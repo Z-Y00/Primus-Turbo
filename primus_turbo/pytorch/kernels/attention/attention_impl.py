@@ -84,6 +84,9 @@ def _gqa_group_ok(num_heads_q: int, num_heads_kv: int, head_dim: int) -> bool:
     Anything else falls back to aiter."""
     if num_heads_kv <= 0 or num_heads_q % num_heads_kv != 0:
         return False
+    if is_gfx1250():
+        # The gfx1250 kernels walk the group head by head; any integer G works.
+        return True
     g = num_heads_q // num_heads_kv
     return 1 <= g <= 256 and (g & (g - 1)) == 0 and (num_heads_q * head_dim) % 128 == 0
 
@@ -102,13 +105,15 @@ def _flydsl_common_ok(
     ``sink`` and the GQA group are checked separately, where Hq is known.
     """
     head_dim = q.shape[-1]
+    # The gfx1250 backward masks per element and has no window-band minimum.
+    min_window = 0 if is_gfx1250() else _MIN_FLYDSL_WINDOW
     return (
         get_device_compute_capability() >= _GFX950
         and bool(causal)
         and q.dtype == torch.bfloat16
         and head_dim in (64, 128)
         and int(window_size[1]) in (0, -1)
-        and (int(window_size[0]) < 0 or int(window_size[0]) >= _MIN_FLYDSL_WINDOW)
+        and (int(window_size[0]) < 0 or int(window_size[0]) >= min_window)
         and _scale_ok(softmax_scale, head_dim)
         and dropout_p == 0.0
         and bias is None
@@ -316,9 +321,10 @@ class DenseAttnFwdHipkittensBackend(KernelBackend):
 class DenseAttnFwdTritonBackend(KernelBackend):
     """Portable Triton attention: no CK, no aiter, no arch-specific extension.
 
-    The only dense backend that runs on gfx1250 -- FlyDSL and HipKittens target other archs,
-    and the aiter path reaches CK, whose fmha backward rejects the call at runtime after the
-    forward has succeeded. Narrow by construction, matching what the kernel asserts.
+    On gfx1250 it covers, when pinned, what FlyDSL refuses (fp16, non-causal, other head
+    dims): HipKittens targets other archs, and the aiter path reaches CK, whose fmha backward
+    rejects the call at runtime after the forward has succeeded. Narrow by construction,
+    matching what the kernel asserts.
     """
 
     @staticmethod
@@ -558,7 +564,8 @@ class VarlenAttnFwdFlydslBackend(KernelBackend):
             return False
         if not _flydsl_common_ok(q, causal, window_size, softmax_scale, dropout_p, bias, alibi_slopes):
             return False
-        return _uniform_cu_seqlens(cu_seqlens_q, cu_seqlens_k)
+        # Ragged segments are native on gfx1250 (and skipping the check saves a device sync).
+        return is_gfx1250() or _uniform_cu_seqlens(cu_seqlens_q, cu_seqlens_k)
 
     @staticmethod
     def execute(

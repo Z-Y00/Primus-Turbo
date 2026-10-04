@@ -4,7 +4,8 @@
 # See LICENSE for license information.
 ###############################################################################
 
-"""FlyDSL flash-attention forward/backward impls (THD varlen and SBHD), gfx950 / MI355X.
+"""FlyDSL flash-attention forward/backward impls (THD varlen and SBHD), gfx950 / MI355X and
+gfx1250 / MI455X.
 
 Bottom-right causal, GQA, D in {64, 128}, bf16. The forward bakes softmax_scale to
 1/sqrt(D); the backward takes it explicitly. Mirrors the ``attention_aiter_impl`` /
@@ -20,13 +21,21 @@ import torch
 from primus_turbo.flydsl.attention.flash_attn_bwd import (
     flydsl_varlen_backward,
 )
+from primus_turbo.flydsl.attention.flash_attn_bwd_gfx1250 import (
+    flash_attn_bwd_gfx1250,
+)
 from primus_turbo.flydsl.attention.flash_attn_fwd import (
     build_flash_attn_dualwave_swp_module,
+)
+from primus_turbo.flydsl.attention.flash_attn_fwd_gfx1250 import (
+    build_flash_attn_fwd_gfx1250,
 )
 from primus_turbo.flydsl.utils.attn_helper import (
     SCORE_BOUND_HEAD_DIM_MAX,
     SCORE_BOUND_KV_CHUNKS,
 )
+from primus_turbo.pytorch.core.utils import is_gfx1250
+from primus_turbo.triton.attention.attn_bwd_prep import attn_bwd_prep
 from primus_turbo.triton.attention.score_bound import k_sq_norm_max
 
 
@@ -129,6 +138,86 @@ def _uniform_shape(cu_seqlens: "torch.Tensor", max_seqlen, total):
     return (B, S) if B * S == int(total) else None
 
 
+# gfx1250 (MI455X) runs the wave32 WMMA kernels in flash_attn_{fwd,bwd}_gfx1250: ragged
+# varlen is native there, and the backward is two deterministic kernels fed by head-major
+# (lse2, delta) statistics, so the gfx950 uniform / sparse-CP special cases do not apply.
+
+
+def _gfx1250_forward(q, k, v, lse_rows, layout, window_left, return_lse, sink, cu_q=None, cu_k=None):
+    Hq, D = q.shape[-2], q.shape[-1]
+    Hkv = k.shape[-2]
+    fwd = build_flash_attn_fwd_gfx1250(
+        Hq,
+        Hkv,
+        D,
+        causal=True,
+        window_left=window_left,
+        has_sink=sink is not None,
+        emit_lse=bool(return_lse),
+        varlen=cu_q is not None,
+    )
+    out = torch.empty_like(q)
+    lse = torch.empty((lse_rows, Hq) if return_lse else (0,), device=q.device, dtype=torch.float32)
+    fwd(
+        q,
+        k,
+        v,
+        out,
+        *layout,
+        lse=lse if return_lse else None,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_k,
+        sink=sink,
+        stream=_current_stream(),
+    )
+    return out, lse
+
+
+def _gfx1250_backward(
+    dout,
+    q,
+    k,
+    v,
+    out_bshd,
+    dout_bshd,
+    lse_rows,
+    seq,
+    layout,
+    softmax_scale,
+    window_left,
+    sink,
+    cu_q=None,
+    cu_k=None,
+):
+    """``out_bshd`` / ``dout_bshd``: [batch, seq, Hq, D] views in the forward's LSE row order;
+    ``lse_rows``: that LSE as [batch * seq, Hq]. Returns (dq, dk, dv, dsink-or-empty)."""
+    Hq, D = q.shape[-2], q.shape[-1]
+    lse2, delta = attn_bwd_prep(out_bshd, dout_bshd, lse_rows, seq)
+    dq, dk, dv = flash_attn_bwd_gfx1250(
+        dout,
+        q,
+        k,
+        v,
+        lse2,
+        delta,
+        *layout,
+        num_heads_q=Hq,
+        num_heads_kv=k.shape[-2],
+        head_dim=D,
+        causal=True,
+        window_left=window_left,
+        softmax_scale=softmax_scale,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_k,
+        stream=_current_stream(),
+    )
+    if sink is None:
+        return dq, dk, dv, lse_rows.new_empty((0,))
+    # d(sink_h) = -sum_rows P_sink * delta, with P_sink = exp(sink - LSE) = exp2(sink*log2e - lse2).
+    dsink = -(torch.exp2(sink.float()[:, None] * 1.4426950408889634 - lse2) * delta).sum(1)
+    return dq, dk, dv, dsink
+
+
 @functools.lru_cache(maxsize=64)
 def _fwd_module(Hq, Hkv, D, causal, cross_seqlen, emit_lse, window_left, sbhd=False, has_sink=False):
     # D in (64,128): stagger-off lifts MFMA utilization, and the raw 8-wave build default
@@ -171,6 +260,13 @@ def _varlen_forward_op(
     total_q, Hq, D = q.shape
     Hkv = k.shape[1]
     sink = sink.contiguous() if sink is not None else None
+
+    if is_gfx1250():
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        layout = (B, Sq, Skv, Hq * D, Hkv * D)
+        return _gfx1250_forward(
+            q, k, v, total_q, layout, window_left, return_lse, sink, cu_seqlens_q, cu_seqlens_k
+        )
 
     mod = _fwd_module(Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, has_sink=sink is not None)
     out = torch.empty_like(q)
@@ -261,6 +357,27 @@ def _varlen_backward_op(
     Hq, D = q.shape[1], q.shape[2]
     Hkv = k.shape[1]
     sink = sink.contiguous() if sink is not None else None
+
+    if is_gfx1250():
+        dout, q, k, v, out = (t.contiguous() for t in (dout, q, k, v, out))
+        T = q.shape[0]
+        layout = (cu_seqlens_q.numel() - 1, int(max_seqlen_q), int(max_seqlen_k), Hq * D, Hkv * D)
+        return _gfx1250_backward(
+            dout,
+            q,
+            k,
+            v,
+            out.view(1, T, Hq, D),
+            dout.view(1, T, Hq, D),
+            lse,
+            T,
+            layout,
+            softmax_scale,
+            window_left,
+            sink,
+            cu_seqlens_q,
+            cu_seqlens_k,
+        )
 
     uq = _uniform_shape(cu_seqlens_q, max_seqlen_q, q.shape[0])
     uk = _uniform_shape(cu_seqlens_k, max_seqlen_k, k.shape[0])
@@ -439,6 +556,10 @@ def _sbhd_forward_op(
     Skv, _, Hkv, _ = k.shape
     sink = sink.contiguous() if sink is not None else None
 
+    if is_gfx1250():
+        layout = (B, Sq, Skv, B * Hq * D, B * Hkv * D, Hq * D, Hkv * D)
+        return _gfx1250_forward(q, k, v, B * Sq, layout, window_left, return_lse, sink)
+
     mod = _fwd_module(
         Hq, Hkv, D, True, Sq != Skv, bool(return_lse), window_left, sbhd=True, has_sink=sink is not None
     )
@@ -503,6 +624,24 @@ def _sbhd_backward_op(
     Sq, B, Hq, D = q.shape
     Skv, _, Hkv, _ = k.shape
     sink = sink.contiguous() if sink is not None else None
+
+    if is_gfx1250():
+        # lse is the [B,Hq,Sq] view of the forward's [B*Sq,Hq] rows; out is sbhd-contiguous.
+        layout = (B, Sq, Skv, B * Hq * D, B * Hkv * D, Hq * D, Hkv * D)
+        return _gfx1250_backward(
+            dout,
+            q,
+            k,
+            v,
+            out.permute(1, 0, 2, 3),
+            dout.permute(1, 0, 2, 3),
+            lse.permute(0, 2, 1).reshape(B * Sq, Hq),
+            Sq,
+            layout,
+            softmax_scale,
+            window_left,
+            sink,
+        )
 
     grads = flydsl_varlen_backward(
         dout,

@@ -8,11 +8,16 @@ import torch
 from einops import repeat
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from primus_turbo.pytorch.core.utils import is_gfx1250
+
 ATTN_BACKENDS = [
     SDPBackend.FLASH_ATTENTION,
     SDPBackend.EFFICIENT_ATTENTION,
     SDPBackend.MATH,
 ]
+# On gfx1250 the fused SDPA backends return NaN dQ for a masked (windowed) call.
+if torch.cuda.is_available() and is_gfx1250():
+    ATTN_BACKENDS = [SDPBackend.MATH]
 
 
 class AttnConfig:
