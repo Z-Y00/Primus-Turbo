@@ -53,3 +53,9 @@
 - Signal: free compiler knob listed in the FlyDSL arch-gfx1250 notes.
 - Takeaway: `flyc.compile[{"llvm_options": {"amdgpu-expert-scheduling-mode": True}}](launch, ...)` gave +3..7% on every shape (largest on compute-heavy ones) with identical VGPRs and bitwise-same-quality results; verify `hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2` in `21_final_isa.s`. `amdgpu-sched-strategy=coexec` was neutral. Try it first on any new gfx1250 WMMA kernel.
 - Applicability: any gfx1250 (gfx12+) compute-bound kernel.
+
+### 2026-10-04 15:30 round-13 — REJECTED
+- Context: `rocdl.global_load_async_to_lds_b128` + `s_wait_asynccnt` in a large (500-VGPR) FlyDSL kernel compiled with `amdgpu-expert-scheduling-mode`.
+- Signal: GPU memory access fault at address nil; same kernel correct without expert mode; a tiny async-copy kernel works in both modes.
+- Takeaway: async global->LDS copies and expert scheduling mode do not mix in the current compiler (the address VGPRs are likely clobbered before the async read; SCHED_MODE 2 leaves those hazards to software). Without expert mode the async gather removed 64 staging VGPRs and the spills, but expert mode alone was worth more (+5%).
+- Applicability: any gfx1250 kernel combining async/TDM LDS copies with expert scheduling — test both modes.
