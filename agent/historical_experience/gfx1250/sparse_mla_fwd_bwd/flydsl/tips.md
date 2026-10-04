@@ -29,3 +29,9 @@
 - Signal: H64 per-tile time ≈ H128 per-tile time at half the FLOPs; 580 VGPRs, 4 waves/CU.
 - Takeaway: when LDS pins 1 WG/CU, keep 8 waves per WG regardless of head count — split the per-head-group work (slot sub-tiles, dQ d-range) across 2 waves; it also halves accumulator VGPRs. +10-12% on H64 bwd.
 - Applicability: gfx1250 kernels where a WG's wave count follows a problem dim (heads) that can be small.
+
+### 2026-10-04 12:46 round-7 — ACCEPTED
+- Context: scattered-row gather (CSR) over a multi-GB bf16 intermediate on gfx1250.
+- Signal: the same compiled gather ran 2.7x faster when the buffer it reads spans < ~2 GB; 2.3 GB chunks got no speedup. LLC is only ~256-384 MB (copy BW 10-11 TB/s below 256 MB, 7.4 TB/s above).
+- Takeaway: keep randomly-accessed buffers under ~1.5-2 GB per kernel launch (chunk the work); also size per-token-workgroup chunks as multiples of the CU count when LDS pins 1 WG/CU — a 1366-token chunk on 256 CUs cost ~8% from wave quantization.
+- Applicability: any gather/scatter-heavy kernel on gfx1250 with multi-GB working sets.

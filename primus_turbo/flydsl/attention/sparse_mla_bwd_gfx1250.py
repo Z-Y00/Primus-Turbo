@@ -64,6 +64,9 @@ from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
     wmma_bf16,
 )
 _LDS_CAP = 320 * 1024
+# Per-chunk bound on the dKV intermediate. Besides capping memory, the gather's scattered row
+# reads run ~2.5x faster once the buffer spans less than ~2 GB.
+_INTERM_BYTES = 1536 << 20
 
 
 @functools.lru_cache(maxsize=64)
@@ -341,6 +344,11 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
     return run
 
 
+@functools.lru_cache(maxsize=None)
+def _num_cus(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _inverted_topk(topk_indices, num_kv):
     """CSR inverse of the top-k map: ``inv_data`` lists flat ``(tok, slot)`` indices grouped by kv
     row in stable order (invalid entries first, skipped by ``inv_ptr[0]``). Built from the sorted
@@ -355,9 +363,22 @@ def _inverted_topk(topk_indices, num_kv):
 
 
 def sparse_mla_bwd_gfx1250(
-    q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None, stream=None
+    q,
+    kv,
+    o,
+    do,
+    topk_indices,
+    lse,
+    attn_sink=None,
+    kv_lora_rank=512,
+    scale=None,
+    stream=None,
+    interm_bytes=_INTERM_BYTES,
 ):
-    """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink."""
+    """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
+
+    Tokens are processed in chunks whose bf16 ``[tokens, topk, 512]`` intermediate fits in
+    ``interm_bytes`` (no chunking when ``None``)."""
     # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
     from primus_turbo.triton.attention.sparse_mla import _bwd_dkv_gather_acc
 
@@ -374,15 +395,25 @@ def sparse_mla_bwd_gfx1250(
     num_kv = kv2.shape[0]
     dq = torch.empty_like(q)
     delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
-    interm = torch.empty(T_, topk, DV, dtype=torch.bfloat16, device=q.device)
+    # One workgroup per token and per CU: chunks are whole multiples of the CU count.
+    cus = _num_cus(q.device)
+    units = -(-T_ // cus)
+    n_chunks = 1 if interm_bytes is None else -(-T_ * topk * DV * 2 // interm_bytes)
+    n_chunks = max(1, min(n_chunks, units))
+    chunk = -(-units // n_chunks) * cus
+    interm = torch.empty(chunk, topk, DV, dtype=torch.bfloat16, device=q.device)
     dkv_acc = torch.zeros(num_kv, DQK, dtype=torch.float32, device=q.device)
     if T_ > 0:
         run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
-        run(q, kv2, o, do, topk_indices, lse, dq, delta, interm, stream=stream)
-        inv_ptr, inv_data = _inverted_topk(topk_indices, num_kv)
-        _bwd_dkv_gather_acc[(num_kv,)](
-            interm, inv_ptr, inv_data, dkv_acc, DV, DQK, D_V=DV, D_ROPE=DQK - DV, HAS_ROPE=False, num_warps=4
-        )
+        for t0 in range(0, T_, chunk):
+            t1 = min(t0 + chunk, T_)
+            idx = topk_indices[t0:t1]
+            im = interm[: t1 - t0]
+            run(q[t0:t1], kv2, o[t0:t1], do[t0:t1], idx, lse[t0:t1], dq[t0:t1], delta[t0:t1], im, stream=stream)
+            inv_ptr, inv_data = _inverted_topk(idx, num_kv)
+            _bwd_dkv_gather_acc[(num_kv,)](
+                im, inv_ptr, inv_data, dkv_acc, DV, DQK, D_V=DV, D_ROPE=DQK - DV, HAS_ROPE=False, num_warps=4
+            )
     dsink = None
     if attn_sink is not None:
         dsink = -(torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
