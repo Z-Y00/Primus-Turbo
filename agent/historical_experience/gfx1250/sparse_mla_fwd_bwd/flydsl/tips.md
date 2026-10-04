@@ -41,3 +41,9 @@
 - Signal: same per-wave work compiled to 999 VGPRs at 4 waves/WG vs ~500 at 8 waves/WG.
 - Takeaway: with small workgroups the backend may use the full 1024-VGPR file (occupancy 1). Pass `value_attrs={"rocdl.waves_per_eu": 2}` at launch to cap at 512 and fit 2 WGs/CU; pair it with a smaller tile if the kernel would spill heavily (bn64+wpe2 was 2x slower, bn32+wpe2 15-25% faster). wpe 3/4 spill badly.
 - Applicability: any gfx1250 FlyDSL kernel whose VGPR count jumps above 512 with a 4-wave workgroup.
+
+### 2026-10-04 13:20 round-9 — ACCEPTED
+- Context: CSR segmented-sum (dKV gather) where a few rows hold most entries (compressed pool).
+- Signal: one-program-per-row gather 4.6x slower on cr128 than cr0 at similar bytes.
+- Takeaway: split only heavy rows (> SEG entries) into fixed blocks of the sorted entry list, write per-block partials, add them in block order in a fix-up kernel (deterministic). Keep light rows on a 1-program-per-row path in the same launch — a pure fixed-block design was ~2x slower on short uniform rows (longer dependent-load chain + serial row loop).
+- Applicability: any deterministic scatter-to-gather (inverted index) reduction with skewed row lengths.

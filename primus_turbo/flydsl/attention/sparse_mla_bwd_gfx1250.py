@@ -63,10 +63,12 @@ from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
     vmul_scalar,
     wmma_bf16,
 )
+
 _LDS_CAP = 320 * 1024
 # Per-chunk bound on the dKV intermediate. Besides capping memory, the gather's scattered row
 # reads run ~2.5x faster once the buffer spans less than ~2 GB.
 _INTERM_BYTES = 1536 << 20
+_GATHER_SEG = 256  # CSR entries per gather program
 
 
 @functools.lru_cache(maxsize=64)
@@ -167,7 +169,9 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
         h_own = hg * 16 + l16
         CPP = CPR // (2 * DS)
         part = ds * 2 + hi
-        o_regs = [buf_load(rsrc_o, h_own * (DV * 2) + (part * CPP + j) * 16, v4i) for j in range_constexpr(CPP)]
+        o_regs = [
+            buf_load(rsrc_o, h_own * (DV * 2) + (part * CPP + j) * 16, v4i) for j in range_constexpr(CPP)
+        ]
         gpu.barrier()
         acc = fx.Float32(0.0)
         for j in range_constexpr(CPP):
@@ -351,15 +355,15 @@ def _num_cus(device):
 
 def _inverted_topk(topk_indices, num_kv):
     """CSR inverse of the top-k map: ``inv_data`` lists flat ``(tok, slot)`` indices grouped by kv
-    row in stable order (invalid entries first, skipped by ``inv_ptr[0]``). Built from the sorted
-    keys alone, so no host sync."""
+    row in stable order (invalid entries first, skipped by ``inv_ptr[0]``), ``keys`` the kv row
+    of each listed entry. Built from the sorted keys alone, so no host sync."""
     flat = topk_indices.reshape(-1)
     if num_kv < torch.iinfo(torch.int16).max:
         flat = flat.to(torch.int16)  # half the radix passes
     keys, inv_data = torch.sort(flat, stable=True)
     bounds = torch.arange(num_kv + 1, device=keys.device, dtype=keys.dtype)
     inv_ptr = torch.searchsorted(keys, bounds, out_int32=True)
-    return inv_ptr, inv_data.to(torch.int32)
+    return keys, inv_ptr, inv_data.to(torch.int32)
 
 
 def sparse_mla_bwd_gfx1250(
@@ -380,7 +384,7 @@ def sparse_mla_bwd_gfx1250(
     Tokens are processed in chunks whose bf16 ``[tokens, topk, 512]`` intermediate fits in
     ``interm_bytes`` (no chunking when ``None``)."""
     # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
-    from primus_turbo.triton.attention.sparse_mla import _bwd_dkv_gather_acc
+    from primus_turbo.triton.attention.sparse_mla_dkv_gather import dkv_gather_acc
 
     assert kv_lora_rank == DV and q.shape[-1] == DQK, "gfx1250 sparse-MLA is the 512 + 64 latent layout"
     for x in (q, o, do, topk_indices, lse):
@@ -409,11 +413,20 @@ def sparse_mla_bwd_gfx1250(
             t1 = min(t0 + chunk, T_)
             idx = topk_indices[t0:t1]
             im = interm[: t1 - t0]
-            run(q[t0:t1], kv2, o[t0:t1], do[t0:t1], idx, lse[t0:t1], dq[t0:t1], delta[t0:t1], im, stream=stream)
-            inv_ptr, inv_data = _inverted_topk(idx, num_kv)
-            _bwd_dkv_gather_acc[(num_kv,)](
-                im, inv_ptr, inv_data, dkv_acc, DV, DQK, D_V=DV, D_ROPE=DQK - DV, HAS_ROPE=False, num_warps=4
+            run(
+                q[t0:t1],
+                kv2,
+                o[t0:t1],
+                do[t0:t1],
+                idx,
+                lse[t0:t1],
+                dq[t0:t1],
+                delta[t0:t1],
+                im,
+                stream=stream,
             )
+            keys, inv_ptr, inv_data = _inverted_topk(idx, num_kv)
+            dkv_gather_acc(im, keys, inv_ptr, inv_data, dkv_acc, d=DV, seg=_GATHER_SEG)
     dsink = None
     if attn_sink is not None:
         dsink = -(torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
