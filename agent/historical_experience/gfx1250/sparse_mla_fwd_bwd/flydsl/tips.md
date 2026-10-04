@@ -70,3 +70,9 @@
 - Signal: halving per-wave K/V LDS reads by pairing waves (2 head groups per wave, d split, S partial exchange) made it 10-25% slower, 6-21% even with the extra barrier removed.
 - Takeaway: on paper LDS bandwidth (b128 ~350, tr16 ~257 B/clk/CU) looks like the floor, but these kernels are issue-bound; adding per-wave VALU/TRANS work (duplicated softmax) costs more than the saved LDS reads.
 - Applicability: any LDS-sharing restructure of WMMA attention kernels on gfx1250.
+
+### 2026-10-04 15:40 round-16 — REJECTED (aiter OPUS comparison + TDM gather)
+- Context: sparse-MLA forward on gfx1250 vs aiter's prebuilt OPUS bf16 sparse-prefill code object (`hsa/gfx1250/mla_v4_opus/*.co`; loadable via hipModuleLoad + hipDrvLaunchKernelEx with the pinned 112-byte kargs, see campaign `rounds/round-16/artifacts/opus_bench.py`).
+- Signal: OPUS is ~1.7x faster (pro cr4 0.774 vs 1.328 ms). It runs 4 waves x 16 heads per WG at 898 VGPRs (1 wave/SIMD), 290 KB LDS, 64-key tiles, TDM gather (`tensor_load_to_lds` with 8 SGPR row indices from `s_buffer_load_b512`). Porting only the TDM gather into our 2-waves/SIMD kernel was 4-17% slower; OPUS-like 1-wave layouts in our compiler-scheduled code were 1.5x slower (stall on nearly every LDS fragment load).
+- Takeaway: the OPUS win is a hand-pipelined single-wave kernel (deep LDS->register fragment prefetch), not the loader. TDM pitfalls: pred-off gathers don't count toward tensorcnt and all-OOB gathers complete early, so a count-based ring must drain with `s_wait_tensorcnt 0` at the tail. TDM gather pads LDS rows via the descriptor (interval 256 dw, amount 4 dw -> 1040 B pitch); `-1` indices are OOB and land as zeros.
+- Applicability: any gfx1250 gather-attention kernel considering TDM or a 1-wave/SIMD layout.
