@@ -62,8 +62,6 @@ from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
     vmul_scalar,
     wmma_bf16,
 )
-from primus_turbo.triton.attention.sparse_mla import _bwd_dkv_gather_acc
-
 _LDS_CAP = 320 * 1024
 
 
@@ -333,6 +331,9 @@ def sparse_mla_bwd_gfx1250(
     q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None, stream=None
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink."""
+    # Deferred: primus_turbo.triton imports primus_turbo.pytorch, which imports this module.
+    from primus_turbo.triton.attention.sparse_mla import _bwd_dkv_gather_acc
+
     assert kv_lora_rank == DV and q.shape[-1] == DQK, "gfx1250 sparse-MLA is the 512 + 64 latent layout"
     for x in (q, o, do, topk_indices, lse):
         assert x.is_contiguous()
