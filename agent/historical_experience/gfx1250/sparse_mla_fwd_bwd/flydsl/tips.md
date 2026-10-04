@@ -35,3 +35,9 @@
 - Signal: the same compiled gather ran 2.7x faster when the buffer it reads spans < ~2 GB; 2.3 GB chunks got no speedup. LLC is only ~256-384 MB (copy BW 10-11 TB/s below 256 MB, 7.4 TB/s above).
 - Takeaway: keep randomly-accessed buffers under ~1.5-2 GB per kernel launch (chunk the work); also size per-token-workgroup chunks as multiples of the CU count when LDS pins 1 WG/CU — a 1366-token chunk on 256 CUs cost ~8% from wave quantization.
 - Applicability: any gather/scatter-heavy kernel on gfx1250 with multi-GB working sets.
+
+### 2026-10-04 12:51 round-8 — ACCEPTED
+- Context: FlyDSL gfx1250 kernels with a 4-wave (128-thread) workgroup.
+- Signal: same per-wave work compiled to 999 VGPRs at 4 waves/WG vs ~500 at 8 waves/WG.
+- Takeaway: with small workgroups the backend may use the full 1024-VGPR file (occupancy 1). Pass `value_attrs={"rocdl.waves_per_eu": 2}` at launch to cap at 512 and fit 2 WGs/CU; pair it with a smaller tile if the kernel would spill heavily (bn64+wpe2 was 2x slower, bn32+wpe2 15-25% faster). wpe 3/4 spill badly.
+- Applicability: any gfx1250 FlyDSL kernel whose VGPR count jumps above 512 with a 4-wave workgroup.

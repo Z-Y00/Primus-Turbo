@@ -68,14 +68,19 @@ DQK = 576  # q / kv row length (latent + zero rope pad)
 
 
 @functools.lru_cache(maxsize=64)
-def build_sparse_mla_fwd_gfx1250(num_heads, topk, scale, has_sink, heads_per_wg=None, block_k=None):
+def build_sparse_mla_fwd_gfx1250(
+    num_heads, topk, scale, has_sink, heads_per_wg=None, block_k=None, waves_per_eu=None
+):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``."""
     H = num_heads
     HB = heads_per_wg or min(H, 128)
     if H % HB or HB % 16:
         raise ValueError(f"num_heads {H} must split into 16-head waves (heads_per_wg={HB})")
-    # 64-row tiles only pay off with 4 waves; at 8 waves the 32-row tile is ~1.3-1.7x faster.
-    BN = block_k or (64 if topk % 64 == 0 and HB < 128 else 32)
+    BN = block_k or 32
+    if waves_per_eu is None and HB < 128:
+        # A 4-wave workgroup otherwise lets the compiler take ~1000 VGPRs (one wave per SIMD);
+        # capping it fits two workgroups per CU.
+        waves_per_eu = 2
     if topk % BN or BN % 32:
         raise ValueError(f"topk {topk} must be a multiple of the kv tile {BN}")
     WAVES = HB // 16
@@ -250,7 +255,8 @@ def build_sparse_mla_fwd_gfx1250(num_heads, topk, scale, has_sink, heads_per_wg=
         NKV: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        sparse_mla_fwd_gfx1250_kernel(Q, KV, TOPK, SINK, O, LSE, NKV).launch(
+        attrs = {} if waves_per_eu is None else {"rocdl.waves_per_eu": waves_per_eu}
+        sparse_mla_fwd_gfx1250_kernel(Q, KV, TOPK, SINK, O, LSE, NKV, value_attrs=attrs).launch(
             grid=(fx.Index(n_tok), H // HB, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
