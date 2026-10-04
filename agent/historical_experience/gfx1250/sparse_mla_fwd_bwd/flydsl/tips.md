@@ -64,3 +64,9 @@
 - Context: roofline numbers for gfx1250 (256 CUs, sclk 2.4 GHz) measured with FlyDSL microbenchmarks (campaign `rounds/round-14/artifacts`).
 - Takeaway: bf16 WMMA 16x16x32 peak ~3.45 PFLOPS (0.34 WMMA/clk/CU); LDS ds_load_b128 ~350 B/clk/CU, ds_load_tr16_b128 ~257 B/clk/CU. rocprofv3 WMMA counters read 0 on this stack, so use timing probes. hipBLASLt bf16 GEMM is untuned (127 TF), not a usable reference. `amdgpu-sched-strategy` max-ilp / max-memory-clause / iterative-* were all worse than the default (iterative-minreg produced wrong results).
 - Applicability: any gfx1250 kernel roofline estimate.
+
+### 2026-10-04 14:45 round-15 — REJECTED
+- Context: attention forward on gfx1250 with every wave re-reading the shared K/V LDS tile (2 waves/SIMD, ~500 VGPRs).
+- Signal: halving per-wave K/V LDS reads by pairing waves (2 head groups per wave, d split, S partial exchange) made it 10-25% slower, 6-21% even with the extra barrier removed.
+- Takeaway: on paper LDS bandwidth (b128 ~350, tr16 ~257 B/clk/CU) looks like the floor, but these kernels are issue-bound; adding per-wave VALU/TRANS work (duplicated softmax) costs more than the saved LDS reads.
+- Applicability: any LDS-sharing restructure of WMMA attention kernels on gfx1250.
