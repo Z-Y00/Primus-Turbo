@@ -62,10 +62,7 @@ from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
     vmul_scalar,
     wmma_bf16,
 )
-from primus_turbo.triton.attention.sparse_mla import (
-    _build_inverted_topk_slice,
-    _bwd_dkv_gather_acc,
-)
+from primus_turbo.triton.attention.sparse_mla import _bwd_dkv_gather_acc
 
 _LDS_CAP = 320 * 1024
 
@@ -319,6 +316,16 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
     return run
 
 
+def _inverted_topk(topk_indices, num_kv):
+    """CSR inverse of the top-k map: ``inv_data`` lists flat ``(tok, slot)`` indices grouped by kv
+    row in stable order (invalid entries first, skipped by ``inv_ptr[0]``). Built from the sorted
+    keys alone, so no host sync."""
+    keys, inv_data = torch.sort(topk_indices.reshape(-1), stable=True)
+    bounds = torch.arange(num_kv + 1, device=keys.device, dtype=keys.dtype)
+    inv_ptr = torch.searchsorted(keys, bounds, out_int32=True)
+    return inv_ptr, inv_data.to(torch.int32)
+
+
 def sparse_mla_bwd_gfx1250(
     q, kv, o, do, topk_indices, lse, attn_sink=None, kv_lora_rank=512, scale=None, stream=None
 ):
@@ -341,7 +348,7 @@ def sparse_mla_bwd_gfx1250(
     if T_ > 0:
         run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
         run(q, kv2, o, do, topk_indices, lse, dq, delta, interm, stream=stream)
-        inv_ptr, inv_data = _build_inverted_topk_slice(topk_indices, 0, topk, num_kv=num_kv)
+        inv_ptr, inv_data = _inverted_topk(topk_indices, num_kv)
         _bwd_dkv_gather_acc[(num_kv,)](
             interm, inv_ptr, inv_data, dkv_acc, DV, DQK, D_V=DV, D_ROPE=DQK - DV, HAS_ROPE=False, num_warps=4
         )
