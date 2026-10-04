@@ -74,7 +74,8 @@ def build_sparse_mla_fwd_gfx1250(num_heads, topk, scale, has_sink, heads_per_wg=
     HB = heads_per_wg or min(H, 128)
     if H % HB or HB % 16:
         raise ValueError(f"num_heads {H} must split into 16-head waves (heads_per_wg={HB})")
-    BN = block_k or (64 if topk % 64 == 0 else 32)
+    # 64-row tiles only pay off with 4 waves; at 8 waves the 32-row tile is ~1.3-1.7x faster.
+    BN = block_k or (64 if topk % 64 == 0 and HB < 128 else 32)
     if topk % BN or BN % 32:
         raise ValueError(f"topk {topk} must be a multiple of the kv tile {BN}")
     WAVES = HB // 16
