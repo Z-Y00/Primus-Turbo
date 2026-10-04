@@ -105,7 +105,7 @@ class SparseMlaBwdFlydslBackend(KernelBackend):
     def can_handle(q, topk_indices, **kwargs) -> bool:
         _, num_heads, d_qk = q.shape
         return (
-            (is_gfx950() or (is_gfx1250() and num_heads <= 128))
+            (is_gfx950() or (is_gfx1250() and 128 % num_heads == 0))
             and q.dtype == torch.bfloat16
             and d_qk == _DSV4_QK_DIM
             and num_heads % 32 == 0

@@ -16,7 +16,8 @@
 Same contract as ``sparse_mla_bwd_triton`` (dq / dkv rope columns are zero, dsink from
 ``delta`` and ``lse``), deterministic: no atomics.
 
-One fused kernel per token, all heads in one workgroup (16 heads per wave):
+One fused kernel per token, all heads in one workgroup (16 heads per wave group; with fewer
+than 128 heads, two waves share a group and split its slots and dQ^T columns):
 
 1. ``S = Q K^T`` and ``dP = dO K^T`` with heads as rows, so a lane holds one top-k slot and
    eight heads; with lse known, ``P`` and ``dS = P (dP - delta) scale`` are elementwise.
@@ -66,28 +67,37 @@ _LDS_CAP = 320 * 1024
 
 
 @functools.lru_cache(maxsize=64)
-def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
+def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=None):
     H = num_heads
-    if H % 32 or H > 128:
-        raise ValueError(f"gfx1250 sparse-MLA backward needs num_heads % 32 == 0 and <= 128, got {H}")
+    if H % 32 or 128 % H:
+        raise ValueError(f"gfx1250 sparse-MLA backward needs num_heads in (32, 64, 128), got {H}")
     BN = block_k
     if topk % BN or BN % 32:
         raise ValueError(f"topk {topk} must be a multiple of the kv tile {BN}")
-    WAVES = H // 16
+    HG = H // 16  # 16-head groups
+    KT = BN // 16  # 16-slot sub-tiles
+    # Waves per head group: they split the S / dP slot sub-tiles and the dQ^T d range, so small
+    # head counts still run 8 waves.
+    DS = d_split or max(1, min(8 // HG, KT))
+    WAVES = HG * DS
     BLOCK = WAVES * WAVE
     NT = topk // BN
-    KT = BN // 16  # 16-slot sub-tiles
+    KTW = KT // DS  # slot sub-tiles per wave (S, dP)
     PC = BN // 32  # 32-slot reduction steps (dQ)
     KS = DV // 32  # d reduction steps (S, dP)
     DT = DV // 16  # d tiles of dQ^T
+    DTQ = DT // DS  # dQ^T d tiles per wave
     HC = H // 32  # head reduction steps (dKV)
     DTW = DT // WAVES  # d tiles of C^T per wave
+    RZ = (DQK - DV) * 2 // 32  # 16-byte rope-zero chunks per half row of dq
+    if KT % DS or DT % WAVES or RZ % DS:
+        raise ValueError(f"d_split {DS} does not divide the tile for num_heads {H}")
     ROW = DV * 2 + 16  # LDS pitch of latent rows (bytes)
     SP = H * 2 + 16  # LDS pitch of the [slot][head] dS / P tiles (bytes)
     QO_B = H * ROW
     TILE_B = BN * ROW
     DS_B = BN * SP
-    fixed = 2 * QO_B + 2 * DS_B + H * 4
+    fixed = 2 * QO_B + 2 * DS_B + DS * H * 4
     NBUF = 2 if fixed + 2 * TILE_B <= _LDS_CAP else 1
     if fixed + NBUF * TILE_B > _LDS_CAP:
         raise ValueError("sparse-MLA backward tile does not fit in LDS")
@@ -112,6 +122,8 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
     ):
         tid = fx.Int32(fx.thread_idx.x)
         wave = uniform(tid // WAVE)
+        hg = wave % HG
+        ds = wave // HG
         lane = tid % WAVE
         l16 = lane % 16
         hi = lane // 16
@@ -126,7 +138,7 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
         ds_lds = lds0 + 2 * QO_B
         p_lds = ds_lds + DS_B
         dl_lds = p_lds + DS_B
-        kv_lds = dl_lds + H * 4
+        kv_lds = dl_lds + DS * H * 4
 
         v4i = vec_type(4, fx.Int32)
         v4f = vec_type(4, fx.Float32)
@@ -147,24 +159,21 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
             lds_store(buf_load(rsrc_q, r * (DQK * 2) + col * 16, v4i), q_lds + r * ROW + col * 16)
             lds_store(buf_load(rsrc_do, r * (DV * 2) + col * 16, v4i), do_lds + r * ROW + col * 16)
 
-        # ---- delta = rowsum(O * dO): lane (l16, hi) sums half of head wave*16 + l16; dO from LDS.
-        h_own = wave * 16 + l16
-        o_regs = [
-            buf_load(rsrc_o, h_own * (DV * 2) + (hi * (CPR // 2) + j) * 16, v4i) for j in range_constexpr(CPR // 2)
-        ]
+        # ---- delta = rowsum(O * dO), dO from LDS: lane (l16, hi) of split ds sums part ds*2 + hi
+        # of head hg*16 + l16; the DS partials are summed when read back.
+        h_own = hg * 16 + l16
+        CPP = CPR // (2 * DS)
+        part = ds * 2 + hi
+        o_regs = [buf_load(rsrc_o, h_own * (DV * 2) + (part * CPP + j) * 16, v4i) for j in range_constexpr(CPP)]
         gpu.barrier()
         acc = fx.Float32(0.0)
-        for j in range_constexpr(CPR // 2):
-            off = (hi * (CPR // 2) + j) * 16
+        for j in range_constexpr(CPP):
+            off = (part * CPP + j) * 16
             ov = Vec(o_regs[j]).bitcast(fx.BFloat16)
             dv = Vec(lds_load(do_lds + h_own * ROW + off, v4i)).bitcast(fx.BFloat16)
             for e in range_constexpr(8):
                 acc = fadd(acc, fmul(fx.Float32(ov[e]), fx.Float32(dv[e])))
-        delta_own = fadd(acc, swap_halves(acc))
-        rsrc_dl = make_rsrc(tensor_addr(DELTA) + fx.Int64(tok) * (H * 4), H * 4)
-        dl_off = fx.Int32((hi == 0).select(h_own * 4, fx.Int32(0x7FFFFFF0)))
-        buf_store(delta_own, rsrc_dl, dl_off)
-        lds_store(delta_own, dl_lds + h_own * 4, align=4)
+        lds_store(fadd(acc, swap_halves(acc)), dl_lds + (ds * H + h_own) * 4, align=4)
 
         # ---- KV gather (same scheme as the forward).
         g_row = tid // TPR
@@ -183,11 +192,21 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
         store_tile(load_tile(fx.Int32(0)), fx.Int32(0))
         gpu.barrier()
 
-        # Per-lane row statistics for heads wave*16 + hi*8 + i (rows of this lane's S tile).
+        delta_own = fx.Float32(lds_load(dl_lds + h_own * 4, T.f32, align=4))
+        for k in range_constexpr(1, DS):
+            delta_own = fadd(delta_own, fx.Float32(lds_load(dl_lds + (k * H + h_own) * 4, T.f32, align=4)))
+        rsrc_dl = make_rsrc(tensor_addr(DELTA) + fx.Int64(tok) * (H * 4), H * 4)
+        buf_store(delta_own, rsrc_dl, fx.Int32((part == 0).select(h_own * 4, fx.Int32(0x7FFFFFF0))))
+
+        # Per-lane row statistics for heads hg*16 + hi*8 + i (rows of this lane's S tile).
         rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
-        hrow = wave * 16 + hi * 8
+        hrow = hg * 16 + hi * 8
         lsev = cat(Vec(buf_load(rsrc_lse, hrow * 4, v4f)), Vec(buf_load(rsrc_lse, hrow * 4 + 16, v4f)))
-        dlv = cat(lds_load(dl_lds + hrow * 4, v4f), lds_load(dl_lds + hrow * 4 + 16, v4f))
+        dlt = [fx.Float32(0.0)] * 8
+        for k in range_constexpr(DS):
+            o = dl_lds + (k * H + hrow) * 4
+            dlv = cat(lds_load(o, v4f), lds_load(o + 16, v4f))
+            dlt = [fadd(dlt[i], fx.Float32(dlv[i])) for i in range_constexpr(8)]
         lse2 = []
         for i in range_constexpr(8):
             l_ = fx.Float32(lsev[i])
@@ -197,38 +216,41 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
                     (l_ == fx.Float32(float("-inf"))).select(fx.Float32(float("inf")), fmul(l_, LOG2E))
                 )
             )
-        dlt = [fx.Float32(dlv[i]) for i in range_constexpr(8)]
 
         a_lane = l16 * ROW + hi * 16  # non-transposed fragment read (lane = row)
         tr_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
         tr_ds = (hi * 8 + l8) * SP + (l16 // 8) * 16
-        q_row = q_lds + (wave * 16) * ROW + a_lane
-        do_row = do_lds + (wave * 16) * ROW + a_lane
+        q_row = q_lds + (hg * 16) * ROW + a_lane
+        do_row = do_lds + (hg * 16) * ROW + a_lane
+        kt0 = ds * KTW  # first slot sub-tile of this wave
+        dt0 = ds * DTQ  # first dQ^T d tile of this wave
         interm_tok = fx.Int64(tok) * fx.Int64(topk * DV * 2)
         rsrc_im = make_rsrc(tensor_addr(INTERM) + interm_tok, topk * DV * 2)
 
         def tile_compute(t, buf, dq_acc):
             kbase = kv_lds + buf * TILE_B
-            s = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KT)]
-            dp = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KT)]
+            kb_w = kbase + a_lane + kt0 * 16 * ROW
+            s = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)]
+            dp = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)]
             for ks in range_constexpr(KS):
                 aq = cat(lds_load(q_row + ks * 64, v8e), lds_load(q_row + ks * 64 + 32, v8e))
                 ad = cat(lds_load(do_row + ks * 64, v8e), lds_load(do_row + ks * 64 + 32, v8e))
-                for kt in range_constexpr(KT):
-                    o = kbase + a_lane + kt * 16 * ROW + ks * 64
+                for kk in range_constexpr(KTW):
+                    o = kb_w + kk * 16 * ROW + ks * 64
                     bk = cat(lds_load(o, v8e), lds_load(o + 32, v8e))
-                    s[kt] = wmma_bf16(aq, bk, s[kt])
-                    dp[kt] = wmma_bf16(ad, bk, dp[kt])
-            # P, dS: lane = slot t*BN + kt*16 + l16, element i = head wave*16 + hi*8 + i.
-            for kt in range_constexpr(KT):
+                    s[kk] = wmma_bf16(aq, bk, s[kk])
+                    dp[kk] = wmma_bf16(ad, bk, dp[kk])
+            # P, dS: lane = slot t*BN + kt*16 + l16, element i = head hg*16 + hi*8 + i.
+            for kk in range_constexpr(KTW):
+                kt = kt0 + kk
                 idx = fx.Int32(buf_load(rsrc_idx, (t * BN + kt * 16 + l16) * 4, T.i32))
                 ok = idx >= fx.Int32(0)
-                sv = vmul_scalar(s[kt], c_log2)
+                sv = vmul_scalar(s[kk], c_log2)
                 pv, dsv = [], []
                 for i in range_constexpr(8):
                     p = fx.Float32(ok.select(exp2(fsub(sv[i], lse2[i])), fx.Float32(0.0)))
                     pv.append(p)
-                    dsv.append(fmul(fmul(p, fsub(dp[kt][i], dlt[i])), scale))
+                    dsv.append(fmul(fmul(p, fsub(dp[kk][i], dlt[i])), scale))
                 slot_off = (kt * 16 + l16) * SP + hrow * 2
                 lds_store(to_bf16(Vec.from_elements(dsv, fx.Float32)), ds_lds + slot_off)
                 lds_store(to_bf16(Vec.from_elements(pv, fx.Float32)), p_lds + slot_off)
@@ -236,12 +258,12 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
             # dQ^T[d, own heads] += K^T[d, slot] dS^T[slot, h].
             new = list(dq_acc)
             for pc in range_constexpr(PC):
-                bb = ds_lds + tr_ds + pc * 32 * SP + wave * 32
+                bb = ds_lds + tr_ds + pc * 32 * SP + hg * 32
                 b = cat(lds_load_tr16(bb), lds_load_tr16(bb + 16 * SP))
-                for dt in range_constexpr(DT):
-                    ab = kbase + tr_lane + pc * 32 * ROW + dt * 32
+                for j in range_constexpr(DTQ):
+                    ab = kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32
                     a = cat(lds_load_tr16(ab), lds_load_tr16(ab + 16 * ROW))
-                    new[dt] = wmma_bf16(a, b, new[dt])
+                    new[j] = wmma_bf16(a, b, new[j])
             # C^T[d, slot] = Q^T dS + dO^T P over this wave's d tiles.
             for kt in range_constexpr(KT):
                 bs, bp = [], []
@@ -261,30 +283,31 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
                     buf_store(to_bf16(c).bitcast(fx.Int32), rsrc_im, im_off)
             return new
 
-        init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DT)]
+        init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DTQ)]
         for t, st in range(fx.Index(0), fx.Index(NT), fx.Index(1), init=init):
             ti = fx.Int32(t)
             nxt = load_tile(ti + 1)
             if const_expr(NBUF == 2):
                 buf = ti % 2
-                acc_ = tile_compute(ti, buf, [st[dt] for dt in range_constexpr(DT)])
+                acc_ = tile_compute(ti, buf, [st[j] for j in range_constexpr(DTQ)])
                 store_tile(nxt, 1 - buf)
                 gpu.barrier()
             else:
-                acc_ = tile_compute(ti, fx.Int32(0), [st[dt] for dt in range_constexpr(DT)])
+                acc_ = tile_compute(ti, fx.Int32(0), [st[j] for j in range_constexpr(DTQ)])
                 gpu.barrier()
                 store_tile(nxt, fx.Int32(0))
                 gpu.barrier()
             res = yield list(acc_)
 
-        # dQ^T tiles: lane holds head wave*16 + l16, d rows dt*16 + hi*8 + [0..7].
+        # dQ^T tiles: lane holds head hg*16 + l16, d rows (dt0 + j)*16 + hi*8 + [0..7].
         rsrc_dq = make_rsrc(tensor_addr(DQ) + tok_q, H * DQK * 2)
         dq_off = h_own * (DQK * 2) + hi * 16
-        for dt in range_constexpr(DT):
-            buf_store(to_bf16(res[dt]).bitcast(fx.Int32), rsrc_dq, dq_off + dt * 32)
+        for j in range_constexpr(DTQ):
+            buf_store(to_bf16(res[j]).bitcast(fx.Int32), rsrc_dq, dq_off + (dt0 + j) * 32)
         zero = Vec.filled(4, 0, fx.Int32)
-        for j in range_constexpr((DQK - DV) * 2 // 32):
-            buf_store(zero, rsrc_dq, h_own * (DQK * 2) + DV * 2 + hi * ((DQK - DV) * 2 // 2) + j * 16)
+        rz_off = h_own * (DQK * 2) + DV * 2 + hi * (RZ * 16) + ds * (RZ // DS * 16)
+        for j in range_constexpr(RZ // DS):
+            buf_store(zero, rsrc_dq, rz_off + j * 16)
 
     @flyc.jit
     def launch_sparse_mla_bwd_gfx1250(

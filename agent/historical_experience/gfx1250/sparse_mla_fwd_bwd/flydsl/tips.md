@@ -23,3 +23,9 @@
 - Signal: removing 128 KB/token of reads gave +3-6% on H128 shapes, ~0 on H64.
 - Takeaway: measure the copy BW first — gfx1250 kernels with per-token staging are bandwidth-sensitive at short top-k; never re-read from HBM what is already staged in LDS. H64 (4 waves/CU) did not benefit: it is latency-bound, fix occupancy first.
 - Applicability: per-token / per-row fused backward kernels on gfx1250.
+
+### 2026-10-04 12:37 round-6 — ACCEPTED
+- Context: per-token fused attention backward, one workgroup per token, LDS-limited to 1 WG per CU.
+- Signal: H64 per-tile time ≈ H128 per-tile time at half the FLOPs; 580 VGPRs, 4 waves/CU.
+- Takeaway: when LDS pins 1 WG/CU, keep 8 waves per WG regardless of head count — split the per-head-group work (slot sub-tiles, dQ d-range) across 2 waves; it also halves accumulator VGPRs. +10-12% on H64 bwd.
+- Applicability: gfx1250 kernels where a WG's wave count follows a problem dim (heads) that can be small.
