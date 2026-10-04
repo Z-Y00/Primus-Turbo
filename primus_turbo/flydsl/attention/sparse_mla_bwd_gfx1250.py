@@ -320,7 +320,10 @@ def _inverted_topk(topk_indices, num_kv):
     """CSR inverse of the top-k map: ``inv_data`` lists flat ``(tok, slot)`` indices grouped by kv
     row in stable order (invalid entries first, skipped by ``inv_ptr[0]``). Built from the sorted
     keys alone, so no host sync."""
-    keys, inv_data = torch.sort(topk_indices.reshape(-1), stable=True)
+    flat = topk_indices.reshape(-1)
+    if num_kv < torch.iinfo(torch.int16).max:
+        flat = flat.to(torch.int16)  # half the radix passes
+    keys, inv_data = torch.sort(flat, stable=True)
     bounds = torch.arange(num_kv + 1, device=keys.device, dtype=keys.dtype)
     inv_ptr = torch.searchsorted(keys, bounds, out_int32=True)
     return inv_ptr, inv_data.to(torch.int32)
