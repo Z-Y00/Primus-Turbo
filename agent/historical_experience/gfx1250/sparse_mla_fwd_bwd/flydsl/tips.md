@@ -17,3 +17,9 @@
 - Signal: kernel-only sweep: 128-head WG (8 waves) bn64 2349 us vs bn32 1414 us at topk 1152; 64-head WG prefers bn64.
 - Takeaway: the right KV tile depends on waves/WG — sweep block_k per heads_per_wg instead of "bigger tile when divisible".
 - Applicability: FlyDSL gfx1250 attention-style kernels with gather prefetch in registers.
+
+### 2026-10-04 12:31 round-5 — ACCEPTED
+- Context: gfx1250 node practical HBM copy BW ~7.4 TB/s (r+w); per-token attention backward with ~1 MB/token traffic.
+- Signal: removing 128 KB/token of reads gave +3-6% on H128 shapes, ~0 on H64.
+- Takeaway: measure the copy BW first — gfx1250 kernels with per-token staging are bandwidth-sensitive at short top-k; never re-read from HBM what is already staged in LDS. H64 (4 waves/CU) did not benefit: it is latency-bound, fix occupancy first.
+- Applicability: per-token / per-row fused backward kernels on gfx1250.

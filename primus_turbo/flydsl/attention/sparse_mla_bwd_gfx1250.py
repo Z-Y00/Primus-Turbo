@@ -147,13 +147,17 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32):
             lds_store(buf_load(rsrc_q, r * (DQK * 2) + col * 16, v4i), q_lds + r * ROW + col * 16)
             lds_store(buf_load(rsrc_do, r * (DV * 2) + col * 16, v4i), do_lds + r * ROW + col * 16)
 
-        # ---- delta = rowsum(O * dO): lane (l16, hi) sums half of head wave*16 + l16.
+        # ---- delta = rowsum(O * dO): lane (l16, hi) sums half of head wave*16 + l16; dO from LDS.
         h_own = wave * 16 + l16
+        o_regs = [
+            buf_load(rsrc_o, h_own * (DV * 2) + (hi * (CPR // 2) + j) * 16, v4i) for j in range_constexpr(CPR // 2)
+        ]
+        gpu.barrier()
         acc = fx.Float32(0.0)
         for j in range_constexpr(CPR // 2):
             off = (hi * (CPR // 2) + j) * 16
-            ov = Vec(buf_load(rsrc_o, h_own * (DV * 2) + off, v4i)).bitcast(fx.BFloat16)
-            dv = Vec(buf_load(rsrc_do, h_own * (DV * 2) + off, v4i)).bitcast(fx.BFloat16)
+            ov = Vec(o_regs[j]).bitcast(fx.BFloat16)
+            dv = Vec(lds_load(do_lds + h_own * ROW + off, v4i)).bitcast(fx.BFloat16)
             for e in range_constexpr(8):
                 acc = fadd(acc, fmul(fx.Float32(ov[e]), fx.Float32(dv[e])))
         delta_own = fadd(acc, swap_halves(acc))
