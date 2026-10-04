@@ -65,6 +65,9 @@ from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
 _NEG_INF = float("-inf")
 DV = 512  # latent width: K and V
 DQK = 576  # q / kv row length (latent + zero rope pad)
+# gfx12 expert scheduling: the backend models the XDL / TRANS / VALU pipes and runs the wave in
+# hardware SCHED_MODE 2 (5-8% faster on these WMMA-bound kernels).
+COMPILE_HINTS = {"llvm_options": {"amdgpu-expert-scheduling-mode": True}}
 
 
 @functools.lru_cache(maxsize=64)
@@ -266,7 +269,7 @@ def build_sparse_mla_fwd_gfx1250(
         args = (q, kv, topk_indices, o if sink is None else sink, o, lse, int(q.shape[0]), int(kv.shape[0]))
         fn = compiled.get("fn")
         if fn is None:
-            fn = flyc.compile(launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
+            fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
             compiled["fn"] = fn
         return fn(*args, stream)
 

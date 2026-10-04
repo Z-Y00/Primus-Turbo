@@ -40,7 +40,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.attention.sparse_mla_fwd_gfx1250 import DQK, DV
+from primus_turbo.flydsl.attention.sparse_mla_fwd_gfx1250 import COMPILE_HINTS, DQK, DV
 from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
     LOG2E,
     WAVE,
@@ -341,7 +341,7 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
         args = (q, kv, o, do, topk_indices, lse, dq, delta, interm, int(q.shape[0]), int(kv.shape[0]))
         fn = compiled.get("fn")
         if fn is None:
-            fn = flyc.compile(launch_sparse_mla_bwd_gfx1250, *args, fx.Stream(stream))
+            fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_bwd_gfx1250, *args, fx.Stream(stream))
             compiled["fn"] = fn
         return fn(*args, stream)
 

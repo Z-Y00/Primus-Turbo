@@ -47,3 +47,9 @@
 - Signal: one-program-per-row gather 4.6x slower on cr128 than cr0 at similar bytes.
 - Takeaway: split only heavy rows (> SEG entries) into fixed blocks of the sorted entry list, write per-block partials, add them in block order in a fix-up kernel (deterministic). Keep light rows on a 1-program-per-row path in the same launch — a pure fixed-block design was ~2x slower on short uniform rows (longer dependent-load chain + serial row loop).
 - Applicability: any deterministic scatter-to-gather (inverted index) reduction with skewed row lengths.
+
+### 2026-10-04 14:15 round-11 — ACCEPTED
+- Context: WMMA-bound FlyDSL kernels (attention fwd/bwd) on gfx1250.
+- Signal: free compiler knob listed in the FlyDSL arch-gfx1250 notes.
+- Takeaway: `flyc.compile[{"llvm_options": {"amdgpu-expert-scheduling-mode": True}}](launch, ...)` gave +3..7% on every shape (largest on compute-heavy ones) with identical VGPRs and bitwise-same-quality results; verify `hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2` in `21_final_isa.s`. `amdgpu-sched-strategy=coexec` was neutral. Try it first on any new gfx1250 WMMA kernel.
+- Applicability: any gfx1250 (gfx12+) compute-bound kernel.
