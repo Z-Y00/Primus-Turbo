@@ -82,3 +82,9 @@
 - Signal: the compiler put two LDS loads + `s_wait_dscnt` right before every WMMA (no lookahead) and regrouped interleaved chains when prefetch was deep; debug runs without LDS loads were 32% faster.
 - Takeaway: (1) prefetch LDS operands in the source (a Python queue of fragments N steps ahead) and pin the order with `rocdl.sched_barrier(0)` every few steps — prefetch 8 / pin 4 was best; (2) software-pipeline QK(t+1) against PV(t) in one block; (3) spend the 1024-VGPR file on more heads per wave (32 = two 16-head groups) so each LDS fragment feeds 2 WMMAs — the single biggest win (pro cr4 fwd 1.33 -> 0.93 ms, 950 VGPRs, no spills); (4) gfx1250 has no LDS bank-conflict counters; padding sweeps moved < 2%; (5) 16-bit TDM gather indices (dword0 `0x80000001`, 16 rows/op, two indices per dword) halve the op count against the 3-ops/wave queue; deeper rings lost (TDM LDS writes compete with operand reads); (6) expert scheduling mode miscompiled one VALU/WMMA interleaving (non-deterministic wrong results, correct with expert off) — re-verify every new interleaving several times.
 - Applicability: any gfx1250 1-wave/SIMD WMMA kernel reading operands from LDS.
+
+### 2026-10-04 21:15 round-18 — REJECTED
+- Context: one-wave/SIMD WMMA attention forward on gfx1250 (expert scheduling mode).
+- Signal: FA3-style intra-wave pipelining (softmax + O rescale of tile t spliced between the independent QK(t+1) WMMAs) was verified in the ISA but made the forward 1-2% slower.
+- Takeaway: a wave's own VALU/TRANS work does not hide under its WMMAs; softmax cost here is issue cost. Reduce instruction count (lazy rescale, fewer selects) rather than reorder.
+- Applicability: any single-wave WMMA kernel considering intra-wave softmax/GEMM overlap on gfx1250.
