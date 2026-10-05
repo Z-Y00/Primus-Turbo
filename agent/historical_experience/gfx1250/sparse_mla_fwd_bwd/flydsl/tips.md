@@ -88,3 +88,9 @@
 - Signal: FA3-style intra-wave pipelining (softmax + O rescale of tile t spliced between the independent QK(t+1) WMMAs) was verified in the ISA but made the forward 1-2% slower.
 - Takeaway: a wave's own VALU/TRANS work does not hide under its WMMAs; softmax cost here is issue cost. Reduce instruction count (lazy rescale, fewer selects) rather than reorder.
 - Applicability: any single-wave WMMA kernel considering intra-wave softmax/GEMM overlap on gfx1250.
+
+### 2026-10-04 21:30 OPUS asm study (no round) — where its softmax cycles go
+- Context: aiter OPUS gfx1250 sparse-prefill forward (`opus_mla_v4_prefill_a16w16_16mx4_64nx1.co`, cy1 kernel), steady-state loop.
+- Signal: its softmax runs as a contiguous block with no WMMAs inside (no intra-wave softmax/WMMA overlap, consistent with round 18).
+- Takeaway (candidates, not yet tried): (1) thresholded lazy rescale (FA4-style): `growth = scale*tile_max - m_run`; if `growth <= 8.0` on every lane (`v_cmp_ge` + `s_cmp_eq vcc, exec` + `s_cbranch_vccnz`) keep the stale max and skip alpha + the 128 `v_pk_mul` O rescale — safe since exp2(s - m) <= 2^8; (2) lean exp path: one `v_fma_f32 x, s_scale, -m` per score alternated with `v_exp_f32` (VALU/TRANS co-issue), vs our pk_mul + cndmask + sub + back-to-back exps + v_nop; (3) split barrier: `s_barrier_signal`, the last PV WMMAs from already-loaded registers, then `s_barrier_wait`. OPUS also sets SCHED_MODE 2 (same as our expert mode).
+- Applicability: next steps for the gfx1250 sparse-MLA forward; (1)-(3) apply to any single-wave WMMA attention forward.
