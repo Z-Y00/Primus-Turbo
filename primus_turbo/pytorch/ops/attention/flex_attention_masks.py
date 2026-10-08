@@ -14,8 +14,16 @@ a dimension the mask is broadcast over). Under varlen the indices are sequence-l
 ``b`` is the sequence index.
 
 ``causal_mask``, ``sliding_window_mask(...)`` and ``noop_mask`` are recognized: for
-equal query/key lengths they run on the kernel's dedicated causal / window path, which
-needs no block lists and is faster than the general block-sparse path.
+equal query/key lengths they can also run on the kernel's dedicated causal / window
+path, which needs no block lists.
+
+``BLOCK_SIZE`` is the granularity of the exposed block lists. The kernels may run each
+pass at a different granularity -- every block size is exact, since partial blocks
+evaluate ``mask_mod`` per element. With autotuning on (the default;
+``PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE=0`` disables it) the first call for a given mask
+and input shape times the fast path and block sizes 64 / 128 separately for the forward
+and the backward, and reuses the winners: the forward usually prefers big tiles, the
+backward smaller ones.
 """
 
 import functools
@@ -118,7 +126,7 @@ class BlockMask:
         self.BLOCK_SIZE = block_size
         self.device = device
         self._fast_path = fast_path
-        self._plan = plan
+        self._plans = {} if plan is None else {plan.block_size[0]: plan}
         self._cu_seqlens = cu_seqlens
 
     @property
@@ -132,25 +140,33 @@ class BlockMask:
 
     @property
     def plan(self) -> BlockPlan:
-        if self._plan is None:
+        """The block lists at ``BLOCK_SIZE``."""
+        return self.plan_at(self.BLOCK_SIZE[0])
+
+    def plan_at(self, block_size: int) -> BlockPlan:
+        """The block lists at another (square) block size, built on first use.
+
+        Any block size is exact -- partial blocks evaluate ``mask_mod`` per element -- so
+        the kernels may run the forward and backward at different granularities.
+        """
+        if block_size not in self._plans:
             batch, heads, q_len, kv_len = self.shape
-            q_bs, kv_bs = self.BLOCK_SIZE
             cu_q, cu_k = self._cu_seqlens if self._cu_seqlens is not None else (None, None)
             categories = classify_blocks(
                 self.mask_mod,
                 batch,
                 heads,
-                triton.cdiv(q_len, q_bs),
-                triton.cdiv(kv_len, kv_bs),
-                self.BLOCK_SIZE,
+                triton.cdiv(q_len, block_size),
+                triton.cdiv(kv_len, block_size),
+                (block_size, block_size),
                 self.device,
                 q_len=q_len,
                 kv_len=kv_len,
                 cu_seqlens_q=cu_q,
                 cu_seqlens_k=cu_k,
             )
-            self._plan = BlockPlan.from_categories(categories, self.BLOCK_SIZE)
-        return self._plan
+            self._plans[block_size] = BlockPlan.from_categories(categories, (block_size, block_size))
+        return self._plans[block_size]
 
     @property
     def kv_num_blocks(self) -> torch.Tensor:

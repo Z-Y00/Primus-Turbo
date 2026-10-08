@@ -147,6 +147,69 @@ def test_block_sparse_masks(block_size, Sq, Skv, name, mask_mod, keep_fn):
     _check(out, flex_attention_ref(q, k, v, keep_fn=keep_fn)[0], (q, k, v))
 
 
+# ---------------------------------------------------------------- execution-path selection
+
+
+@pytest.mark.parametrize(
+    "name,mask_mod,keep_fn",
+    [("window64", sliding_window_mask(64), _keep_window(64, 0)), CUSTOM[1]],
+    ids=["builtin_window", "custom_prefix_lm"],
+)
+def test_every_forward_backward_path_pair(name, mask_mod, keep_fn):
+    # The forward and backward are tuned independently, so any pairing must be exact.
+    from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
+
+    q, k, v = _inputs(1, 4, 2, 320, 320, 64)
+    block_mask = create_block_mask(mask_mod, None, None, 320, 320)
+    cands = fi._candidates(block_mask, num_splits=1)
+    assert len(cands) >= 2
+    key = fi._tune_key(block_mask, q, k, v, 1, None, False)
+    try:
+        for fwd in cands:
+            for bwd in cands:
+                fi._TUNED[key] = (fwd, bwd)
+                out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+                _check(out, flex_attention_ref(q, k, v, keep_fn=keep_fn)[0], (q, k, v))
+    finally:
+        fi._TUNED.pop(key, None)
+
+
+@triton.jit
+def _band_mask_for_tuning(b, h, q_idx, kv_idx):
+    d = q_idx - kv_idx
+    return (d < 64) & (d > -64)
+
+
+def test_first_call_tunes_and_caches_both_passes():
+    from primus_turbo.pytorch.ops.attention import flex_attention_interface as fi
+
+    q, k, v = _inputs(1, 4, 4, 256, 256, 64)
+    block_mask = create_block_mask(_band_mask_for_tuning, None, None, 256, 256)
+    key = fi._tune_key(block_mask, q, k, v, 1, None, False)
+    with torch.no_grad():
+        flex_attention(q, k, v, block_mask=block_mask)
+    fwd, bwd = fi._TUNED[key]
+    assert fwd is not None and bwd is None  # no gradient needed yet
+    # A rebuilt mask with the same mask_mod and shapes reuses the decision.
+    rebuilt = create_block_mask(_band_mask_for_tuning, None, None, 256, 256)
+    flex_attention(q, k, v, block_mask=rebuilt).sum().backward()
+    fwd2, bwd2 = fi._TUNED[key]
+    assert fwd2 is fwd and bwd2 is not None
+
+
+def test_untuned_default_paths():
+    from primus_turbo.pytorch.kernels.flex_attention.flex_attention_heuristic import (
+        MaskPath,
+        default_paths,
+    )
+
+    sparse = [MaskPath(f"bs{s}", block_size=s) for s in (64, 128)]
+    fwd, bwd = default_paths(sparse, 128)
+    assert (fwd.block_size, bwd.block_size) == (128, 64)
+    fast = MaskPath("fast", causal=True)
+    assert default_paths([fast] + sparse, 128) == (fast, fast)
+
+
 # ---------------------------------------------------------------- score mods
 
 

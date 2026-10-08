@@ -121,8 +121,12 @@ torch.distributed.destroy_process_group()
 + Flex Attention
 
 Same interface as `torch.nn.attention.flex_attention`, with `score_mod` / `mask_mod`
-written as `@triton.jit` functions. `causal_mask` and `sliding_window_mask` run on a
-dedicated fast path; any other mask is evaluated per tile to build the block lists.
+written as `@triton.jit` functions. `create_block_mask` evaluates the `mask_mod` per tile
+to build the block lists; `causal_mask` and `sliding_window_mask` can also use a
+dedicated causal/window kernel path. The first call for a given mask and input shape
+times the available paths (that kernel path, block sizes 64 and 128) separately for the
+forward and the backward and keeps the fastest; set
+`PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE=0` to skip this and use static defaults.
 ```python
 import torch
 import triton

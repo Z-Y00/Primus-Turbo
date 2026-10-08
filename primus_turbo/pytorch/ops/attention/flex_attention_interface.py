@@ -28,20 +28,28 @@ than traced:
 * ``return_aux`` supports ``lse`` but not ``max_scores``.
 """
 
+import dataclasses
 from dataclasses import dataclass, field
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional
 
 import torch
 
-from primus_turbo.pytorch.kernels.flex_attention.flex_attention_block_mask_utils import (
-    BlockPlan,
+from primus_turbo.pytorch.kernels.flex_attention.flex_attention_heuristic import (
+    AUTOTUNE_BLOCK_SIZES,
+    NO_MASK,
+    MaskPath,
+    default_paths,
+    fastest,
 )
 from primus_turbo.pytorch.kernels.flex_attention.flex_attention_impl import (
     flex_attention_backward_impl,
     flex_attention_forward_impl,
 )
 from primus_turbo.pytorch.ops.attention.flex_attention_masks import BlockMask
-from primus_turbo.triton.flex_attention.flex_attention_utils import MAX_AUX_TENSORS
+from primus_turbo.triton.flex_attention.flex_attention_utils import (
+    AUTOTUNE,
+    MAX_AUX_TENSORS,
+)
 
 __all__ = ["AuxOutput", "AuxRequest", "flex_attention", "flex_attention_varlen"]
 
@@ -66,12 +74,11 @@ class _Config:
     """Everything the autograd function needs besides the differentiable tensors."""
 
     scale: float
-    causal: bool
-    window: Tuple[int, int]
+    # How the mask is run, chosen per pass (see flex_attention_heuristic).
+    fwd: MaskPath = NO_MASK
+    bwd: MaskPath = NO_MASK
     score_mod: object = None
-    mask_mod: object = None
     score_mod_bwd: object = None
-    block_plan: Optional[BlockPlan] = None
     num_splits: int = 1
     aux_tensors: list = field(default_factory=list)
     score_grad_hook: object = None
@@ -83,6 +90,32 @@ class _Config:
     @property
     def varlen(self) -> bool:
         return self.cu_seqlens_q is not None
+
+    def forward_kwargs(self, path: MaskPath) -> dict:
+        return dict(
+            scale=self.scale,
+            causal=path.causal,
+            window=path.window,
+            cu_seqlens_q=self.cu_seqlens_q,
+            cu_seqlens_k=self.cu_seqlens_k,
+            max_seqlen_q=self.max_seqlen_q,
+            max_seqlen_k=self.max_seqlen_k,
+            score_mod=self.score_mod,
+            mask_mod=path.mask_mod,
+            block_plan=path.plan,
+            num_splits=self.num_splits,
+            aux_tensors=self.aux_tensors,
+        )
+
+    def backward_kwargs(self, path: MaskPath, score_grad=None) -> dict:
+        kwargs = self.forward_kwargs(path)
+        del kwargs["num_splits"]
+        return dict(
+            kwargs,
+            score_mod_bwd=self.score_mod_bwd,
+            score_grad_hook=self.score_grad_hook if score_grad is not None else None,
+            score_grad=score_grad,
+        )
 
 
 class FlexAttentionFunc(torch.autograd.Function):
@@ -102,25 +135,7 @@ class FlexAttentionFunc(torch.autograd.Function):
             out = torch.empty(batch, heads, seqlen_q, v.shape[-1], dtype=q.dtype, device=q.device)
             lse = torch.empty(batch, heads, seqlen_q, dtype=torch.float32, device=q.device)
             qk, kk, vk, ok = (t.transpose(1, 2) for t in (q, k, v, out))
-        flex_attention_forward_impl(
-            qk,
-            kk,
-            vk,
-            ok,
-            lse,
-            scale=cfg.scale,
-            causal=cfg.causal,
-            window=cfg.window,
-            cu_seqlens_q=cfg.cu_seqlens_q,
-            cu_seqlens_k=cfg.cu_seqlens_k,
-            max_seqlen_q=cfg.max_seqlen_q,
-            max_seqlen_k=cfg.max_seqlen_k,
-            score_mod=cfg.score_mod,
-            mask_mod=cfg.mask_mod,
-            block_plan=cfg.block_plan,
-            num_splits=cfg.num_splits,
-            aux_tensors=cfg.aux_tensors,
-        )
+        flex_attention_forward_impl(qk, kk, vk, ok, lse, **cfg.forward_kwargs(cfg.fwd))
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.cfg = cfg
         ctx.score_grad_like = (
@@ -151,20 +166,7 @@ class FlexAttentionFunc(torch.autograd.Function):
             *tensors[:5],
             lse,
             *tensors[5:],
-            scale=cfg.scale,
-            causal=cfg.causal,
-            window=cfg.window,
-            cu_seqlens_q=cfg.cu_seqlens_q,
-            cu_seqlens_k=cfg.cu_seqlens_k,
-            max_seqlen_q=cfg.max_seqlen_q,
-            max_seqlen_k=cfg.max_seqlen_k,
-            score_mod=cfg.score_mod,
-            mask_mod=cfg.mask_mod,
-            score_mod_bwd=cfg.score_mod_bwd,
-            block_plan=cfg.block_plan,
-            aux_tensors=cfg.aux_tensors,
-            score_grad_hook=cfg.score_grad_hook if score_grad is not None else None,
-            score_grad=score_grad,
+            **cfg.backward_kwargs(cfg.bwd, score_grad),
             dlse=None if dlse is None else dlse.contiguous(),
         )
         return dq, dk, dv, score_grad, None
@@ -208,7 +210,7 @@ def _check_mods(q, k, v, score_mod, score_mod_bwd, aux_tensors, score_grad_hook,
             raise ValueError(f"score_grad_target must be a contiguous tensor on {q.device}")
 
 
-def _resolve_options(kernel_options, return_lse, return_aux, block_plan, varlen):
+def _resolve_options(kernel_options, return_lse, return_aux, varlen):
     options = dict(kernel_options or {})
     unknown = set(options) - set(_KERNEL_OPTIONS)
     if unknown:
@@ -216,10 +218,8 @@ def _resolve_options(kernel_options, return_lse, return_aux, block_plan, varlen)
     num_splits = int(options.get("num_splits", 1))
     if num_splits < 1:
         raise ValueError(f"num_splits must be >= 1, got {num_splits}")
-    if num_splits > 1 and (varlen or block_plan is not None):
-        raise NotImplementedError(
-            "num_splits > 1 is supported for dense attention without a block-sparse mask"
-        )
+    if num_splits > 1 and varlen:
+        raise NotImplementedError("num_splits > 1 is not supported by flex_attention_varlen")
     if return_aux is not None:
         if return_lse:
             raise ValueError("return_lse and return_aux cannot both be given; use return_aux")
@@ -228,14 +228,136 @@ def _resolve_options(kernel_options, return_lse, return_aux, block_plan, varlen)
     return num_splits
 
 
-def _mask_path(block_mask: Optional[BlockMask]):
-    """(causal, window, mask_mod, block_plan) for the kernel."""
-    if block_mask is None:
-        return False, (-1, -1), None, None
+def _candidates(block_mask: BlockMask, num_splits: int):
+    """Every exact way to run this mask: the kernel's causal/window path for a built-in
+    mask, and the block-sparse path at each candidate block size."""
+    cands = []
     if block_mask._fast_path is not None:
         causal, left, right = block_mask._fast_path
-        return causal, (left, right), None, None
-    return False, (-1, -1), block_mask.mask_mod, block_mask.plan
+        cands.append(MaskPath("fast", causal=causal, window=(left, right)))
+    if num_splits > 1:
+        if not cands:
+            raise NotImplementedError(
+                "num_splits > 1 needs a mask on the causal/window path, not a block-sparse one"
+            )
+        return cands  # split-KV is implemented on the dense path only
+    block_size = block_mask.BLOCK_SIZE[0]
+    if AUTOTUNE == "on":
+        sizes = sorted(set(AUTOTUNE_BLOCK_SIZES) | {block_size})
+    elif cands:
+        sizes = []  # untuned: the fast path wins, no lists needed
+    else:
+        sizes = sorted({block_size, min(block_size, 64)})
+    for size in sizes:
+        cands.append(MaskPath(f"block_sparse_{size}", mask_mod=block_mask.mask_mod, block_size=size))
+    return cands
+
+
+def _bind(path: MaskPath, block_mask: BlockMask) -> MaskPath:
+    """Attach the call's block lists to a block-sparse path (built on first use)."""
+    if path.block_size is None:
+        return path
+    return dataclasses.replace(path, plan=block_mask.plan_at(path.block_size))
+
+
+# Tuning decisions, shared across BlockMask objects: masks are commonly rebuilt every
+# step (document masks especially), and the decision depends only on what is in the key.
+_TUNED: dict = {}
+
+
+def _tune_key(block_mask: BlockMask, q, k, v, num_splits: int, score_mod, varlen: bool):
+    """What decides the fastest path. Varlen omits the exact token count, so batches
+    packed differently into the same number of sequences share a decision."""
+    q_shape, k_shape = (
+        (tuple(q.shape[1:]), tuple(k.shape[1:])) if varlen else (tuple(q.shape), tuple(k.shape))
+    )
+    return (
+        block_mask.mask_mod,
+        block_mask._fast_path,
+        block_mask.shape,
+        block_mask.BLOCK_SIZE,
+        varlen,
+        q_shape,
+        k_shape,
+        v.shape[-1],
+        q.dtype,
+        num_splits,
+        score_mod,
+    )
+
+
+def _tune(
+    cands, block_mask, q, k, v, cfg: _Config, score_grad_target, fwd: Optional[MaskPath], tune_bwd: bool
+):
+    """Time the candidates on scratch copies of the inputs (the caller's tensors and
+    autograd graph are not touched). The forward is timed once; the backward only when a
+    gradient is needed, on top of the chosen forward's output. Returns unbound paths.
+
+    Varlen block lists depend on ``cu_seqlens``, which changes every batch, so a varlen
+    candidate is timed including a fresh plan build (and the backward's derived lists):
+    that cost recurs every step, while the fast path needs no lists at all.
+    """
+    bound = {c.name: _bind(c, block_mask) for c in cands}
+
+    def plan_for(path):
+        if cfg.varlen and path.block_size is not None:
+            block_mask._plans.pop(path.block_size, None)
+            return _bind(path, block_mask)
+        return bound[path.name]
+
+    with torch.no_grad():
+        qs, ks, vs = (torch.randn_like(t) for t in (q, k, v))
+        if cfg.varlen:
+            out = torch.empty(q.shape[0], q.shape[1], v.shape[-1], dtype=q.dtype, device=q.device)
+            lse = torch.empty(q.shape[1], q.shape[0], dtype=torch.float32, device=q.device)
+            view = lambda t: t  # noqa: E731
+        else:
+            out = torch.empty(*q.shape[:3], v.shape[-1], dtype=q.dtype, device=q.device)
+            lse = torch.empty(*q.shape[:3], dtype=torch.float32, device=q.device)
+            view = lambda t: t.transpose(1, 2)  # noqa: E731
+        qk, kk, vk, ok = (view(t) for t in (qs, ks, vs, out))
+
+        def run_fwd(path):
+            flex_attention_forward_impl(qk, kk, vk, ok, lse, **cfg.forward_kwargs(plan_for(path)))
+
+        if fwd is None:
+            fwd = fastest(cands, run_fwd)
+        if not tune_bwd:
+            return fwd, None
+        run_fwd(fwd)
+        dout = torch.randn_like(out)
+        grads = [torch.zeros_like(t) for t in (qs, ks, vs)]
+        score_grad = None
+        if cfg.score_grad_hook is not None and score_grad_target is not None:
+            score_grad = torch.zeros_like(score_grad_target)
+        tensors = [view(t) for t in (dout, qs, ks, vs, out, *grads)]
+
+        def run_bwd(path):
+            flex_attention_backward_impl(
+                *tensors[:5], lse, *tensors[5:], **cfg.backward_kwargs(plan_for(path), score_grad)
+            )
+
+        return fwd, fastest(cands, run_bwd)
+
+
+def _select_paths(block_mask, q, k, v, cfg: _Config, score_grad_target, needs_grad):
+    """(forward path, backward path), bound to this mask's block lists: tuned once per
+    key (see ``_tune_key``), or the static default when autotuning is off
+    (``PRIMUS_TURBO_FLEX_ATTENTION_AUTOTUNE=0``)."""
+    if block_mask is None:
+        return NO_MASK, NO_MASK
+    cands = _candidates(block_mask, cfg.num_splits)
+    fwd, bwd = default_paths(cands, block_mask.BLOCK_SIZE[0])
+    if AUTOTUNE == "on" and len(cands) > 1:
+        key = _tune_key(block_mask, q, k, v, cfg.num_splits, cfg.score_mod, cfg.varlen)
+        tuned_fwd, tuned_bwd = _TUNED.get(key, (None, None))
+        if tuned_fwd is None or (needs_grad and tuned_bwd is None):
+            tuned_fwd, tuned_bwd = _tune(
+                cands, block_mask, q, k, v, cfg, score_grad_target, tuned_fwd, tune_bwd=needs_grad
+            )
+            _TUNED[key] = (tuned_fwd, tuned_bwd)
+        fwd, bwd = tuned_fwd, tuned_bwd or bwd
+    return _bind(fwd, block_mask), _bind(bwd, block_mask)
 
 
 def _finish(out, lse, return_lse, return_aux):
@@ -290,20 +412,22 @@ def flex_attention(
                 f"(B={batch}, H={heads_q}, Q_LEN={seqlen_q}, KV_LEN={seqlen_k})"
             )
     _check_mods(query, key, value, score_mod, score_mod_bwd, aux_tensors, score_grad_hook, score_grad_target)
-    causal, window, mask_mod, block_plan = _mask_path(block_mask)
-    num_splits = _resolve_options(kernel_options, return_lse, return_aux, block_plan, varlen=False)
     cfg = _Config(
         scale=query.shape[-1] ** -0.5 if scale is None else float(scale),
-        causal=causal,
-        window=window,
         score_mod=score_mod,
-        mask_mod=mask_mod,
         score_mod_bwd=score_mod_bwd,
-        block_plan=block_plan,
-        num_splits=num_splits,
+        num_splits=_resolve_options(kernel_options, return_lse, return_aux, varlen=False),
         aux_tensors=list(aux_tensors or ()),
         score_grad_hook=score_grad_hook,
     )
+    return _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, return_aux)
+
+
+def _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, return_aux):
+    needs_grad = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad for t in (query, key, value, score_grad_target)
+    )
+    cfg.fwd, cfg.bwd = _select_paths(block_mask, query, key, value, cfg, score_grad_target, needs_grad)
     out, lse = FlexAttentionFunc.apply(query, key, value, score_grad_target, cfg)
     return _finish(out, lse, return_lse, return_aux)
 
@@ -353,17 +477,11 @@ def flex_attention_varlen(
         if block_mask.shape[1] not in (1, heads_q):
             raise ValueError(f"block mask has {block_mask.shape[1]} heads, query has {heads_q}")
     _check_mods(query, key, value, score_mod, score_mod_bwd, aux_tensors, score_grad_hook, score_grad_target)
-    causal, window, mask_mod, block_plan = _mask_path(block_mask)
-    num_splits = _resolve_options(kernel_options, return_lse, return_aux, block_plan, varlen=True)
     cfg = _Config(
         scale=query.shape[-1] ** -0.5 if scale is None else float(scale),
-        causal=causal,
-        window=window,
         score_mod=score_mod,
-        mask_mod=mask_mod,
         score_mod_bwd=score_mod_bwd,
-        block_plan=block_plan,
-        num_splits=num_splits,
+        num_splits=_resolve_options(kernel_options, return_lse, return_aux, varlen=True),
         aux_tensors=list(aux_tensors or ()),
         score_grad_hook=score_grad_hook,
         cu_seqlens_q=cu_seqlens_q,
@@ -371,5 +489,4 @@ def flex_attention_varlen(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_k=int(max_seqlen_k),
     )
-    out, lse = FlexAttentionFunc.apply(query, key, value, score_grad_target, cfg)
-    return _finish(out, lse, return_lse, return_aux)
+    return _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, return_aux)
