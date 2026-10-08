@@ -1,0 +1,176 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+from primus_turbo.pytorch.ops import (
+    causal_mask,
+    create_block_mask_varlen,
+    flex_attention_varlen,
+    flex_attention_varlen_rel_bias,
+    identity_score_mod_bwd,
+    sliding_window_mask,
+)
+from tests.pytorch.ref.flex_attention_ref import flex_attention_varlen_ref, rel_bias_ref
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+
+DTYPE = torch.bfloat16
+TOL = 2e-2
+
+
+def _cu(seqlens):
+    return torch.tensor([0] + list(seqlens), device="cuda").cumsum(0).to(torch.int32)
+
+
+def _packed(Tq, Tk, Hq, Hkv, D, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen).to("cuda", DTYPE).requires_grad_(True)
+
+    return randn(Tq, Hq, D), randn(Tk, Hkv, D), randn(Tk, Hkv, D)
+
+
+def _check(out, ref, leaves):
+    torch.testing.assert_close(out.float(), ref, atol=TOL, rtol=TOL)
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, leaves, dout)
+    ref_grads = torch.autograd.grad(ref, leaves, dout.float())
+    for i, (g, r) in enumerate(zip(grads, ref_grads)):
+        scale = r.abs().max().item()
+        err = (g.float() - r.float()).abs().max().item()
+        assert err <= 5 * TOL * max(scale, 1.0), f"grad {i}: max err {err} vs max |ref| {scale}"
+
+
+SEQLENS = [(256,), (150, 106, 64), (300, 212)]
+
+
+@pytest.mark.parametrize("seqlens", SEQLENS, ids=str)
+@pytest.mark.parametrize(
+    "name,mask_fn,keep_fn",
+    [
+        ("none", None, None),
+        ("causal", lambda: causal_mask, lambda b, h, q, kv: q >= kv),
+        ("window100", lambda: sliding_window_mask(100), lambda b, h, q, kv: (q >= kv) & (q - kv <= 100)),
+    ],
+    ids=["none", "causal", "window100"],
+)
+def test_builtin_masks_self_attention(seqlens, name, mask_fn, keep_fn):
+    cu = _cu(seqlens)
+    q, k, v = _packed(cu[-1].item(), cu[-1].item(), 8, 2, 128)
+    block_mask = None
+    if mask_fn is not None:
+        block_mask = create_block_mask_varlen(mask_fn(), cu, cu, max(seqlens), max(seqlens))
+        assert block_mask._fast_path is not None
+    out = flex_attention_varlen(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), block_mask=block_mask, enable_gqa=True
+    )
+    _check(out, flex_attention_varlen_ref(q, k, v, cu, cu, keep_fn=keep_fn)[0], (q, k, v))
+
+
+def test_causal_mask_with_different_key_lengths():
+    # Separate cu_seqlens tensors leave the fast path; the mask runs per tile instead.
+    seq_q, seq_k = (96, 160), (224, 160)
+    cu_q, cu_k = _cu(seq_q), _cu(seq_k)
+    q, k, v = _packed(cu_q[-1].item(), cu_k[-1].item(), 4, 4, 64, seed=1)
+    block_mask = create_block_mask_varlen(causal_mask, cu_q, cu_k, max(seq_q), max(seq_k), BLOCK_SIZE=64)
+    assert block_mask._fast_path is None
+    out = flex_attention_varlen(q, k, v, cu_q, cu_k, max(seq_q), max(seq_k), block_mask=block_mask)
+    ref = flex_attention_varlen_ref(q, k, v, cu_q, cu_k, keep_fn=lambda b, h, qi, ki: qi >= ki)[0]
+    _check(out, ref, (q, k, v))
+
+
+@triton.jit
+def _band_mask(b, h, q_idx, kv_idx):
+    d = q_idx - kv_idx
+    return (d < 80) & (d > -80)
+
+
+def test_custom_block_sparse_mask():
+    seqlens = (300, 212, 128)
+    cu = _cu(seqlens)
+    q, k, v = _packed(cu[-1].item(), cu[-1].item(), 4, 2, 64, seed=2)
+    block_mask = create_block_mask_varlen(_band_mask, cu, cu, max(seqlens), max(seqlens), BLOCK_SIZE=64)
+    out = flex_attention_varlen(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), block_mask=block_mask, enable_gqa=True
+    )
+    ref = flex_attention_varlen_ref(q, k, v, cu, cu, keep_fn=lambda b, h, qi, ki: (qi - ki).abs() < 80)[0]
+    _check(out, ref, (q, k, v))
+
+
+@triton.jit
+def _packed_kv_bias_score_mod(score, b, h, q_idx, kv_idx, BIAS, CU_SEQLENS):
+    return score + tl.load(BIAS + tl.load(CU_SEQLENS + b) + kv_idx)
+
+
+def test_two_aux_tensors():
+    seqlens = (150, 106, 64)
+    cu = _cu(seqlens)
+    q, k, v = _packed(cu[-1].item(), cu[-1].item(), 4, 4, 128, seed=3)
+    bias = torch.randn(cu[-1].item() + 256, device="cuda") * 2  # padded for tail tiles
+    out = flex_attention_varlen(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max(seqlens),
+        max(seqlens),
+        score_mod=_packed_kv_bias_score_mod,
+        score_mod_bwd=identity_score_mod_bwd,
+        block_mask=create_block_mask_varlen(causal_mask, cu, cu, max(seqlens), max(seqlens)),
+        aux_tensors=[bias, cu],
+    )
+    starts = cu[:-1]
+
+    def score_fn(s, b, h, qi, ki):
+        return s + bias[starts[b] + ki]
+
+    ref = flex_attention_varlen_ref(
+        q, k, v, cu, cu, score_fn=score_fn, keep_fn=lambda b, h, qi, ki: qi >= ki
+    )[0]
+    _check(out, ref, (q, k, v))
+
+
+# (seqlens, rel_extent, window_left): one tile and several, ragged tails, and windows
+# shorter than, equal to and longer than the extent.
+REL_BIAS_CASES = [
+    ((256,), 48, None),
+    ((160, 96), 48, 47),
+    ((150, 106), 130, None),
+    ((300, 212), 130, 199),
+    ((300, 212), 200, 129),
+]
+
+
+@pytest.mark.parametrize("heads", [(16, 2), (16, 4)], ids=["global", "local"])
+@pytest.mark.parametrize("seqlens,rel_extent,window_left", REL_BIAS_CASES, ids=str)
+def test_rel_bias(heads, seqlens, rel_extent, window_left):
+    Hq, Hkv = heads
+    cu = _cu(seqlens)
+    T = cu[-1].item()
+    q, k, v = _packed(T, T, Hq, Hkv, 128, seed=4)
+    rel = (torch.randn(T, Hq, rel_extent, device="cuda") * 0.5).requires_grad_(True)
+    out = flex_attention_varlen_rel_bias(
+        q, k, v, rel, cu, max(seqlens), scale=1.0 / 128, window_left=window_left
+    )
+    ref = rel_bias_ref(q, k, v, rel, cu, scale=1.0 / 128, window_left=window_left)
+    _check(out, ref, (q, k, v, rel))
+
+
+def test_rel_bias_without_grad():
+    seqlens = (160, 96)
+    cu = _cu(seqlens)
+    q, k, v = _packed(256, 256, 8, 2, 128, seed=5)
+    rel = torch.randn(256, 8, 48, device="cuda") * 0.5
+    with torch.no_grad():
+        out = flex_attention_varlen_rel_bias(q, k, v, rel, cu, 160, scale=1.0 / 128)
+    ref = rel_bias_ref(q, k, v, rel, cu, scale=1.0 / 128)
+    torch.testing.assert_close(out.float(), ref, atol=TOL, rtol=TOL)

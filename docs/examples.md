@@ -118,6 +118,58 @@ torch.distributed.destroy_process_group()
 # run with torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=12355 this_code.py
 ```
 
++ Flex Attention
+
+Same interface as `torch.nn.attention.flex_attention`, with `score_mod` / `mask_mod`
+written as `@triton.jit` functions. `causal_mask` and `sliding_window_mask` run on a
+dedicated fast path; any other mask is evaluated per tile to build the block lists.
+```python
+import torch
+import triton
+import triton.language as tl
+import primus_turbo.pytorch as turbo
+
+B, Hq, Hkv, S, D = 2, 16, 2, 4096, 128
+q = torch.randn(B, Hq, S, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+k = torch.randn(B, Hkv, S, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+v = torch.randn(B, Hkv, S, D, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+
+@triton.jit
+def prefix_lm_mask(b, h, q_idx, kv_idx):
+    return (kv_idx < 512) | (q_idx >= kv_idx)
+
+@triton.jit
+def alibi(score, b, h, q_idx, kv_idx):
+    return score - 0.01 * (h + 1) * (q_idx - kv_idx).to(tl.float32)
+
+block_mask = turbo.ops.create_block_mask(prefix_lm_mask, None, None, S, S)
+out, aux = turbo.ops.flex_attention(
+    q, k, v,
+    score_mod=alibi,
+    score_mod_bwd=turbo.ops.identity_score_mod_bwd,  # score_mod is not auto-differentiated
+    block_mask=block_mask,
+    enable_gqa=True,
+    return_aux=turbo.ops.AuxRequest(lse=True),
+)
+out.sum().backward()
+```
+
+Packed sequences use `flex_attention_varlen` with `cu_seqlens`. A tensor read by
+`score_mod` is passed in `aux_tensors`; to train it, pass it as `score_grad_target`
+with a `score_grad_hook`. `flex_attention_varlen_rel_bias` packages this for a
+relative-position bias table (Inkling):
+```python
+T, RE = 8192, 1024
+cu_seqlens = torch.tensor([0, 3072, 5120, 8192], dtype=torch.int32, device="cuda")
+q = torch.randn(T, 16, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+k = torch.randn(T, 2, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+v = torch.randn(T, 2, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+rel_logits = torch.randn(T, 16, RE, device="cuda", requires_grad=True)  # [T, Hq, RE]
+
+out = turbo.ops.flex_attention_varlen_rel_bias(q, k, v, rel_logits, cu_seqlens, max_seqlen=3072, scale=1 / 128)
+out.sum().backward()  # gradients for q, k, v and rel_logits
+```
+
 
 ### 1.3 Grouped Gemm
 ```python

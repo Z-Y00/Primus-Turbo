@@ -1,0 +1,279 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+from primus_turbo.pytorch.ops import (
+    AuxRequest,
+    causal_mask,
+    create_block_mask,
+    flex_attention,
+    identity_score_mod_bwd,
+    make_softcap_score_mod,
+    noop_mask,
+    sliding_window_mask,
+)
+from tests.pytorch.ref.flex_attention_ref import flex_attention_ref
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+
+DTYPE = torch.bfloat16
+TOL = 2e-2
+
+
+def _inputs(B, Hq, Hkv, Sq, Skv, D, Dv=None, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen).to("cuda", DTYPE).requires_grad_(True)
+
+    return randn(B, Hq, Sq, D), randn(B, Hkv, Skv, D), randn(B, Hkv, Skv, Dv or D)
+
+
+def _check(out, ref, leaves, extra_loss=None, ref_extra_loss=None):
+    """Compare out, then every gradient of leaves, against the fp32 reference."""
+    torch.testing.assert_close(out.float(), ref, atol=TOL, rtol=TOL)
+    dout = torch.randn_like(out)
+    loss = (out * dout).sum() + (0 if extra_loss is None else extra_loss)
+    ref_loss = (ref * dout.float()).sum() + (0 if ref_extra_loss is None else ref_extra_loss)
+    grads = torch.autograd.grad(loss, leaves, retain_graph=True)
+    ref_grads = torch.autograd.grad(ref_loss, leaves)
+    for i, (g, r) in enumerate(zip(grads, ref_grads)):
+        scale = r.abs().max().item()
+        err = (g.float() - r.float()).abs().max().item()
+        assert err <= 5 * TOL * max(scale, 1.0), f"grad {i}: max err {err} vs max |ref| {scale}"
+
+
+# ---------------------------------------------------------------- built-in masks
+
+
+def _keep_causal(b, h, q, kv):
+    return q >= kv
+
+
+def _keep_window(left, right):
+    return lambda b, h, q, kv: (q - kv <= left) & (q - kv >= -right)
+
+
+SHAPES = [(2, 4, 4, 256, 256, 64), (1, 8, 2, 384, 384, 128), (1, 4, 1, 200, 200, 128)]
+BUILTINS = [
+    ("none", None, None),
+    ("causal", causal_mask, _keep_causal),
+    ("window64", sliding_window_mask(64), _keep_window(64, 0)),
+    ("window32x32", sliding_window_mask(32, 32), _keep_window(32, 32)),
+    ("noop", noop_mask, None),
+]
+
+
+@pytest.mark.parametrize("shape", SHAPES, ids=str)
+@pytest.mark.parametrize("name,mask_mod,keep_fn", BUILTINS, ids=[b[0] for b in BUILTINS])
+def test_builtin_masks(shape, name, mask_mod, keep_fn):
+    B, Hq, Hkv, Sq, Skv, D = shape
+    q, k, v = _inputs(B, Hq, Hkv, Sq, Skv, D)
+    block_mask = None if mask_mod is None else create_block_mask(mask_mod, None, None, Sq, Skv)
+    if block_mask is not None:
+        assert block_mask._fast_path is not None
+    out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+    ref, _ = flex_attention_ref(q, k, v, keep_fn=keep_fn)
+    _check(out, ref, (q, k, v))
+
+
+def test_causal_mask_unequal_lengths_is_top_left():
+    # Sq != Skv leaves the fast path (its causal flag is bottom-right aligned) and runs
+    # the mask itself, which keeps torch's top-left semantics.
+    q, k, v = _inputs(1, 4, 4, 128, 384, 64)
+    block_mask = create_block_mask(causal_mask, 1, 4, 128, 384, BLOCK_SIZE=64)
+    assert block_mask._fast_path is None
+    out = flex_attention(q, k, v, block_mask=block_mask)
+    _check(out, flex_attention_ref(q, k, v, keep_fn=_keep_causal)[0], (q, k, v))
+
+
+# ---------------------------------------------------------------- block-sparse masks
+
+
+@triton.jit
+def _band_mask(b, h, q_idx, kv_idx):
+    d = q_idx - kv_idx
+    return (d < 96) & (d > -96)
+
+
+@triton.jit
+def _prefix_lm_mask(b, h, q_idx, kv_idx):
+    return (kv_idx < 64) | (q_idx >= kv_idx)
+
+
+@triton.jit
+def _head_checker_mask(b, h, q_idx, kv_idx):
+    return ((q_idx // 64 + kv_idx // 64 + h) % 2) == 0
+
+
+CUSTOM = [
+    ("band", _band_mask, lambda b, h, q, kv: (q - kv).abs() < 96),
+    ("prefix_lm", _prefix_lm_mask, lambda b, h, q, kv: (kv < 64) | (q >= kv)),
+    ("head_checker", _head_checker_mask, lambda b, h, q, kv: ((q // 64 + kv // 64 + h) % 2) == 0),
+]
+
+
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("Sq,Skv", [(512, 512), (384, 640), (300, 300)])
+@pytest.mark.parametrize("name,mask_mod,keep_fn", CUSTOM, ids=[c[0] for c in CUSTOM])
+def test_block_sparse_masks(block_size, Sq, Skv, name, mask_mod, keep_fn):
+    B, H = 2, 4
+    q, k, v = _inputs(B, H, 2, Sq, Skv, 64)
+    per_head = name == "head_checker"
+    block_mask = create_block_mask(mask_mod, None, H if per_head else None, Sq, Skv, BLOCK_SIZE=block_size)
+
+    # The visited tiles are exactly those with at least one kept position.
+    dev = q.device
+    keep = keep_fn(
+        torch.zeros(1, 1, 1, 1, device=dev, dtype=torch.long),
+        torch.arange(block_mask.shape[1], device=dev).view(1, -1, 1, 1),
+        torch.arange(Sq, device=dev).view(1, 1, Sq, 1),
+        torch.arange(Skv, device=dev).view(1, 1, 1, Skv),
+    ).expand(1, block_mask.shape[1], Sq, Skv)
+    nq, nk = triton.cdiv(Sq, block_size), triton.cdiv(Skv, block_size)
+    padded = torch.zeros(1, keep.shape[1], nq * block_size, nk * block_size, dtype=torch.bool, device=dev)
+    padded[..., :Sq, :Skv] = keep
+    visited = padded.view(1, keep.shape[1], nq, block_size, nk, block_size).any(dim=(3, 5))
+    assert torch.equal(block_mask.to_dense(), visited)
+
+    out = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
+    _check(out, flex_attention_ref(q, k, v, keep_fn=keep_fn)[0], (q, k, v))
+
+
+# ---------------------------------------------------------------- score mods
+
+
+@triton.jit
+def _alibi_score_mod(score, b, h, q_idx, kv_idx):
+    return score - (h + 1) * 0.05 * (q_idx - kv_idx).to(tl.float32)
+
+
+def test_additive_score_mod_with_causal():
+    q, k, v = _inputs(2, 4, 4, 256, 256, 64)
+    out = flex_attention(
+        q,
+        k,
+        v,
+        score_mod=_alibi_score_mod,
+        score_mod_bwd=identity_score_mod_bwd,
+        block_mask=create_block_mask(causal_mask, None, None, 256, 256),
+    )
+
+    def score_fn(s, b, h, qi, ki):
+        return s - (h + 1) * 0.05 * (qi - ki).float()
+
+    ref, _ = flex_attention_ref(q, k, v, score_fn=score_fn, keep_fn=_keep_causal)
+    _check(out, ref, (q, k, v))
+
+
+def test_softcap_score_mod():
+    q, k, v = _inputs(1, 4, 4, 256, 256, 128)
+    cap = 2.0
+    score_mod, score_mod_bwd = make_softcap_score_mod(cap)
+    out = flex_attention(q, k, v, score_mod=score_mod, score_mod_bwd=score_mod_bwd, scale=0.5)
+    ref, _ = flex_attention_ref(q, k, v, score_fn=lambda s, *_: cap * torch.tanh(s / cap), scale=0.5)
+    _check(out, ref, (q, k, v))
+
+
+# ---------------------------------------------------------------- aux outputs / options
+
+
+def test_lse_is_returned_and_differentiable():
+    q, k, v = _inputs(2, 4, 2, 192, 192, 64)
+    block_mask = create_block_mask(causal_mask, None, None, 192, 192)
+    out, aux = flex_attention(
+        q, k, v, block_mask=block_mask, enable_gqa=True, return_aux=AuxRequest(lse=True)
+    )
+    ref, ref_lse = flex_attention_ref(q, k, v, keep_fn=_keep_causal)
+    torch.testing.assert_close(aux.lse, ref_lse, atol=TOL, rtol=TOL)
+    w = torch.randn_like(ref_lse)
+    _check(out, ref, (q, k, v), extra_loss=(aux.lse * w).sum(), ref_extra_loss=(ref_lse * w).sum())
+
+
+def test_num_splits_short_query_long_context():
+    q, k, v = _inputs(1, 8, 8, 16, 4096, 128)
+    out = flex_attention(q, k, v, kernel_options={"num_splits": 8})
+    _check(out, flex_attention_ref(q, k, v)[0], (q, k, v))
+
+
+def test_mla_head_dims():
+    q, k, v = _inputs(1, 4, 4, 256, 256, 192, Dv=128)
+    out = flex_attention(q, k, v, block_mask=create_block_mask(causal_mask, None, None, 256, 256))
+    _check(out, flex_attention_ref(q, k, v, keep_fn=_keep_causal)[0], (q, k, v))
+
+
+# ---------------------------------------------------------------- aux tensors + gradient hook
+
+PAIR = 128  # per-pair bias table [B, H, PAIR, PAIR], for sequences up to 100
+
+
+@triton.jit
+def _pair_bias_score_mod(score, b, h, q_idx, kv_idx, BIAS):
+    offset = ((b * 2 + h) * 128 + q_idx) * 128 + kv_idx
+    return score + tl.load(BIAS + offset, mask=(q_idx < 100) & (kv_idx < 100), other=0.0)
+
+
+@triton.jit
+def _pair_bias_grad_hook(dscore, valid, b, h, q_idx, kv_idx, DBIAS, BIAS):
+    offset = ((b * 2 + h) * 128 + q_idx) * 128 + kv_idx
+    tl.store(DBIAS + offset, dscore, mask=valid)
+
+
+def test_score_grad_hook_returns_captured_tensor_gradient():
+    # Every (b, h, q, kv) has its own bias entry, so the hook's output must equal
+    # autograd's gradient of the bias, zeros at masked and padded positions included.
+    B, H, S = 2, 2, 100
+    q, k, v = _inputs(B, H, H, S, S, 64, seed=3)
+    bias = (torch.randn(B, H, PAIR, PAIR, device="cuda") * 2).requires_grad_(True)
+    out = flex_attention(
+        q,
+        k,
+        v,
+        score_mod=_pair_bias_score_mod,
+        score_mod_bwd=identity_score_mod_bwd,
+        block_mask=create_block_mask(causal_mask, None, None, S, S),
+        aux_tensors=[bias.detach()],
+        score_grad_hook=_pair_bias_grad_hook,
+        score_grad_target=bias,
+    )
+    ref, _ = flex_attention_ref(q, k, v, score_fn=lambda s, *_: s + bias[:, :, :S, :S], keep_fn=_keep_causal)
+    _check(out, ref, (q, k, v, bias))
+
+
+# ---------------------------------------------------------------- validation
+
+
+def test_validation_errors():
+    q, k, v = _inputs(1, 4, 2, 128, 128, 64)
+    with pytest.raises(ValueError, match="enable_gqa"):
+        flex_attention(q, k, v)
+    with pytest.raises(NotImplementedError, match="max_scores"):
+        flex_attention(q, k, v, enable_gqa=True, return_aux=AuxRequest(max_scores=True))
+    with pytest.raises(ValueError, match="score_mod_bwd"):
+        flex_attention(q, k, v, enable_gqa=True, score_mod=_alibi_score_mod)
+    with pytest.raises(ValueError, match="kernel_options"):
+        flex_attention(q, k, v, enable_gqa=True, kernel_options={"BLOCK_M": 64})
+    with pytest.raises(ValueError, match="does not match"):
+        flex_attention(
+            q, k, v, enable_gqa=True, block_mask=create_block_mask(causal_mask, None, None, 256, 256)
+        )
+    with pytest.raises(ValueError, match="square"):
+        create_block_mask(_band_mask, None, None, 128, 128, BLOCK_SIZE=(64, 128))
+    bias = torch.zeros(4, 128, device="cuda", requires_grad=True)
+    with pytest.raises(ValueError, match="requires grad"):
+        flex_attention(
+            q,
+            k,
+            v,
+            enable_gqa=True,
+            score_mod=_alibi_score_mod,
+            score_mod_bwd=identity_score_mod_bwd,
+            aux_tensors=[bias],
+        )
