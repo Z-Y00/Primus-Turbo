@@ -1,10 +1,14 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #pragma once
 
+#ifdef BUILD_CK_BACKEND
 #include "ck_tile/core.hpp"
+#endif
 #include "primus_turbo/dtype.h"
 #include <hipblaslt/hipblaslt.h>
 #include <torch/extension.h>
@@ -16,6 +20,7 @@ using namespace primus_turbo::dtype;
 //==================================================================
 //  DataType Mapping : at::ScalarType -> CK-Tile Type
 //==================================================================
+#ifdef BUILD_CK_BACKEND
 
 template <at::ScalarType scalar_type> struct TorchToCKTileType;
 
@@ -88,6 +93,8 @@ template <> struct TorchToCKTileType<at::kFloat> {
     default:                                                                                       \
         PRIMUS_TURBO_ERROR("Invalid scalar type");                                                 \
     }
+
+#endif // BUILD_CK_BACKEND
 
 //==================================================================
 //  DataType Mapping : at::ScalarType -> HipBLASLt Type

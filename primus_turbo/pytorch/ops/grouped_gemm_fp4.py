@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """MXFP4 grouped GEMM (MX_BLOCKWISE, Triton backend, gfx950).
 
 The MXFP4 training recipe (https://arxiv.org/pdf/2509.25149) applies a 16-point Random Hadamard
@@ -36,20 +37,66 @@ from primus_turbo.pytorch.core.quantized_tensor import (
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_fp4_impl import (
     grouped_gemm_fp4_impl,
+    grouped_gemm_fp4_variable_k_accum_impl,
     grouped_gemm_fp4_variable_k_impl,
 )
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     group_offs_from_lens,
 )
 from primus_turbo.pytorch.ops.quantization import grouped_quantize_fp4_with_trans, quantize_fp4_with_trans
+from primus_turbo.pytorch.ops.utils import (
+    _ensure_contiguous_grad_out,
+    _get_dummy_wgrad,
+    _setup_fused_grad_accum,
+)
 
 __all__ = ["grouped_gemm_fp4"]
 
 
-def _ensure_contiguous_grad_out(grad_out: torch.Tensor) -> torch.Tensor:
-    # Some upstream reductions can produce expanded zero-stride grad_out views.
-    # Custom grouped GEMM kernels expect dense layouts.
-    return grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+def _bgrad_grouped_gemm_fp4_impl_wrapper(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    inplace_add_to_out: bool = False,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run the variable-K wgrad GEMM, accumulating into ``out`` when asked to.
+
+    Returns the weight gradient for autograd, or a dummy buffer when the wgrad went
+    straight into ``out``: forward already flagged the weight, so the training
+    framework's own accumulation step stands down. Megatron still expects a tensor
+    rather than None there, so its backward hooks stay on the main thread; the
+    contents are never read. It is handed back in the weight's own dtype, since a
+    mismatch would make autograd allocate and cast a full-size copy.
+    """
+    inputs = (a, b, a_scales, b_scales, group_lens, group_offs)
+    options = dict(
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity,
+        num_cu=num_cu,
+        default_backend=default_backend,
+    )
+
+    if not inplace_add_to_out:
+        return grouped_gemm_fp4_variable_k_impl(*inputs, **options)
+
+    assert out is not None, "out should not be None when inplace_add_to_out is True"
+    grouped_gemm_fp4_variable_k_accum_impl(*inputs, out=out, **options)
+
+    return _get_dummy_wgrad(out.shape, out_dtype)
 
 
 class FP4GroupedGemmMXFunc(torch.autograd.Function):
@@ -68,7 +115,10 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         out_dtype: torch.dtype,
         config: Float4QuantConfig,
         num_cu: int | None,
+        fuse_bgrad_accum_pattern: Union[None, str] = None,
     ):
+        fuse_bgrad_accum, main_grad = _setup_fused_grad_accum(b, fuse_bgrad_accum_pattern)
+
         assert config.granularity == ScalingGranularity.MX_BLOCKWISE
         assert a.ndim == 2 and b.ndim == 3
         assert out_dtype in (torch.float16, torch.bfloat16)
@@ -101,11 +151,14 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     block_size=MXFP4_BLOCK_SIZE,
                     scaling_recipe=a_scaling_recipe,
                     scaling_recipe_for_trans=a_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             )
         else:
             quantized_a = a
             check_quantized_tensor(quantized_a, config, axis=-1, scaling_recipe=a_scaling_recipe)
+            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
+            group_offs_padded_rowwise = quantized_a.group_offs
             if a_t is None:
                 quantized_a_t = QuantizedTensor.quantize(
                     quantized_a.dequantize(),
@@ -115,15 +168,13 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     block_size=config.block_size,
                     scaling_recipe=a_t_scaling_recipe,
                     group_lens=group_lens,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(a_t, QuantizedTensor)
                 quantized_a_t = a_t
-
-            a_row, a_row_scale = quantized_a.qdata, quantized_a.scale_inv
+                check_quantized_tensor(quantized_a_t, config, axis=-2, scaling_recipe=a_t_scaling_recipe)
             a_col, a_col_scale = quantized_a_t.qdata, quantized_a_t.scale_inv
-
-            group_offs_padded_rowwise = quantized_a.group_offs
 
         # --- B: 3D weight (G, N, K). row-wise (rht=F) is the fwd operand; col-wise
         b_scaling_recipe = ScalingRecipe(use_2d_block=True)
@@ -136,6 +187,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                 block_size=MXFP4_BLOCK_SIZE,
                 scaling_recipe=b_scaling_recipe,
                 scaling_recipe_for_trans=b_t_scaling_recipe,
+                scale_rounding_mode=config.scale_rounding_mode,
             )
         else:
             quantized_b = b
@@ -149,10 +201,12 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
                     axis=-2,
                     block_size=config.block_size,
                     scaling_recipe=b_t_scaling_recipe,
+                    scale_rounding_mode=config.scale_rounding_mode,
                 )
             else:
                 assert isinstance(b_t, QuantizedTensor)
                 quantized_b_t = b_t
+                check_quantized_tensor(quantized_b_t, config, axis=-2, scaling_recipe=b_t_scaling_recipe)
 
             b_row, b_row_scale = quantized_b.qdata, quantized_b.scale_inv
             b_col, b_col_scale = quantized_b_t.qdata, quantized_b_t.scale_inv
@@ -170,7 +224,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         out = out[:total_m]
@@ -180,6 +234,8 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         ctx.config = config
         ctx.out_dtype = out_dtype
         ctx.num_cu = num_cu
+        ctx.fuse_bgrad_accum = fuse_bgrad_accum
+        ctx.main_grad = main_grad
         return out
 
     @staticmethod
@@ -187,7 +243,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
         grad_out = _ensure_contiguous_grad_out(grad_out)
         a_col, a_col_scale, b_col, b_col_scale, group_lens, group_offs = ctx.saved_tensors
 
-        # --- grad_out: fused grouped dual-quant in one bf16 read
+        # --- grad_out: fused grouped dual-quant in one 16-bit read
         grad_out_scaling_recipe = ScalingRecipe(
             use_sr=ctx.config.use_gradient_sr,
         )
@@ -213,9 +269,10 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             block_size=ctx.config.block_size,
             scaling_recipe=grad_out_scaling_recipe,
             scaling_recipe_for_trans=grad_out_t_scaling_recipe,
+            scale_rounding_mode=ctx.config.scale_rounding_mode,
         )
 
-        # --- dgrad: grad_a = gradO_row(rht=T) @ B_col(rht=T)^T, contract N -> [total_m, K] ---
+        # --- dgrad: grad_a = gradO_row(rht=F) @ B_col(rht=F)^T, contract N -> [total_m, K] ---
         grad_a = grouped_gemm_fp4_impl(
             grad_out_fp4_row,
             b_col,
@@ -228,13 +285,13 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
             group_offs_out=group_offs,
         )
         grad_a = grad_a[: ctx.total_m]
 
         # --- wgrad: grad_b[g] = gradO_col(rht=T) @ A_col(rht=T)^T, contract M_g -> [G, N, K] ---
-        grad_b = grouped_gemm_fp4_variable_k_impl(
+        grad_b = _bgrad_grouped_gemm_fp4_impl_wrapper(
             grad_out_t_fp4,
             a_col,
             grad_out_t_scale,
@@ -242,12 +299,14 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             group_lens_padded_colwise,
             group_offs_padded_colwise,
             trans_a=False,
-            trans_b=False,
+            trans_b=True,
             trans_c=False,
             out_dtype=ctx.out_dtype,
             granularity=ScalingGranularity.MX_BLOCKWISE.value,
             num_cu=ctx.num_cu,
-            default_backend=BackendType.TRITON.value,
+            default_backend=BackendType.FLYDSL.value,
+            inplace_add_to_out=ctx.fuse_bgrad_accum,
+            out=ctx.main_grad,
         )
 
         return (
@@ -261,6 +320,7 @@ class FP4GroupedGemmMXFunc(torch.autograd.Function):
             None,  # out_dtype
             None,  # config
             None,  # num_cu
+            None,  # fuse_bgrad_accum_pattern
         )
 
 
@@ -281,6 +341,7 @@ def grouped_gemm_fp4(
     out_dtype: Union[torch.dtype, None] = None,
     config: Union[Float4QuantConfig, None] = None,
     num_cu: int | None = None,
+    fuse_bgrad_accum_pattern: Union[None, str] = None,
 ) -> torch.Tensor:
     """Grouped GEMM with MXFP4 (E2M1) quantization, supporting autograd.
 
@@ -297,6 +358,13 @@ def grouped_gemm_fp4(
         out_dtype: Output dtype (defaults to promote(a, b)).
         config: Float4QuantConfig (MX_BLOCKWISE). use_preshuffle must be False.
         num_cu: Optional cap on compute units for the persistent grid.
+        fuse_bgrad_accum_pattern: Enables fusing the weight-gradient accumulation
+            into the wgrad GEMM epilogue, so backward writes ``b.main_grad``
+            directly instead of returning a gradient the framework then adds.
+            ``"megatron"`` is the only supported pattern; ``b`` must carry
+            ``main_grad`` / ``grad_added_to_main_grad``. FlyDSL is the only backend
+            with the FP4 accumulate epilogue and its store is 16-bit, so ``main_grad``
+            must be in the weight's own dtype. Defaults to None (no fusion).
 
     Returns:
         Output [total_m, N].
@@ -334,5 +402,6 @@ def grouped_gemm_fp4(
             out_dtype,
             config,
             num_cu,
+            fuse_bgrad_accum_pattern,
         )
     raise ValueError(f"Unsupported FP4 ScalingGranularity: {config.granularity}")

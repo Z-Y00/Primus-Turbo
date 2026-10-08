@@ -17,6 +17,8 @@ ENV_LOG_LEVEL = "PRIMUS_TURBO_LOG_LEVEL"
 
 # GEMM backend selection (e.g. HIPBLASLT, AITER).
 # Supports per-precision format: "FP4:HIPBLASLT,FP8:AITER" or a single value.
+# Any backend slot also accepts "autotune" to auto-tune that precision only,
+# e.g. "autotune" or "FP8:autotune,other:HIPBLASLT".
 # Default: None (auto-select)
 ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 
@@ -25,10 +27,28 @@ ENV_GEMM_BACKEND = "PRIMUS_TURBO_GEMM_BACKEND"
 ENV_GROUPED_GEMM_BACKEND = "PRIMUS_TURBO_GROUPED_GEMM_BACKEND"
 
 # MoE dispatch/combine EP backend (TURBO, DEEP_EP, or custom names like UCCL_EP).
+# Auto-tune is not supported here; "autotune" raises an AssertionError.
 # Default: TURBO
 ENV_MOE_DISPATCH_COMBINE_BACKEND = "PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"
 
+# Attention backend selection, one key per family: flash-attention and sparse attention do
+# not carry the same backends (only the former has AITER, only the latter TRITON), so a
+# shared key would name backends one of the two dispatchers reading it cannot run.
+# Same per-precision format as ENV_GEMM_BACKEND. GLUON is explicit/forward-only rather
+# than part of automatic selection.
+# Default: None (auto-select; FLYDSL when eligible, else the op's fallback)
+
+# Dense and varlen flash-attention share this key, but backend support remains
+# dispatcher-specific. GLUON is dense-only, so explicit selection makes varlen
+# dispatch fail before launch.
+ENV_ATTN_BACKEND = "PRIMUS_TURBO_ATTN_BACKEND"
+
+# Sparse attention: DeepSeek-V4 sparse-MLA (e.g. FLYDSL, TRITON).
+ENV_SPARSE_ATTN_BACKEND = "PRIMUS_TURBO_SPARSE_ATTN_BACKEND"
+
 # Enable auto-tuning across registered kernel backends ("1" to enable).
+# Global switch: it turns auto-tune on for every op. An explicit per-op backend
+# (e.g. "<OP>_BACKEND=HIPBLASLT") still takes precedence over it.
 # Default: "0" (disabled)
 ENV_AUTO_TUNE = "PRIMUS_TURBO_AUTO_TUNE"
 

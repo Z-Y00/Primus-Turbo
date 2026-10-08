@@ -1,6 +1,8 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #include "../extensions.h"
 #include "../type_traits.h"
@@ -8,6 +10,8 @@
 #include "primus_turbo/gemm.h"
 
 namespace primus_turbo::pytorch {
+
+#ifdef BUILD_CK_BACKEND
 
 template <typename AType, typename BType, typename CType, typename ACCType>
 inline CKGemmFP8Params<AType, BType, CType, ACCType>
@@ -96,5 +100,17 @@ at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::T
 
     return c;
 }
+
+#else // !BUILD_CK_BACKEND : CK GEMM unsupported (CK backend disabled)
+
+at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
+                       const bool transA, const bool transB, at::ScalarType out_dtype,
+                       const std::string &granularity) {
+    PRIMUS_TURBO_ERROR("ck_gemm_fp8 is unavailable: CK backend not built (disabled via "
+                       "PRIMUS_TURBO_BUILD_CK, or unsupported on gfx1250). "
+                       "Rebuild on a supported architecture with PRIMUS_TURBO_BUILD_CK=1.");
+}
+
+#endif // BUILD_CK_BACKEND
 
 } // namespace primus_turbo::pytorch

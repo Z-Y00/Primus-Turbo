@@ -1,16 +1,17 @@
-// Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
-
-// ODC single-node rocSHMEM host-API backend (kernel-library implementation).
-//
-// The host-only surface below (uid bootstrap + symmetric heap + peer-ptr resolve)
-// originally shipped as librs_host5.so and was loaded via ctypes by ODC's
-// primus/core/odc/odc/primitives/_rocshmem_backend.py. The host logic is preserved
-// verbatim; it now lives in libprimus_turbo_kernels.so and is declared in
-// primus_turbo/odc_rocshmem/api.h so the thin pytorch/jax binding can call it
-// without linking rocSHMEM itself. Everything is guarded by DISABLE_ROCSHMEM so
-// the kernels library still builds on toolchains without rocSHMEM.
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ * ODC single-node rocSHMEM host-API backend (kernel-library implementation).
+ *
+ * The host-only surface below (uid bootstrap + symmetric heap + peer-ptr resolve)
+ * originally shipped as librs_host5.so and was loaded via ctypes by ODC's
+ * primus/core/odc/odc/primitives/_rocshmem_backend.py. The host logic is preserved
+ * verbatim; it now lives in libprimus_turbo_kernels.so and is declared in
+ * primus_turbo/odc_rocshmem/api.h so the thin pytorch/jax binding can call it
+ * without linking rocSHMEM itself. Everything is guarded by DISABLE_ROCSHMEM so
+ * the kernels library still builds on toolchains without rocSHMEM.
+ **************************************************************************************************/
 
 #ifndef DISABLE_ROCSHMEM
 
@@ -39,13 +40,6 @@ void rs_init_uid(int rank, int nranks, const char *bytes) {
     rocshmem_init_attr_t attr;
     rocshmem_set_attr_uniqueid_args(rank, nranks, &uid, &attr);
     rocshmem_init_attr(ROCSHMEM_INIT_WITH_UNIQUEID, &attr);
-}
-void rs_get_ctx_fields(long long *a, long long *b) {
-    void          *dctx = rocshmem_get_device_ctx();
-    rocshmem_ctx_t h;
-    hipMemcpy(&h, dctx, sizeof(rocshmem_ctx_t), hipMemcpyDeviceToHost);
-    *a = (long long) h.ctx_opaque;
-    *b = (long long) h.team_opaque;
 }
 int rs_my_pe() {
     return rocshmem_my_pe();

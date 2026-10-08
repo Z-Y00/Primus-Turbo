@@ -3,6 +3,7 @@
 #
 # See LICENSE for license information.
 ###############################################################################
+
 """Python-side wrappers that launch the Triton RMSNorm kernels."""
 
 from __future__ import annotations
@@ -82,9 +83,19 @@ def _pick_bwd_config(H: int, B: int) -> Tuple[str, int, int, int, int]:
     return "grid", BLOCK_H, grid, 0, 0
 
 
+# Above this many partials the Triton finalize loses badly to a torch
+# reduction: it parallelizes over H only (ceil(H/BLOCK_H) programs) and walks
+# n_parts serially, so a tall, narrow buffer leaves the GPU idle.
+# The multi-row backward emits ceil(B / ROWS_PER_BLOCK) partials, which reaches
+# the tall regime for q_norm/k_norm (B in the millions, H=128).
+_FINALIZE_TRITON_MAX_PARTS = 512
+
+
 def _finalize_dgamma(dg_partial: torch.Tensor, gamma_dtype: torch.dtype) -> torch.Tensor:
     """Reduce (n_parts, H) fp32 partials to dgamma[H]."""
     n_parts, H = dg_partial.shape
+    if n_parts > _FINALIZE_TRITON_MAX_PARTS:
+        return dg_partial.sum(dim=0).to(gamma_dtype)
     dg = torch.empty(H, device=dg_partial.device, dtype=gamma_dtype)
     BLOCK_H = 64 if H >= 64 else _next_pow2(H)
     BLOCK_N = 64 if n_parts >= 64 else _next_pow2(max(n_parts, 1))
@@ -228,13 +239,20 @@ def rmsnorm_bwd_impl(
 
 
 def rmsnorm_fwd_residual_impl(
-    x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor, eps: float
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    eps: float,
+    skip_y_store: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int]:
     """Fused (x + residual) -> rmsnorm forward.
 
     Returns ``(y, x_plus_r, rstd, BLOCK_H, ROWS, num_warps, num_stages)``. Both
     ``y`` and ``x_plus_r`` are returned in [B, H] layout (caller is expected to
     reshape back to the original logical shape if needed).
+
+    ``skip_y_store``: R3 path. Do not write BF16 ``y`` (GEMM consumes MXFP4).
+    ``y`` is still allocated so the autograd Function can return a tensor.
     """
     H = gamma.shape[0]
     x2 = _reshape_batch_hidden(x, H)
@@ -263,6 +281,7 @@ def rmsnorm_fwd_residual_impl(
             H=H,
             eps=eps,
             BLOCK_H=BLOCK_H,
+            SKIP_Y_STORE=skip_y_store,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -288,6 +307,7 @@ def rmsnorm_fwd_residual_impl(
             eps=eps,
             BLOCK_H=BLOCK_H,
             ROWS_PER_BLOCK=ROWS,
+            SKIP_Y_STORE=skip_y_store,
             num_warps=num_warps,
             num_stages=num_stages,
         )

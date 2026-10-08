@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -14,33 +15,20 @@ from primus_turbo.pytorch.core.backend import (
     PrecisionType,
     TuneCache,
 )
-from primus_turbo.pytorch.core.utils import _get_device_compute_capability
-
-
-def _is_gfx950_device(device: torch.device) -> bool:
-    """Compute capability check bound to a specific tensor's device.
-
-    ``is_gfx950()`` inspects the *current* CUDA device via
-    ``torch.cuda.current_device()``, which is wrong when the tensor lives
-    on a different device than the ambient one (multi-GPU / mixed-arch
-    hosts). Route by the tensor's device instead.
-    """
-    if device.type != "cuda":
-        return False
-    return _get_device_compute_capability(device) == (9, 5)
-
-
-from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
-    BaseGroupedGEMMKernelDispatcher,
-    BaseGroupedGEMMVariableKKernelDispatcher,
-)
-from primus_turbo.pytorch.kernels.grouped_gemm.ws_ck_heuristic import (
+from primus_turbo.pytorch.core.utils import build_ck, is_gfx950, is_gfx1250
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_ck_ws_heuristic import (
     approximate_ck_standard_total_tiles,
     compute_ck_variable_k_total_tiles,
     resolve_ck_ws_local_per_xcd,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
+    BaseGroupedGEMMKernelDispatcher,
+    BaseGroupedGEMMVariableKKernelDispatcher,
+)
+from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import (
     grouped_gemm_output_tail_kernel,
+)
+from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
     grouped_gemm_triton_kernel,
     grouped_gemm_variable_k_triton_kernel,
 )
@@ -100,6 +88,8 @@ class GroupedGEMMCKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= not trans_a
@@ -108,9 +98,7 @@ class GroupedGEMMCKBackend(KernelBackend):
         # broadcast slot, which fits on gfx950 (MI355X) but overflows
         # gfx942's 64 KB LDS budget. The device-side WS body is stubbed
         # out on gfx942, so refuse to dispatch WS to CK on that arch.
-        # Check the *tensor's* device (multi-GPU safe), not the ambient
-        # ``current_device()``.
-        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+        if schedule == "work_steal" and not is_gfx950():
             supported = False
         return supported
 
@@ -174,16 +162,21 @@ class GroupedGEMMVariableKCKBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
         supported &= schedule in _WS_SUPPORTED_SCHEDULES
         # See GroupedGEMMCKBackend.can_handle: the CK WS kernel is
-        # gfx950-only due to LDS budget. Route by the tensor's device.
-        if schedule == "work_steal" and not _is_gfx950_device(a.device):
+        # gfx950-only due to LDS budget.
+        if schedule == "work_steal" and not is_gfx950():
             supported = False
         return supported
 
@@ -290,6 +283,8 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
@@ -297,6 +292,11 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         supported &= a.dtype in _COMMON_SUPPORTED_DTYPES and b.dtype in _COMMON_SUPPORTED_DTYPES
         supported &= trans_a and not trans_b
         supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and (out.dtype == a.dtype or out.dtype == torch.float32)
+
         return supported
 
     @staticmethod
@@ -311,6 +311,8 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
         num_cu: int | None,
         maybe_pre_sync: bool = False,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
@@ -320,8 +322,9 @@ class GroupedGEMMVariableKHipblasltBackend(KernelBackend):
             lhs, rhs = a, b
             trans_lhs, trans_rhs = trans_a, trans_b
 
+        beta = 1.0 if inplace_add_to_out else 0.0
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm(
-            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync
+            lhs, rhs, group_lens, group_offs, trans_lhs, trans_rhs, maybe_pre_sync, beta, out
         )
 
 
@@ -370,10 +373,138 @@ class GroupedGEMMTritonBackend(KernelBackend):
         )
 
 
+def _cap_cu(num_cu: int | None, device: torch.device) -> int:
+    """Turn the dispatcher's CU count into a budget the kernels act on. Callers routinely pass
+    the full device count meaning "no limit", and honouring that literally would launch a
+    persistent grid where the tuned one-tile-per-WG launch is both simpler and faster, so it
+    reads as 0."""
+    if num_cu is None or num_cu >= _num_cus(device):
+        return 0
+    return int(num_cu)
+
+
+def _gfx1250_grouped_gemm_shapes_ok(a: torch.Tensor, b: torch.Tensor, trans_b: bool) -> bool:
+    """Whether the gfx1250 NT/NN entries can run this shape *natively*.
+
+    The gate has to live at selection time, because neither thing it checks fails
+    loudly on its own:
+
+    * **``K % tile_k``** -- the gfx1250 K loop is a compile-time tile count, so the
+      kernel ``assert``s divisibility. gfx950 chunks K at runtime and has no such rule.
+    * **The native-NN shape rules** (``nn_native_unsupported_reason``), chiefly
+      ``N % 8 == 0``: ``ds_load_tr16_b128`` needs 16-byte-aligned column bases and
+      silently degrades to a plain non-transposing load otherwise. The kernel guards
+      itself by materialising a transposed weight copy, so no call is ever wrong --
+      but that fallback measured 0.32x Triton, so it is not a path to select into.
+
+    Both are asked of the kernel module rather than reimplemented here: ``tile_k``
+    comes out of ``_pick_config``, whose thresholds that docstring marks as fitted,
+    so a second copy of the rule would turn a Triton fallback into an
+    ``AssertionError`` the moment the two drift.
+    """
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+        grouped_gemm_bf16_nn_supported,
+        grouped_gemm_bf16_nt_supported,
+    )
+
+    # TDM reads whole tiles straight out of the operands, so a non-contiguous view
+    # would be read as if it were packed.
+    if not (a.is_contiguous() and b.is_contiguous()):
+        return False
+
+    G = b.shape[0]
+    avg_m = max(1, a.shape[0] // max(G, 1))
+    if trans_b:  # NT, b is [G, N, K]
+        return grouped_gemm_bf16_nt_supported(b.shape[1], a.shape[1], avg_m, G)
+    # NN, b is [G, K, N]: K is the reduction, N the output width.
+    return grouped_gemm_bf16_nn_supported(b.shape[2], b.shape[1], avg_m, G)
+
+
+class GroupedGEMMFlyDSLBackend(KernelBackend):
+    """FlyDSL bf16 grouped GEMM backend (gfx950 and gfx1250).
+
+    M-grouped operator, both directions of the forward pair:
+      - trans_b=True  -> NT, b is [G, N, K] (forward)
+      - trans_b=False -> NN, b is [G, K, N] (dgrad)
+
+    Tiles are cut per expert rather than on a global row-block grid, so neither the token
+    count nor the per-expert run lengths have to land on the tile boundary.
+
+    Two separate kernel modules back this: ``grouped_gemm_bf16_kernel`` (gfx950, MFMA /
+    wave64 / SRD) and ``grouped_gemm_bf16_kernel_gfx1250`` (gfx1250, WMMA / wave32 / TDM).
+    They share the entry-point names and the operand contract and nothing below that.
+    """
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> bool:
+        gfx950, gfx1250 = is_gfx950(), is_gfx1250()
+        supported = True
+        # gfx950 (CDNA4) builds the body on mfma_f32_16x16x32_bf16; gfx1250 (RDNA-class
+        # matrix cores) on v_wmma_f32_16x16x32_bf16. No other part has a port.
+        supported &= gfx950 or gfx1250
+        # No work-stealing variant, and the grid is sized from the tile count, so a CU budget
+        # could only be ignored -- better to decline than to accept and not honour it.
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= a.dim() == 2 and b.dim() == 3
+        # Both 16-bit float formats: same pipeline, the mfma atom picks bf16 vs f16. Mixed
+        # operand types have no atom, so the pair has to agree.
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
+        supported &= not trans_a
+        if supported and gfx1250:
+            # cap_cu raises on gfx1250 rather than being silently ignored, so decline here
+            # and let the registry's default fall through to Triton instead.
+            supported &= _cap_cu(num_cu, a.device) == 0
+            supported &= _gfx1250_grouped_gemm_shapes_ok(a, b, trans_b)
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        if is_gfx1250():
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+                grouped_gemm_bf16_nn_flydsl_kernel,
+                grouped_gemm_bf16_nt_flydsl_kernel,
+            )
+
+            kernel = grouped_gemm_bf16_nt_flydsl_kernel if trans_b else grouped_gemm_bf16_nn_flydsl_kernel
+            # cap_cu is not passed: can_handle has already established it would be 0, and a
+            # non-zero value raises here. The NN entry reads b[G,K,N] in place through
+            # ds_load_tr16_b128, so no b_nt and no transposed weight copy.
+            return kernel(a, b, group_offs, out_dtype=a.dtype)
+
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_nn_flydsl_kernel,
+            grouped_gemm_bf16_nt_flydsl_kernel,
+        )
+
+        kernel = grouped_gemm_bf16_nt_flydsl_kernel if trans_b else grouped_gemm_bf16_nn_flydsl_kernel
+        return kernel(a, b, group_offs, out_dtype=a.dtype, cap_cu=_cap_cu(num_cu, a.device))
+
+
 _GROUPED_GEMM_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMFlyDSLBackend),
 }
 
 
@@ -411,6 +542,8 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
         trans_c: bool,
         num_cu: int | None,
         schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if trans_c:
@@ -424,6 +557,115 @@ class GroupedGEMMVariableKTritonBackend(KernelBackend):
             num_cu=num_cu,
             work_steal=(schedule == "work_steal"),
             ws_mode="auto",
+            beta=(1.0 if inplace_add_to_out else 0.0),
+            out=out,
+        )
+
+
+class GroupedGEMMVariableKFlyDSLBackend(KernelBackend):
+    """FlyDSL bf16 variable-K grouped GEMM backend (gfx950 and gfx1250).
+
+    wgrad: C[g] = a[offs[g] : offs[g] + lens[g]]^T @ b[the same rows] -- the contraction
+    length varies per group. The kernel walks it with a runtime scf.for and reads the group
+    table on-device, so a padded ``group_offs`` paired with the true ``group_lens`` costs no
+    host sync.
+
+    """
+
+    # A real measured boundary on gfx950 (clean through G=65, wrong at G=80 and G=96),
+    # but only a convention on gfx1250, which was measured correct up to G=160. The cap
+    # is kept at 64 on both anyway: raising it for one arch would make the supported
+    # expert count arch-dependent for no measured shape, and no MoE configuration in
+    # the benchmark table exceeds G=32.
+    MAX_G = 64
+
+    @staticmethod
+    def can_handle(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        inplace_add_to_out: bool = False,
+        **kwargs,
+    ) -> bool:
+        gfx950, gfx1250 = is_gfx950(), is_gfx1250()
+        supported = True
+        # gfx950 (CDNA4) builds the body on mfma_f32_16x16x32_bf16; gfx1250 on
+        # v_wmma_f32_16x16x32_bf16 with the transpose done by ds_load_tr16_b128 in LDS.
+        supported &= gfx950 or gfx1250
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        supported &= schedule in _NON_WS_SUPPORTED_SCHEDULES
+        supported &= a.dim() == 2 and b.dim() == 2 and a.shape[0] == b.shape[0]
+        supported &= a.dtype in (torch.bfloat16, torch.float16) and b.dtype == a.dtype
+        supported &= trans_a and not trans_b
+        supported &= group_lens.numel() <= GroupedGEMMVariableKFlyDSLBackend.MAX_G
+        if supported and gfx1250:
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+                grouped_gemm_bf16_variable_k_supported,
+            )
+
+            # cap_cu raises on gfx1250; decline so the registry can fall through to Triton.
+            supported &= _cap_cu(num_cu, a.device) == 0
+            supported &= a.is_contiguous() and b.is_contiguous()
+            # Judged on the post-swap operands, because that is what execute() calls with.
+            lhs, rhs = (b, a) if trans_c else (a, b)
+            avg_m = max(1, a.shape[0] // max(group_lens.numel(), 1))
+            supported &= grouped_gemm_bf16_variable_k_supported(lhs.shape[1], rhs.shape[1], avg_m)
+        return supported
+
+    @staticmethod
+    def execute(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        group_lens: torch.Tensor,
+        group_offs: torch.Tensor,
+        trans_a: bool,
+        trans_b: bool,
+        trans_c: bool,
+        num_cu: int | None,
+        schedule: str = "static",
+        **kwargs,
+    ) -> torch.Tensor:
+        if is_gfx1250():
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel_gfx1250 import (
+                grouped_gemm_bf16_variable_k_flydsl_kernel,
+            )
+
+            # gfx1250 has no transposed-store epilogue, so trans_c=True raises there. But
+            # (A.T B).T = B.T A, so swapping the operands computes the transposed output
+            # with the untransposed store -- the same trick the CK and Triton backends
+            # already use, and free: both operands are [M_total, *] over the same rows, so
+            # group_offs and masked_k apply unchanged either way.
+            lhs, rhs = (b, a) if trans_c else (a, b)
+            return grouped_gemm_bf16_variable_k_flydsl_kernel(
+                lhs,
+                rhs,
+                group_offs,
+                masked_k=group_lens,
+                out_dtype=a.dtype,
+            )
+
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_bf16_kernel import (
+            grouped_gemm_bf16_variable_k_flydsl_kernel,
+        )
+
+        # trans_c is native here -- the store writes the transposed tile -- so unlike the CK
+        # and Triton backends there is no operand swap. group_lens goes in as the per-group
+        # valid contraction length, which is what lets group_offs carry padding.
+        return grouped_gemm_bf16_variable_k_flydsl_kernel(
+            a,
+            b,
+            group_offs,
+            masked_k=group_lens,
+            out_dtype=a.dtype,
+            trans_c=trans_c,
+            cap_cu=_cap_cu(num_cu, a.device),
         )
 
 
@@ -431,6 +673,7 @@ _GROUPED_GEMM_VARIABLE_K_BACKENDS = {
     BackendType.CK: BackendEntry(GroupedGEMMVariableKCKBackend),
     BackendType.HIPBLASLT: BackendEntry(GroupedGEMMVariableKHipblasltBackend, autotune=False),
     BackendType.TRITON: BackendEntry(GroupedGEMMVariableKTritonBackend),
+    BackendType.FLYDSL: BackendEntry(GroupedGEMMVariableKFlyDSLBackend),
 }
 
 
@@ -481,8 +724,8 @@ def grouped_gemm_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
 
     kwargs = dict(
         a=a,
@@ -496,7 +739,7 @@ def grouped_gemm_impl(
         schedule=schedule,
     )
 
-    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     out = grouped_gemm_output_tail_kernel(out, group_offs)
     return out
 
@@ -515,8 +758,8 @@ def grouped_gemm_variable_k_impl(
     maybe_pre_sync: bool = False,
     schedule: str = "static",
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
     kwargs = dict(
         a=a,
         b=b,
@@ -529,7 +772,9 @@ def grouped_gemm_variable_k_impl(
         maybe_pre_sync=maybe_pre_sync,
         schedule=schedule,
     )
-    return GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMVariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
 
 
 @grouped_gemm_impl.register_fake
@@ -554,6 +799,78 @@ def grouped_gemm_impl_meta(
     m = a.shape[1] if trans_a else a.shape[0]
     n = b.shape[-2] if trans_b else b.shape[-1]
     return torch.empty((m, n), device=a.device, dtype=a.dtype)
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    """Variable-K grouped BF16/FP16 GEMM that accumulates into ``out``.
+
+    Computes ``out += A^T @ B`` per group, folding the accumulation into the GEMM
+    epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.BF16_FP16_FP32)
+    kwargs = dict(
+        a=a,
+        b=b,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        schedule=schedule,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
+    # the caller's buffer would accumulate the wgrad once per warmup and timing
+    # iteration.
+    if (
+        GlobalBackendManager.auto_tune_enabled()
+        and not GroupedGEMMVariableKKernelDispatcher._is_graph_capturing()
+    ):
+        GroupedGEMMVariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GroupedGEMMVariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@grouped_gemm_variable_k_accum_impl.register_fake
+def grouped_gemm_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    schedule: str = "static",
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_variable_k_impl.register_fake

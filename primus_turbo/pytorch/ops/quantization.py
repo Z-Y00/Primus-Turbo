@@ -29,7 +29,7 @@ from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
     quant_fp8_blockwise_for_weight_impl,
     quant_fp8_blockwise_impl,
     quantize_fp8_rowwise_impl,
-    quantize_fp8_tensorwise_impl,
+    quantize_fp8_tensorwise_pad_impl,
     quantize_mxfp4_impl,
     quantize_mxfp8_impl,
 )
@@ -57,6 +57,8 @@ def quantize_fp8(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    pad_align_last: int = 0,
+    pad_align_penultimate: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP8 Quantize
@@ -69,9 +71,19 @@ def quantize_fp8(
             1. The x must be 2D tensor.
             2. The axis means direction of quantization. The 0 means along column direction and 1 means along row direction.
             3. The block size must be 32.
+
+        ``pad_align_last`` / ``pad_align_penultimate`` are opt-in (default 0, off), TENSORWISE
+        fp8 only: when >0 the cast zero-pads the last (K) / penultimate (weight N) dim to a
+        multiple of 128. The scale is computed pre-pad, so it stays pad-invariant.
     """
     if granularity == ScalingGranularity.TENSORWISE:
-        return quantize_fp8_tensorwise_impl(x, out_dtype)
+        # (k_align=1, pad_n=False) matches the legacy cast byte-for-byte; only padded callers widen K/N.
+        return quantize_fp8_tensorwise_pad_impl(
+            x,
+            out_dtype,
+            pad_n=(pad_align_penultimate > 0),
+            k_align=(pad_align_last or 1),
+        )
 
     elif granularity == ScalingGranularity.ROWWISE:
         return quantize_fp8_rowwise_impl(x, out_dtype, axis)
@@ -304,6 +316,7 @@ def quantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize (single direction).
@@ -332,6 +345,7 @@ def quantize_fp4(
             block_size,
             with_trans=False,
             scaling_recipe=scaling_recipe,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -347,6 +361,7 @@ def grouped_quantize_fp4(
     block_size: Optional[int] = None,
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """FP4 Grouped Quantize (single direction).
 
@@ -356,8 +371,9 @@ def grouped_quantize_fp4(
 
       * row-wise (``axis`` == last dim): tight-M layout (row i == input row i);
         the returned padded group_lens/offs equal the (tight) originals.
-      * col-wise (``axis`` == 0): 128-padded per-group M layout; the returned
-        padded group_lens/offs are the col-wise padded offsets from the kernel.
+      * col-wise (``axis`` == 0): the same per-group padded M layout the fused dual
+        quantizer emits (the variable-K wgrad operand); the returned padded
+        group_lens/offs are the col-wise padded offsets from the kernel.
 
     Returns ``(data, scale_inv, group_lens_padded, group_offs_padded)`` to mirror
     :func:`grouped_quantize_fp8`.
@@ -379,6 +395,7 @@ def grouped_quantize_fp4(
             group_offs,
             False,
             scaling_recipe,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -394,6 +411,7 @@ def grouped_quantize_fp4_with_trans(
     block_size: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -407,11 +425,11 @@ def grouped_quantize_fp4_with_trans(
     """FP4 Grouped Quantize with trans (fused rowwise + colwise).
 
     ``x`` is a 2D packed-M grouped activation ``[total_m, N]`` (groups along M via
-    ``group_lens`` / ``group_offs``). One bf16 read emits both operands:
+    ``group_lens`` / ``group_offs``). One 16-bit (bf16/fp16) read emits both operands:
 
       * row-wise FP4 [total_m, N_pad/2] + scale [total_m, N_pad/32] in the tight
         (un-padded) M layout (row i == input row i) -- the fwd/dgrad operand;
-      * col-wise FP4 [N, M_pad_col/2] + scale [N, M_pad_col/32] in the 128-padded
+      * col-wise FP4 [N, M_pad_col/2] + scale [N, M_pad_col/32] in the 512-aligned
         per-group M layout -- the variable-K wgrad operand.
 
     Returns ``(rowwise_out, rowwise_scale, colwise_out, colwise_scale,
@@ -437,6 +455,7 @@ def grouped_quantize_fp4_with_trans(
             True,
             scaling_recipe,
             scaling_recipe_for_trans,
+            scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")
@@ -451,6 +470,7 @@ def quantize_fp4_with_trans(
     axis: Optional[int] = None,
     scaling_recipe: Optional[ScalingRecipe] = None,
     scaling_recipe_for_trans: Optional[ScalingRecipe] = None,
+    scale_rounding_mode: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     FP4 Quantize with trans
@@ -477,6 +497,7 @@ def quantize_fp4_with_trans(
             with_trans=True,
             scaling_recipe=scaling_recipe,
             scaling_recipe_for_trans=scaling_recipe_for_trans,
+            scale_rounding_mode=scale_rounding_mode,
         )
     else:
         raise NotImplementedError(f"Unknown granularity {granularity}")

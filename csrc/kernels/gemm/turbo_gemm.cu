@@ -1,6 +1,8 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #include "primus_turbo/gemm.h"
 #include "turbo/turbo_gemm_mxfp8_kernel.h"
@@ -26,6 +28,9 @@ void turbo_gemm_mxfp8_impl(const AType *a_ptr, const BType *b_ptr,
                            const dtype::float8_e8m0 *b_scale_ptr, CType *c_ptr, int32_t m,
                            int32_t n, int32_t k, void *workspace, size_t workspace_size,
                            hipStream_t stream) {
+    PRIMUS_TURBO_CHECK(!primus_turbo::is_gfx1250(),
+                       "turbo_gemm_fp8 is unavailable: the turbo backend is not built "
+                       "on this architecture (gfx1250 is unsupported).");
     constexpr int32_t MX_BLOCK_SIZE = 32;
     const int32_t     scale_cols    = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
     const size_t      a_scale_bytes = (size_t) m * scale_cols * sizeof(uint32_t);

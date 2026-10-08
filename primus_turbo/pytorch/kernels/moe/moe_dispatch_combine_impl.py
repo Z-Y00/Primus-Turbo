@@ -2,6 +2,9 @@
 # Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
 #
+# Adapted from NVIDIA Megatron-LM (https://github.com/NVIDIA/Megatron-LM),
+#   file megatron/core/transformer/moe/fused_a2a.py.
+#
 # See LICENSE for license information.
 ###############################################################################
 
@@ -484,8 +487,9 @@ def _resolve_backend_name() -> str:
       2. ``PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND`` env var (supports names beyond ``BackendType``)
       3. Default: ``TURBO``
     """
-    user_backend = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
-    if user_backend is not None:
+    user_backend_choice = GlobalBackendManager.get_moe_dispatch_combine_backend(PrecisionType.BF16_FP16_FP32)
+    if user_backend_choice is not None and user_backend_choice.backend is not None:
+        user_backend = user_backend_choice.backend
         return _BACKEND_TYPE_TO_NAME.get(user_backend, user_backend.name)
 
     env_val = os.environ.get(ENV_MOE_DISPATCH_COMBINE_BACKEND)

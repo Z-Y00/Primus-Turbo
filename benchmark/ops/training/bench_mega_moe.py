@@ -6,9 +6,10 @@
 
 """Benchmark the fused BF16 mega MoE kernels (EP, intra-node).
 
-Two modes, selected with --mode:
+Three modes, selected with --mode:
   dispatch_grouped_gemm : fused dispatch + grouped GEMM
   grouped_gemm_combine  : fused grouped GEMM + combine
+  activation            : the four gated-activation kernels (bf16/mxfp8, fwd/bwd), SiLU vs swigluoai
 
 Self-contained: the shared reference ops (routing/weight generation, the
 dense-GEMM roofline, the CUDA-event bench helper, the prologue-driven input
@@ -51,24 +52,12 @@ from flydsl.expr.typing import AddressSpace, PointerType  # noqa: E402
 
 # import primus_turbo.pytorch first to dodge the mega kernels' circular import
 import primus_turbo.pytorch  # noqa: E402,F401
-
-# primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
-# original mega_utils order; the two fused kernels below need pytorch first).
-from primus_turbo.flydsl.gemm.gemm_bf16_kernel import (  # noqa: E402
-    _compile_dense_nt,
-    _compile_grouped_variable_k_bf16,
-    _get_compiled_dense,
-    _i64,
-    _make_shared_storage,
-    gemm_bf16_tile,
-)
 from primus_turbo.flydsl.mega import (  # noqa: E402  # noqa: E402
     dispatch_grouped_gemm_bf16_flydsl_kernel,
     dispatch_prologue_flydsl_kernel,
     grouped_gemm_combine_bf16_flydsl_kernel,
-    swiglu_flydsl_kernel,
 )
-from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.ep_intranode import (  # noqa: E402
     _BLOCK_THREADS,
     _NUM_WARPS,
     _PVEC,
@@ -76,19 +65,45 @@ from primus_turbo.flydsl.mega.ep_intranode import (  # noqa: E402
     dispatch_bf16_tile,
     topk_reduce_bf16_tile,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
+
+# primus_turbo.flydsl.* imported before primus_turbo.pytorch (kept from the
+# original mega_utils order; the two fused kernels below need pytorch first).
+from primus_turbo.flydsl.mega.bf16.gemm_bf16_kernel import (  # noqa: E402
+    _compile_dense_nt,
+    _get_compiled_dense,
+    _make_shared_storage,
+    gemm_bf16_tile,
+)
+from primus_turbo.flydsl.mega.bf16.grouped_gemm_bf16_kernel import (  # noqa: E402
+    _compile_grouped_bf16_wgrad,
+)
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     BLOCK_M as _POOL_BLOCK_M,
 )
-from primus_turbo.flydsl.mega.symm_buffer import (  # noqa: E402
+from primus_turbo.flydsl.mega.bf16.symm_buffer import (  # noqa: E402
     TOKEN_DTYPE,
     SymBuffer,
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
+from primus_turbo.flydsl.mega.fp8 import (  # noqa: E402
+    colwise_grouped_meta,
+    swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl,
+    swiglu_mxfp8_flydsl_kernel,
+)
 from primus_turbo.flydsl.utils.gemm_helper import (  # noqa: E402
     ceildiv,
     make_value_attrs,
     xcd_remap_pid,
+)
+from primus_turbo.flydsl.utils.glu_activation import GLUActivation  # noqa: E402
+from primus_turbo.flydsl.utils.prims import _i64  # noqa: E402
+from primus_turbo.flydsl.utils.swiglu_kernel import (  # noqa: E402
+    swiglu_backward_flydsl_kernel,
+    swiglu_flydsl_kernel,
+)
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (  # noqa: E402
+    _DW_FP8_FORMAT,
 )
 from primus_turbo.pytorch.ops import grouped_gemm as turbo_grouped_gemm  # noqa: E402
 
@@ -123,7 +138,7 @@ def compile_grouped_gemm_bf16(
     BLOCK_N=256,
     GROUP_M=1,
     num_xcd=8,
-    nt_vmcnt=4,  # swept: vmcnt=4 > 3 (~1% on L1 NT, gfx950)
+    nt_vmcnt=3,  # gfx950 G2S LDS hazard: vmcnt>=4 races (nondeterministic); 3 is det
     waves_per_eu=2,
     agpr_alloc=0,
     out_fp16=False,
@@ -166,12 +181,17 @@ def compile_grouped_gemm_bf16(
             block_m = first_pid_m + (pid_in_group % group_size_m)
             block_n = pid_in_group // group_size_m
             g_idx = buffer_load(group_res, block_m, vec_width=1, dtype=fx.T.i32())
-            gbase = g_idx * fx.Int32(K) * c_n
+            pool_ptr_ty = PointerType.get(
+                elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
+            )
+            # Per-group weight slab rebased in int64: G*K*N overflows an int32 b_group_base.
+            w_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(B)), signed=True)
+            b_byte_off = _i64(g_idx) * fx.Int64(K * 2) * _i64(c_n)
+            B_tile = fx.make_view(
+                fx.inttoptr(pool_ptr_ty, w_base + b_byte_off), fx.make_layout(fx.Int32(K) * c_n, 1)
+            )
             # Worst-case pool (cap*K > 2^31): rebase A/C per tile in int64, int32 in-resource offset. Mirrors fused nt/nn.
             if layout in ("nt", "nn"):
-                pool_ptr_ty = PointerType.get(
-                    elem_ty=fx.BFloat16.ir_type, address_space=AddressSpace.Global, alignment=16
-                )
                 a_byte_off = _i64(block_m) * fx.Int64(BLOCK_M * K * 2)
                 c_byte_off = _i64(block_m * fx.Int32(BLOCK_M)) * _i64(c_n) * fx.Int64(2)
                 a_base = fx.arith.ArithValue(arith.index_cast(fx.T.i64(), extract_base_index(A)), signed=True)
@@ -185,7 +205,7 @@ def compile_grouped_gemm_bf16(
                 )
                 gemm_tile(
                     A_tile,
-                    B,
+                    B_tile,
                     C_tile,
                     fx.Int32(BLOCK_M),
                     c_n,
@@ -197,12 +217,11 @@ def compile_grouped_gemm_bf16(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
                 )
             else:
                 gemm_tile(
                     A,
-                    B,
+                    B_tile,
                     C,
                     c_m,
                     c_n,
@@ -214,14 +233,13 @@ def compile_grouped_gemm_bf16(
                     BLOCK_N=BLOCK_N,
                     out_fp16=out_fp16,
                     nt_vmcnt=nt_vmcnt,
-                    b_group_base=gbase,
                 )
 
         if fx.block_idx.x < real_grid:
             _emit()
 
     @flyc.jit
-    def launch(A, B, C, TILE_TO_GROUP, NUM_TILE_BLOCKS, c_m: int, c_n: int, stream: fx.Stream):
+    def launch(A, B, C, TILE_TO_GROUP, NUM_TILE_BLOCKS, c_m: fx.Int32, c_n: fx.Int32, stream: fx.Stream):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         grouped_gemm_k(
             A,
@@ -353,12 +371,14 @@ def grouped_gemm_variable_k_only(
         if num_tokens_per_expert_prefix.dtype == torch.int64
         else num_tokens_per_expert_prefix.to(torch.int64)
     )
+    # per-group valid-K length (padded span); kernel bounds the K-contraction to it
+    masked_k_i64 = (prefix_i64[1:] - prefix_i64[:-1]).contiguous()
     # trans_c: C^T = rhs^T @ lhs by swapping operands -> [G, OUT_N, OUT_M] via fast coalesced store.
     if trans_c:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = rhs_pool, lhs_pool, OUT_N, OUT_M
     else:
         lhs_e, rhs_e, OUT_M_e, OUT_N_e = lhs_pool, rhs_pool, OUT_M, OUT_N
-    launch = _compile_grouped_variable_k_bf16(
+    launch = _compile_grouped_bf16_wgrad(
         OUT_M_e,
         OUT_N_e,
         G,
@@ -372,8 +392,9 @@ def grouped_gemm_variable_k_only(
     args = (
         lhs_e.contiguous(),
         rhs_e.contiguous(),
-        out_dw.view(-1),  # output: view (not contiguous) so writes hit the real buffer
+        flyc.from_torch_tensor(out_dw),  # static memref: full rank, no int32 shape kernarg
         prefix_i64,
+        masked_k_i64,
         OUT_M_e,
         OUT_N_e,
         torch.cuda.current_stream(),
@@ -396,7 +417,7 @@ def grouped_gemm_bf16_only(
     GROUP_M=4,
     # xcd=1 maximizes L2 reuse of shared weight slabs (swept: +3% NT, +11% NN, +15% TN vs xcd=8)
     num_xcd=1,
-    nt_vmcnt=4,  # swept: vmcnt=4 > 3 (~1% on L1 NT, gfx950)
+    nt_vmcnt=3,  # gfx950 G2S LDS hazard: vmcnt>=4 races (nondeterministic); 3 is det
     waves_per_eu=2,
     agpr_alloc=0,
 ):
@@ -414,10 +435,10 @@ def grouped_gemm_bf16_only(
         c_m, hidden_size = pool.shape
     if layout == "nt":  # weight [G, N, K]
         G, N, K = weight.shape
-        weight_flat = weight.reshape(G * N, K).contiguous().view(-1)
+        weight_flat = weight.reshape(G * N, K).contiguous()
     else:  # NN / TN: weight [G, K, N]
         G, K, N = weight.shape
-        weight_flat = weight.reshape(G * K, N).contiguous().view(-1)
+        weight_flat = weight.reshape(G * K, N).contiguous()
     assert K == hidden_size, f"weight K={K} != activation K={hidden_size}"
     out_features = N
     launch = compile_grouped_gemm_bf16(
@@ -434,7 +455,7 @@ def grouped_gemm_bf16_only(
     # Pass A/C as 2-D (flat view(-1) overflows int32 shape ABI); kernel rebases per tile.
     launch(
         pool.contiguous(),
-        weight_flat,
+        flyc.from_torch_tensor(weight_flat),
         output,
         tile_to_expert,
         num_tile_blocks,
@@ -462,7 +483,7 @@ def dispatch_only(
     assert x.dtype == torch.bfloat16
     hidden_size = x.size(1)
     pool_capacity = symm.num_max_pool_tokens
-    x_i32 = x.contiguous().view(torch.int32).view(-1)
+    x_i32 = x.contiguous().view(torch.int32)
     launch = _compile_dispatch_only(
         hidden_size,
         pool_capacity,
@@ -488,10 +509,10 @@ def dispatch_only(
 # --------------------------------------------------------------------------- #
 # Routing + weights
 # --------------------------------------------------------------------------- #
-def generate_routing(num_tokens, num_topk, num_experts, *, device="cuda", seed=0):
-    """(topk_idx[T,K] int64, topk_weight[T,K] f32), load-balanced routing."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    scores = torch.rand(num_tokens, num_experts, generator=g, device=device).abs() + 1
+def generate_routing(num_tokens, num_topk, num_experts, *, device="cuda"):
+    """(topk_idx[T,K] int64, topk_weight[T,K] f32), load-balanced routing.
+    Draws from the global RNG so the caller controls reproducibility (pressure loop re-seeds)."""
+    scores = torch.rand(num_tokens, num_experts, device=device).abs() + 1
     topk_weight, topk_idx = torch.topk(scores.softmax(-1), num_topk, dim=-1)
     return topk_idx.to(torch.int64), topk_weight.to(torch.float32)
 
@@ -532,9 +553,17 @@ def bench(fn, *, warmup=20, iters=30):
 # --------------------------------------------------------------------------- #
 def gate3(out, ref, *, cos_thresh=0.99, rel_thresh=0.05):
     """(cos, rel_rmse, ok) of a kernel output vs its reference (flattened, fp32)."""
-    g, r = out.float().flatten(), ref.float().flatten()
-    cos = float(torch.dot(g, r) / (g.norm() * r.norm() + 1e-12))
-    rel = float((g - r).norm() / (r.norm() + 1e-12))
+    g, r = out.flatten(), ref.flatten()
+    # chunked fp64 accumulation: torch.dot/norm cap numel at int32
+    dot = gg = rr = dd = 0.0
+    for i in range(0, g.numel(), 1 << 28):
+        gc, rc = g[i : i + (1 << 28)].float(), r[i : i + (1 << 28)].float()
+        dot += float((gc * rc).sum())
+        gg += float((gc * gc).sum())
+        rr += float((rc * rc).sum())
+        dd += float(((gc - rc) ** 2).sum())
+    cos = dot / (math.sqrt(gg) * math.sqrt(rr) + 1e-12)
+    rel = math.sqrt(dd) / (math.sqrt(rr) + 1e-12)
     return cos, rel, (cos >= cos_thresh and rel <= rel_thresh)
 
 
@@ -590,22 +619,11 @@ def dense_gemm_peak_ms(M, N, K, BLOCK_M, BLOCK_N, iters, *, group_m_cands=(4,)):
 # --------------------------------------------------------------------------- #
 # Input builders (like the EP test): build SymmBuffer, run prologue for the handle, fill pool/activation; `kind` picks the kernel.
 # --------------------------------------------------------------------------- #
-def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
-    """Shared prologue: SymmBuffer + routing + dispatch handle (no pool fill yet)."""
-    rank = group.rank()
-    torch.manual_seed(base_seed + rank)
+def _get_dispatch_handle(symm, *, T, H, E, K):
+    """Shared prologue over a caller-owned symm buffer: routing + dispatch handle (no pool fill yet)."""
     x = torch.randn((T, H), device="cuda", dtype=torch.float32).bfloat16()
-    topk_idx, topk_weight = generate_routing(T, K, E, device="cuda", seed=100 + rank)
+    topk_idx, topk_weight = generate_routing(T, K, E, device="cuda")
 
-    # one symmetric allocation for every cross-rank + scratch buffer (production arena)
-    symm = get_symm_buffer_for_mega_moe(
-        group,
-        num_experts=E,
-        num_max_tokens_per_rank=T,
-        num_topk=K,
-        hidden=H,
-        intermediate_hidden=I,
-    )
     # prologue -> flat dispatch handle (same as test); resets scoreboard+barrier, cross-rank barrier. Handle IS the full prologue tuple.
     handle = dispatch_prologue_flydsl_kernel(
         topk_idx,
@@ -626,7 +644,7 @@ def _build_symm_and_plan(group, *, T, H, I, E, K, BLOCK_M, BLOCK_N, base_seed):
     handle = tuple(handle) + (symm.pool_src_slot,)
     tile_to_expert = handle[5]
     num_tile_blocks = handle[8]  # device real-tile count (prologue-written, per-forward)
-    return symm, x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks
+    return x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks
 
 
 def _dispatch_and_settle(group, x, handle, symm, *, num_dispatch_cu):
@@ -639,8 +657,11 @@ def _dispatch_and_settle(group, x, handle, symm, *, num_dispatch_cu):
     group.barrier()
 
 
-def generate_input(group, *, kind, T, H, I, E, K, BLOCK_M, BLOCK_N, num_dispatch_cu=16, base_seed=7):
-    """Build the real inputs for one of the mega kernels over the production SymmBuffer.
+def generate_input(group, *, kind, symm, T, H, I, E, K, BLOCK_M, BLOCK_N, num_dispatch_cu=16):
+    """Build the real inputs for one of the mega kernels over a caller-owned SymmBuffer.
+
+    The symm buffer is created once per case by the driver and passed in, so its
+    lifetime spans the whole bench/pressure run (destroyed once at the end).
 
     This rank's expert weights (W1/W2) are generated here (deterministic global set,
     sliced to this rank), so callers never build or slice the weights themselves.
@@ -648,8 +669,8 @@ def generate_input(group, *, kind, T, H, I, E, K, BLOCK_M, BLOCK_N, num_dispatch
     kind="dispatch": pool is filled by a single dispatch PUSH (real A for the L1 GEMM).
     kind="combine":  prologue + dispatch + L1 GEMM + SwiGLU -> act (real L2 input), and
                      l2_token_buffer is filled once so combine_only has real rows."""
-    symm, x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks = _build_symm_and_plan(
-        group, T=T, H=H, I=I, E=E, K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, base_seed=base_seed
+    x, topk_idx, topk_weight, handle, tile_to_expert, num_tile_blocks = _get_dispatch_handle(
+        symm, T=T, H=H, E=E, K=K
     )
     # this rank's expert weights: deterministic global set (fixed seed) sliced per rank -> consistent across ranks.
     g = torch.Generator(device="cuda").manual_seed(1234)
@@ -703,12 +724,15 @@ def generate_input(group, *, kind, T, H, I, E, K, BLOCK_M, BLOCK_N, num_dispatch
         grouped_gemm_bf16_only(
             act, W2, symm.l2_token_buffer, tile_to_expert, num_tile_blocks, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
+        # bwd L1-dgrad input: draw from the global RNG (caller re-seeds per rep for reproducibility)
+        grad_l1 = torch.randn(symm.num_max_pool_tokens, 2 * I, device="cuda", dtype=torch.bfloat16) / 8
         torch.cuda.synchronize()
         group.barrier()
         return SimpleNamespace(
             symm=symm,
             x=x,  # raw input tokens (for the turbo full-forward reference)
             act=act,
+            grad_l1=grad_l1,  # L1-dgrad input for the combine backward stage
             handle=handle,
             num_tile_blocks=num_tile_blocks,
             topk_idx=topk_idx,
@@ -1159,15 +1183,21 @@ class StageSpec:
 class StageRunner:
     """Binds per-run context so each stage passes only its own knobs; run does the shared template."""
 
-    def __init__(self, group, args, synced_fn, group_m_cands):
+    def __init__(self, group, args, synced_fn, group_m_cands, skip_benchmark=False):
         self.group = group
         self.args = args
         self.synced_fn = synced_fn
         self.group_m_cands = group_m_cands
+        self.skip_benchmark = skip_benchmark  # pressure test: run fused only, for the hash
 
     def run(self, spec):
-        """Time gemm / dense roofline / comm_only / fused, then gate accuracy under a synced bracket."""
+        """Time gemm / dense roofline / comm_only / fused, then gate accuracy under a synced
+        bracket. Returns (metrics, check, out); pressure mode skips timing+accuracy and returns
+        (None, None, out) so the caller can hash the fused output."""
         args = self.args
+        if self.skip_benchmark:
+            out = self.synced_fn(spec.fused_fn)[0]
+            return None, None, out
         dense_m, dense_n, dense_k = spec.dense_dims
         t_gemm = bench(spec.gemm_fn, iters=args.iters)
         t_dense, dense_gm = dense_gemm_peak_ms(
@@ -1187,7 +1217,7 @@ class StageRunner:
         ref_out = self.synced_fn(spec.ref_fn)
         out = self.synced_fn(spec.fused_fn)[0]
         check = check_accuracy(self.group, spec.name, out[spec.acc_slice], ref_out[spec.acc_slice])
-        return metrics, check
+        return metrics, check, out
 
 
 def _make_runner(group, args):
@@ -1201,7 +1231,7 @@ def _make_runner(group, args):
         return out
 
     group_m_cands = (args.dense_group_m,)
-    return StageRunner(group, args, _synced, group_m_cands)
+    return StageRunner(group, args, _synced, group_m_cands, skip_benchmark=bool(args.pressure_test_mode))
 
 
 ###############################################################################
@@ -1227,11 +1257,12 @@ class DispatchContext:
     group_offs: Any  # cumulative padded boundaries [experts_per_rank + 1]
 
 
-def _dispatch_make_context(group, args):
-    """Build input + symm buffers and precompute shared geometry (weights built in generate_input)."""
+def _dispatch_make_context(group, args, symm):
+    """Build input over the caller-owned symm buffer and precompute shared geometry (weights built in generate_input)."""
     inp = generate_input(
         group,
         kind="dispatch",
+        symm=symm,
         T=args.num_tokens,
         H=args.hidden,
         I=args.inter,
@@ -1313,8 +1344,8 @@ def _dispatch_stage_fwd(runner, ctx):
         ),
         acc_slice=slice(0, M_eff),
     )
-    metrics, check = runner.run(spec)
-    return metrics, check, xgmi_bytes
+    metrics, check, out = runner.run(spec)
+    return metrics, check, xgmi_bytes, out
 
 
 def _dispatch_stage_bwd_dgrad(runner, ctx):
@@ -1395,21 +1426,27 @@ def _dispatch_stage_bwd_wgrad(runner, ctx):
     return runner.run(spec)
 
 
-def _dispatch_profile(group, args):
-    ctx = _dispatch_make_context(group, args)
+def _dispatch_profile(group, args, symm, ctx=None):
+    # symm is caller-owned (built once per case, freed at the end of the run); never destroy here
+    # ctx passed in (pressure test): built once per seed so every rep reuses the SAME input
+    if ctx is None:
+        ctx = _dispatch_make_context(group, args, symm)
     runner = _make_runner(group, args)
     checks = {}
-    try:
-        fwd_metrics, checks["fwd"], xgmi_bytes = _dispatch_stage_fwd(runner, ctx)
-        bwd_metrics, checks["bwd"] = _dispatch_stage_bwd_dgrad(runner, ctx)
-        wgrad_metrics, checks["wgrad"] = _dispatch_stage_bwd_wgrad(runner, ctx)
-    finally:
-        ctx.symm.destroy()  # always free symmetric buffers
+    fwd_metrics, checks["fwd"], xgmi_bytes, out_fwd = _dispatch_stage_fwd(runner, ctx)
+    bwd_metrics, checks["bwd"], out_bwd = _dispatch_stage_bwd_dgrad(runner, ctx)
+    wgrad_metrics, checks["wgrad"], out_wgrad = _dispatch_stage_bwd_wgrad(runner, ctx)
+    hashes = {
+        "fwd": _hash_tensor(out_fwd[: ctx.M_eff]),
+        "bwd": _hash_tensor(out_bwd[: ctx.M_eff]),
+        "wgrad": _hash_tensor(out_wgrad),
+    }
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
     return {
         "stages": {"fwd": fwd_metrics, "bwd": bwd_metrics, "wgrad": wgrad_metrics},
         "xgmi_bytes": xgmi_bytes,
         "checks": checks,
+        "hashes": hashes,
     }
 
 
@@ -1433,16 +1470,17 @@ class CombineContext:
     M_eff: int  # total padded pool rows this rank GEMMs
     xgmi_bytes: int  # combine push bytes per rank (same fwd/bwd, H-wide)
     num_tokens: int
-    topk_idx_flat: Any  # int32 [T*K], drives the per-token reduce
+    topk_idx_flat: Any  # int64 [T*K], drives the per-token reduce
     topk_w_flat: Any  # f32 [T*K], forward routing weights
     reduce_ready: Any  # standalone reduce ready flags (0 == ready)
 
 
-def _combine_make_context(group, args):
-    """Build input + symm buffers and precompute shared geometry + topk tables (weights built in generate_input)."""
+def _combine_make_context(group, args, symm):
+    """Build input over the caller-owned symm buffer and precompute shared geometry + topk tables (weights built in generate_input)."""
     inp = generate_input(
         group,
         kind="combine",
+        symm=symm,
         T=args.num_tokens,
         H=args.hidden,
         I=args.inter,
@@ -1459,7 +1497,8 @@ def _combine_make_context(group, args):
     origin = symm.pool_src_rank
     remote_rows = int(((origin != rank) & (origin >= 0)).sum().item())
     xgmi_bytes = remote_rows * args.hidden * BF16_BYTES
-    topk_idx_flat = inp.topk_idx.to(torch.int32).contiguous().view(-1)
+    # kernel reads topk_indices as i64 (like the production forward); int32 -> OOB slot
+    topk_idx_flat = inp.topk_idx.to(torch.int64).contiguous().view(-1)
     topk_w_flat = inp.topk_weight.to(torch.float32).contiguous().view(-1)
     reduce_ready = torch.zeros(int(symm.num_combine_slots), dtype=torch.int32, device="cuda")
     return CombineContext(
@@ -1561,7 +1600,7 @@ def _combine_stage_bwd(runner, ctx):
     inp, args, symm = ctx.inp, ctx.args, ctx.symm
     N, K = args.hidden, 2 * args.inter  # weight [G, K=2I, N=H]
     flops = 2.0 * ctx.M_eff * N * K
-    grad_l1 = torch.randn(symm.num_max_pool_tokens, K, device="cuda", dtype=torch.bfloat16) / 8
+    grad_l1 = inp.grad_l1  # built deterministically in generate_input (rep-stable, seed-varying)
     ref_dx = torch.empty(ctx.num_tokens, args.hidden, device="cuda", dtype=torch.bfloat16)
 
     # reference: decoupled gemm_only(nn) + combine_only + unweighted topk_reduce (weight rides grad_l1)
@@ -1617,23 +1656,80 @@ def _combine_stage_bwd(runner, ctx):
     return runner.run(spec)
 
 
-def _combine_profile(group, args):
+def _combine_profile(group, args, symm, ctx=None):
     """Forward = e2e step 4 (NT weighted); backward = e2e step 3 (NN unweighted). Both report the 3-role fused kernel."""
-    ctx = _combine_make_context(group, args)
+    # symm is caller-owned (built once per case, freed at the end of the run); never destroy here
+    # ctx passed in (pressure test): built once per seed so every rep reuses the SAME input
+    if ctx is None:
+        ctx = _combine_make_context(group, args, symm)
     runner = _make_runner(group, args)
     checks = {}
-    try:
-        fwd_metrics, checks["fwd"] = _combine_stage_fwd(runner, ctx)
-        bwd_metrics, checks["bwd"] = _combine_stage_bwd(runner, ctx)
-        xgmi_bytes = ctx.xgmi_bytes
-    finally:
-        ctx.symm.destroy()  # always free the symmetric buffer
+    fwd_metrics, checks["fwd"], out_fwd = _combine_stage_fwd(runner, ctx)
+    bwd_metrics, checks["bwd"], out_bwd = _combine_stage_bwd(runner, ctx)
+    hashes = {
+        "fwd": _hash_tensor(out_fwd),
+        "bwd": _hash_tensor(out_bwd),
+    }
     # raw per-rank timings + work; rank 0 aggregates across ranks (bottleneck = max latency)
     return {
         "stages": {"fwd": fwd_metrics, "bwd": bwd_metrics},
-        "xgmi_bytes": xgmi_bytes,
+        "xgmi_bytes": ctx.xgmi_bytes,
         "checks": checks,
+        "hashes": hashes,
     }
+
+
+###############################################################################
+# Pressure test: run the fused kernels repeatedly on a fixed seed and assert the
+# output is bit-exact reproducible (catches cross-rank races / non-determinism).
+###############################################################################
+_HASH_PRIME = 2_000_000_011
+
+
+def _hash_tensor(tensor):
+    """Return an order-sensitive, bit-exact hash of a tensor's raw bytes."""
+    raw = tensor.detach().contiguous().view(torch.uint8).reshape(-1).to(torch.int64)
+    weights = torch.arange(1, raw.numel() + 1, device=raw.device, dtype=torch.int64)
+    return int(((raw * weights) % _HASH_PRIME).sum().item()) % (1 << 62)
+
+
+def _pressure_loop(mode, group, args, reps=20, num_seeds=int(1e9)):
+    rank = dist.get_rank()
+    for case in gen_moe_test_cases(args.models):
+        name = case["Case"]
+        if name in UNSUPPORTED:
+            if rank == 0:
+                print(f"[skip] {name}: unsupported by mega {args.mode}")
+            continue
+        apply_case(args, case)
+        # one caller-owned symm buffer per case, reused across every seed/rep; freed at run end
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=args.num_experts,
+            num_max_tokens_per_rank=args.num_tokens,
+            num_topk=args.num_topk,
+            hidden=args.hidden,
+            intermediate_hidden=args.inter,
+        )
+        if rank == 0:
+            print(f"\n=== pressure {args.mode}: {name} ({reps} reps/seed) ===", flush=True)
+        for seed in range(num_seeds):  # effectively infinite; stop with Ctrl-C
+            if rank == 0:
+                print(f"Testing with seed {seed} ...", flush=True)
+
+            # re-running it each rep would feed a different input and mask the kernel under test.
+            torch.manual_seed(rank + seed)
+            ctx = mode.make_context(group, args, symm)
+
+            ref_hashes = mode.profile(group, args, symm, ctx=ctx)["hashes"]
+            for rep in range(reps):
+                cur = mode.profile(group, args, symm, ctx=ctx)["hashes"]
+                drift = [k for k in ref_hashes if cur.get(k) != ref_hashes[k]]
+                if drift:
+                    detail = ", ".join(f"{k} {cur.get(k)} != {ref_hashes[k]}" for k in drift)
+                    raise AssertionError(
+                        f"[rank{rank}] {name} mode={args.mode} seed={seed} rep={rep}: stage(s) {detail}"
+                    )
 
 
 ###############################################################################
@@ -1655,7 +1751,8 @@ class StageReport:
 class ModeSpec:
     """Everything the shared driver needs to run + report one mode."""
 
-    profile: Callable  # (group, args) -> {"stages", "xgmi_bytes", "checks"}
+    profile: Callable  # (group, args, symm, ctx=None) -> {"stages", "xgmi_bytes", "checks", "hashes"}
+    make_context: Callable  # (group, args, symm) -> ctx; built once/seed so reps reuse the SAME input
     port: int  # default MASTER_PORT for this mode's spawn
     prefix: str  # output CSV filename prefix
     header_kind: str  # print_header kind label
@@ -1671,6 +1768,7 @@ _FWD_REPORT = StageReport("fwd", "", {"dense_ms": True, "xgmi": True, "hidden": 
 MODES = {
     "dispatch_grouped_gemm": ModeSpec(
         profile=_dispatch_profile,
+        make_context=_dispatch_make_context,
         port=8481,
         prefix="dispatch_grouped_gemm",
         header_kind="dispatch",
@@ -1685,6 +1783,7 @@ MODES = {
     ),
     "grouped_gemm_combine": ModeSpec(
         profile=_combine_profile,
+        make_context=_combine_make_context,
         port=8483,
         prefix="grouped_gemm_combine",
         header_kind="combine",
@@ -1693,7 +1792,7 @@ MODES = {
         comm_tag="comb",
         stages=[
             _FWD_REPORT,
-            StageReport("bwd", "bwd ", {"xgmi": True}, "backward dgrad (NN, = mega_moe_fused STEP 3)"),
+            StageReport("bwd", "bwd ", {"xgmi": True}, "backward dgrad (NN, = fused_mega_moe STEP 3)"),
         ],
     ),
 }
@@ -1752,6 +1851,89 @@ def _report_case(mode, platform, gpu_name, world, args, case_name, per_rank):
     return rich_row, csv_row
 
 
+###############################################################################
+# Activation mode: the four gated-activation kernels, SiLU vs swigluoai
+###############################################################################
+_ACTIVATION_PORT = 8485
+_ACTIVATIONS = (("silu", None), ("swigluoai", GLUActivation.swigluoai()))
+
+
+def _activation_kernels(l1, dact, scale, num_tile_blocks, meta, activation):
+    """name -> zero-arg launcher, one per MegaMoE activation kernel, as the staged ops call them."""
+    return {
+        "bf16 fwd": lambda: swiglu_flydsl_kernel(l1, num_tile_blocks, activation=activation),
+        "bf16 bwd": lambda: swiglu_backward_flydsl_kernel(
+            dact, l1, num_tile_blocks, scale=scale, return_gate=True, return_act_w=True, activation=activation
+        ),
+        "mxfp8 fwd": lambda: swiglu_mxfp8_flydsl_kernel(l1, num_tile_blocks, activation=activation),
+        "mxfp8 bwd": lambda: swiglu_bwd_rowcol_dual_quant_mxfp8_flydsl(
+            dact, l1, scale, _DW_FP8_FORMAT, meta=meta, activation=activation
+        ),
+    }
+
+
+def _activation_bench(group, args, reps=5):
+    """Time each activation kernel for SiLU and swigluoai on this rank's real dispatched pool.
+
+    The two activations run interleaved, ``reps`` rounds each, so drift hits both alike; the spread
+    of the SiLU rounds is the noise floor the swigluoai / SiLU ratio has to be read against. The L1
+    output is drawn at std 4 so both of swigluoai's clamps bite on a real share of elements.
+    """
+    rank = dist.get_rank()
+    for case in gen_moe_test_cases(args.models):
+        name = case["Case"]
+        if name in UNSUPPORTED:
+            continue
+        apply_case(args, case)
+        H, I, E, K, T = args.hidden, args.inter, args.num_experts, args.num_topk, args.num_tokens
+        symm = get_symm_buffer_for_mega_moe(
+            group, num_experts=E, num_max_tokens_per_rank=T, num_topk=K, hidden=H, intermediate_hidden=I
+        )
+        torch.manual_seed(rank)
+        handle = _get_dispatch_handle(symm, T=T, H=H, E=E, K=K)[3]
+        num_tile_blocks = handle[8]
+        P = symm.num_max_pool_tokens
+        l1 = (torch.randn(P, 2 * I, device="cuda") * 4.0).bfloat16()
+        dact = torch.randn(P, I, device="cuda").bfloat16()
+        scale = torch.rand(P, device="cuda")
+        meta = colwise_grouped_meta(handle[6], handle[7], pool_rows=P)
+        real_rows = int(num_tile_blocks.item()) * _POOL_BLOCK_M
+        kernels = {
+            act_name: _activation_kernels(l1, dact, scale, num_tile_blocks, meta, act)
+            for act_name, act in _ACTIVATIONS
+        }
+        times = {(k, a): [] for a in kernels for k in kernels[a]}
+        for _ in range(reps):
+            for act_name, fns in kernels.items():
+                for k, fn in fns.items():
+                    times[(k, act_name)].append(bench(fn, iters=args.iters))
+        sync_ranks(group)
+        per_rank = [None] * group.size()
+        dist.all_gather_object(per_rank, (real_rows, times), group=group)
+        if rank == 0:
+            rows = []
+            for k in kernels["silu"]:
+                # bottleneck rank per round, then the median round
+                silu = [max(r[1][(k, "silu")][i] for r in per_rank) for i in range(reps)]
+                oai = [max(r[1][(k, "swigluoai")][i] for r in per_rank) for i in range(reps)]
+                s_med, o_med = statistics.median(silu), statistics.median(oai)
+                rows.append(
+                    {
+                        "kernel": k,
+                        "silu ms": f"{s_med:.4f}",
+                        "swigluoai ms": f"{o_med:.4f}",
+                        "swigluoai/silu": f"{o_med / s_med:.3f}",
+                        "silu noise (max-min)/med": f"{(max(silu) - min(silu)) / s_med:.3f}",
+                    }
+                )
+            print(
+                f"\n=== activation kernels: {name}  EP{group.size()} T={T} H={H} I={I} E={E} topk={K}  "
+                f"pool rows {P} (real, max over ranks {max(r[0] for r in per_rank)})  median of {reps} ==="
+            )
+            print(tabulate(pd.DataFrame(rows), headers="keys", tablefmt="grid", showindex=False))
+        sync_ranks(group)
+
+
 def _init_dist(local_rank, world, default_port):
     """Bring up NCCL + the collective group for this spawn; returns the process group."""
     master_addr = os.getenv("MASTER_ADDR", "127.0.0.1")
@@ -1762,15 +1944,41 @@ def _init_dist(local_rank, world, default_port):
     )
     torch.set_default_device("cuda")
     torch.cuda.set_device(local_rank)
-    return dist.new_group(list(range(world)))
+    # symm-mem rendezvous needs the WORLD group (a fresh subgroup fails "send fd")
+    return dist.group.WORLD
 
 
 def _benchmark(local_rank, world, args):
     """One spawn sweeps every MoE model for args.mode; unsupported / failing cases are skipped."""
+    if args.mode == "activation":
+        group = _init_dist(local_rank, world, _ACTIVATION_PORT)
+        try:
+            _activation_bench(group, args)
+        finally:
+            try:
+                get_symm_buffer_for_mega_moe().destroy()  # no-arg -> the active buffer
+            except RuntimeError:
+                pass  # none was ever built
+            dist.destroy_process_group()
+        return
+
     mode = MODES[args.mode]
     group = _init_dist(local_rank, world, mode.port)
     rank = dist.get_rank()
     platform, gpu_name = get_platform_info()
+
+    # pressure test: skip timing/CSV, just assert bit-exact reproducibility per seed
+    if args.pressure_test_mode:
+        try:
+            _pressure_loop(mode, group, args)
+        finally:
+            # free the symm buffer after the whole run
+            try:
+                get_symm_buffer_for_mega_moe().destroy()  # no-arg -> the active buffer
+            except RuntimeError:
+                pass  # none was ever built
+            dist.destroy_process_group()
+        return
 
     try:
         rich_rows, csv_rows = [], []
@@ -1781,10 +1989,21 @@ def _benchmark(local_rank, world, args):
                     print(f"[skip] {name}: unsupported by mega {args.mode} (see UNSUPPORTED TODO)")
                 continue
             apply_case(args, case)
+            # caller-owned symm buffer; reused per dims (auto-frees the previous case's), freed at run end
+            symm = get_symm_buffer_for_mega_moe(
+                group,
+                num_experts=args.num_experts,
+                num_max_tokens_per_rank=args.num_tokens,
+                num_topk=args.num_topk,
+                hidden=args.hidden,
+                intermediate_hidden=args.inter,
+            )
             sync_ranks(group)
+            # per-rank seed so ranks get distinct tokens/routing (generate_input draws global RNG)
+            torch.manual_seed(rank)
             ok, result = True, None
             try:
-                result = mode.profile(group, args)
+                result = mode.profile(group, args, symm)
             except Exception as e:  # noqa: BLE001  probe: skip cases the kernel can't run
                 ok = False
                 if rank == 0:
@@ -1809,6 +2028,11 @@ def _benchmark(local_rank, world, args):
             print(f"Results saved to {out_file}")
         sync_ranks(group)
     finally:
+        # free the symm buffer after the whole run
+        try:
+            get_symm_buffer_for_mega_moe().destroy()  # no-arg -> the active buffer
+        except RuntimeError:
+            pass  # none was ever built
         dist.destroy_process_group()
 
 
@@ -1826,7 +2050,7 @@ def _build_parser():
     parser = argparse.ArgumentParser(description="Benchmark the fused BF16 mega MoE kernels")
     parser.add_argument(
         "--mode",
-        choices=list(MODES),
+        choices=[*MODES, "activation"],
         required=True,
         help="which fused mega kernel to benchmark",
     )
@@ -1839,6 +2063,8 @@ def _build_parser():
     parser.add_argument("--output", "-o", type=str, default=None)
     # restrict the sweep to these MoE model names (default = all)
     parser.add_argument("--models", nargs="+", default=None)
+    # pressure test: 0 = normal bench; 1 = assert bit-exact reproducibility per seed
+    parser.add_argument("--pressure-test-mode", type=int, default=0, choices=(0, 1))
     return parser
 
 

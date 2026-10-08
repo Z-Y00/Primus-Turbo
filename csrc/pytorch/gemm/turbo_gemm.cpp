@@ -1,7 +1,10 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
+#include "primus_turbo/arch.h"
 #include "primus_turbo/gemm.h"
 
 #include "../extensions.h"
@@ -65,6 +68,7 @@ static at::Tensor launch_mxfp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B
 at::Tensor turbo_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B, at::Tensor scaleB_inv,
                           const at::ScalarType out_dtype, bool transA, bool transB, bool transC,
                           const std::string &granularity) {
+    // Runtime guard: the turbo (MFMA) backend is not compiled on gfx1250.
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(A.scalar_type()), "A must be FP8.");
     PRIMUS_TURBO_CHECK(is_8bit_floating_point_dtype(B.scalar_type()), "B must be FP8.");
     PRIMUS_TURBO_CHECK(is_16bit_floating_point_dtype(out_dtype) || out_dtype == at::kFloat,

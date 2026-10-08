@@ -4,24 +4,763 @@
 # See LICENSE for license information.
 ###############################################################################
 
+import math
 import os
+import subprocess
+import sys
+from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from primus_turbo.pytorch.core.backend import (
+    BackendType,
+    GlobalBackendManager,
+    PrecisionType,
+)
+from primus_turbo.pytorch.core.utils import is_gfx950, is_gfx1250
+from primus_turbo.pytorch.kernels.attention import attention_gluon_impl, attention_impl
+from primus_turbo.pytorch.kernels.attention.attention_impl import (
+    resolve_flash_attn_backend,
+)
 from primus_turbo.pytorch.kernels.attention.attention_triton_impl import (
     F8_FWD_MAX,
     attention_triton_backward_impl,
     attention_triton_forward_impl,
 )
-from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func
-from primus_turbo.pytorch.ops.attention.attention_utils import block_scaling_node
+from primus_turbo.pytorch.kernels.attention.sparse_mla_impl import (
+    SparseMlaBwdDispatcher,
+    SparseMlaFwdDispatcher,
+)
+from primus_turbo.pytorch.ops import flash_attn_fp8_func, flash_attn_func, sparse_mla_func
+from primus_turbo.pytorch.ops.attention.attention_utils import (
+    _infer_qkv_format,
+    block_scaling_node,
+)
+from primus_turbo.triton.attention.sparse_mla import (
+    sparse_mla_bwd_triton,
+    sparse_mla_fwd_triton,
+)
+
+# Pytest discovers the imported fixtures in this test module.
+from tests.pytorch.ops.gluon_helper import (  # noqa: F401
+    _GLUON_CORRECTNESS_CASES,
+    WORKERS,
+    _fake_gluon_raw,
+    _fake_public_gluon_launcher,
+    _fake_public_gluon_tensors,
+    _gfx950_device_for_test,
+    _gluon_attention_fp32_reference,
+    _gluon_cuda_device,
+    _gluon_tensors,
+    _GluonTensor,
+    _has_gfx950,
+    _make_gluon_runtime_inputs,
+    _mock_gfx950_properties,
+    _pinned_gluon_backend,
+    _require_exact_gfx950,
+    _resolve_gluon,
+    _run_worker,
+)
 from tests.pytorch.ref.attention_ref import (
     AttnConfig,
     attention_vanilla_forward_pytorch_ref_impl,
     attention_with_sink_ref_impl,
 )
-from tests.pytorch.test_utils import compute_snr
+from tests.pytorch.test_utils import compute_snr, pinned_backend_takes
+
+
+def test_gluon_resolve_unpinned_uses_aiter_before_gluon(mock_gfx950_properties, monkeypatch):
+    # FlyDSL imports this helper into attention_impl. Keep this dispatcher-only
+    # test independent of the process's current CUDA device and its cached props.
+    monkeypatch.setattr(attention_impl, "get_device_compute_capability", lambda: (9, 5))
+    q, k, v = _gluon_tensors()
+
+    # Noncausal calls are valid Gluon input but intentionally ineligible for FlyDSL.
+    assert (
+        resolve_flash_attn_backend(
+            varlen=False,
+            user_backend=None,
+            q=q,
+            k=k,
+            v=v,
+            causal=False,
+        )
+        == BackendType.AITER
+    )
+
+
+@pytest.mark.parametrize(("storage", "qkv_format"), [("bshd", "bshd"), ("bhsd", "bhsd")])
+def test_gluon_resolve_pinned_accepts_supported_input(storage, qkv_format, mock_gfx950_properties):
+    q, k, v = _gluon_tensors(storage=storage)
+
+    assert _resolve_gluon(q, k, v, causal=False, qkv_format=qkv_format) == BackendType.GLUON
+
+
+@pytest.mark.parametrize(
+    ("name", "build"),
+    [
+        ("non_cuda", lambda: _gluon_tensors(device=None)),
+        ("non_gfx950", lambda: _gluon_tensors()),
+        (
+            "mixed_devices",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64), device="cuda:1"),
+                _GluonTensor((2, 4, 2, 64)),
+            ),
+        ),
+        (
+            "mixed_dtype",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64), dtype=torch.bfloat16),
+                _GluonTensor((2, 4, 2, 64)),
+            ),
+        ),
+        ("unsupported_dtype", lambda: _gluon_tensors(dtype=torch.float32)),
+        (
+            "kv_shape_mismatch",
+            lambda: (
+                _GluonTensor((2, 3, 8, 64)),
+                _GluonTensor((2, 4, 2, 64)),
+                _GluonTensor((2, 5, 2, 64)),
+            ),
+        ),
+        (
+            "zero_dimension",
+            lambda: _gluon_tensors(q_shape=(0, 3, 8, 64), kv_shape=(0, 4, 2, 64)),
+        ),
+        (
+            "head_dim_over_limit",
+            lambda: _gluon_tensors(q_shape=(2, 3, 8, 257), kv_shape=(2, 4, 2, 257)),
+        ),
+        (
+            "invalid_gqa",
+            lambda: _gluon_tensors(q_shape=(2, 3, 7, 64), kv_shape=(2, 4, 2, 64)),
+        ),
+        ("sbhd", lambda: _gluon_tensors(storage="sbhd")),
+        ("noncontiguous", lambda: _gluon_tensors(storage="noncontiguous")),
+    ],
+)
+def test_gluon_eligibility_refuses_invalid_tensor_contract(name, build, mock_gfx950_properties, monkeypatch):
+    q, k, v = build()
+    if name == "non_gfx950":
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda device: SimpleNamespace(gcnArchName="gfx942:sramecc+:xnack-"),
+        )
+
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        _resolve_gluon(q, k, v, causal=False)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"dropout_p": 0.1},
+        {"softmax_scale": "not-a-real-scalar"},
+        {"bias": object()},
+        {"alibi_slopes": object()},
+        {"sink": object()},
+        {"window_size": (1, -1)},
+        {"return_softmax": True},
+        pytest.param({"causal": True}, id="causal-sq-gt-skv"),
+        {"needs_backward": True},
+    ],
+)
+def test_gluon_eligibility_refuses_unsupported_call_features(kwargs, mock_gfx950_properties):
+    q, k, v = _gluon_tensors(q_shape=(2, 5, 8, 64), kv_shape=(2, 4, 2, 64))
+    kwargs.setdefault("causal", False)
+
+    with pytest.raises(ValueError, match="cannot handle the given inputs"):
+        _resolve_gluon(q, k, v, **kwargs)
+
+
+def test_gluon_wrapper_bshd_returns_contiguous_output_on_current_stream(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((2, 3, 8, 64), device=gluon_cuda_device, dtype=torch.float16)
+    k = torch.empty((2, 5, 2, 64), device=gluon_cuda_device, dtype=torch.float16)
+    v = torch.empty_like(k)
+    caller_stream = torch.cuda.Stream(device=gluon_cuda_device)
+
+    with torch.cuda.stream(caller_stream):
+        out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            q,
+            k,
+            v,
+            softmax_scale=Fraction(1, 4),
+            causal=True,
+            qkv_format="bshd",
+        )
+    caller_stream.synchronize()
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == (1536, 512, 64, 1)
+    assert out.is_contiguous()
+    assert out.dtype == torch.float16
+    assert out.device == gluon_cuda_device
+    assert torch.all(out == 1.25)
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == gluon_cuda_device
+    assert torch.all(lse == 0.25)
+    assert fake_gluon_raw == [
+        {
+            "shapes": (q.shape, k.shape, v.shape),
+            "strides": (q.stride(), k.stride(), v.stride()),
+            "contiguous": (True, True, True),
+            "scale_type": float,
+            "stream": caller_stream,
+        }
+    ]
+
+
+def test_gluon_wrapper_bhsd_preserves_physical_layout_and_defaults_scale(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((2, 8, 3, 64), device=gluon_cuda_device, dtype=torch.bfloat16).transpose(1, 2)
+    k = torch.empty((2, 2, 5, 64), device=gluon_cuda_device, dtype=torch.bfloat16).transpose(1, 2)
+    v = torch.empty_like(k.transpose(1, 2)).transpose(1, 2)
+
+    out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+        q, k, v, softmax_scale=None, causal=False, qkv_format="bhsd"
+    )
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == (1536, 64, 192, 1)
+    assert not out.is_contiguous()
+    assert out.dtype == torch.bfloat16
+    assert out.device == gluon_cuda_device
+    assert torch.all(out == 0.125)
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == gluon_cuda_device
+    assert torch.all(lse == 0.125)
+    assert fake_gluon_raw[0]["shapes"] == (
+        torch.Size((2, 8, 3, 64)),
+        torch.Size((2, 2, 5, 64)),
+        torch.Size((2, 2, 5, 64)),
+    )
+    assert fake_gluon_raw[0]["strides"] == (
+        (1536, 192, 64, 1),
+        (640, 320, 64, 1),
+        (640, 320, 64, 1),
+    )
+    assert fake_gluon_raw[0]["contiguous"] == (True, True, True)
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "expected_stride"),
+    [("bshd", (1536, 512, 64, 1)), ("bhsd", (1536, 64, 192, 1))],
+)
+def test_gluon_fake_matches_eager_metadata_and_exact_strides(qkv_format, expected_stride):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        if qkv_format == "bshd":
+            q = torch.empty((2, 3, 8, 64), device="cuda", dtype=torch.float16)
+            k = torch.empty((2, 5, 2, 64), device="cuda", dtype=torch.float16)
+        else:
+            q = torch.empty((2, 8, 3, 64), device="cuda", dtype=torch.float16).transpose(1, 2)
+            k = torch.empty((2, 2, 5, 64), device="cuda", dtype=torch.float16).transpose(1, 2)
+        v = torch.empty_like(k)
+
+        out, lse = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            q, k, v, softmax_scale=None, causal=False, qkv_format=qkv_format
+        )
+
+    assert out.shape == (2, 3, 8, 64)
+    assert out.stride() == expected_stride
+    assert out.dtype == q.dtype
+    assert out.device == q.device
+    assert lse.shape == (2, 8, 3)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+
+
+def test_gluon_compile_preserves_bshd_singleton_batch_stride(gluon_cuda_device, fake_gluon_raw):
+    q = torch.empty((5, 1, 8, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    k = torch.empty((7, 1, 2, 64), device=gluon_cuda_device, dtype=torch.float16).permute(1, 0, 2, 3)
+    v = torch.empty_like(k)
+
+    def forward(query, key, value):
+        out, _ = attention_gluon_impl.flash_attn_gluon_forward_impl(
+            query,
+            key,
+            value,
+            softmax_scale=None,
+            causal=False,
+            qkv_format="bshd",
+        )
+        return out, out.stride(0)
+
+    eager_out, eager_stride = forward(q, k, v)
+    torch._dynamo.reset()
+    try:
+        compiled_forward = torch.compile(forward, backend="eager", fullgraph=True)
+        compiled_out, compiled_stride = compiled_forward(q, k, v)
+    finally:
+        torch._dynamo.reset()
+
+    assert q.stride() == (512, 512, 64, 1)
+    assert eager_out.stride() == (512, 512, 64, 1)
+    assert compiled_out.stride() == (512, 512, 64, 1)
+    assert eager_stride == 512
+    assert compiled_stride == 512
+
+
+def test_gluon_wrapper_rejects_invalid_format_before_dispatch():
+    q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="qkv_format must be 'bshd' or 'bhsd'"):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, q, q, qkv_format="sbhd")
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "bad_storage", "error_match"),
+    [
+        ("bshd", "bhsd_view", "storage does not match"),
+        ("bhsd", "bshd_contiguous", "storage does not match"),
+        ("bshd", "inner_stride", "unit stride"),
+    ],
+)
+def test_gluon_wrapper_rejects_invalid_public_storage(qkv_format, bad_storage, error_match):
+    if qkv_format == "bshd":
+        q = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+    else:
+        q = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+        v = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+
+    if bad_storage == "bhsd_view":
+        k = torch.empty((1, 4, 2, 8), dtype=torch.float16).transpose(1, 2)
+    elif bad_storage == "bshd_contiguous":
+        k = torch.empty((1, 2, 4, 8), dtype=torch.float16)
+    else:
+        k = torch.empty((1, 2, 4, 16), dtype=torch.float16)[..., ::2]
+
+    with pytest.raises(ValueError, match=error_match):
+        attention_gluon_impl.flash_attn_gluon_forward_impl(q, k, v, qkv_format=qkv_format)
+
+
+def test_gluon_wrapper_import_does_not_load_raw_kernel():
+    raw_module = "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
+    code = (
+        "import importlib, sys; "
+        "importlib.import_module('primus_turbo.pytorch.kernels.attention.attention_gluon_impl'); "
+        f"assert {raw_module!r} not in sys.modules"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.getcwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_gluon_compiler_capability_error_names_gluon_and_triton(monkeypatch):
+    import_error = ModuleNotFoundError(
+        "No module named 'triton.experimental.gluon'",
+        name="triton.experimental.gluon",
+    )
+
+    def unavailable_raw_module(module_name):
+        assert module_name == "primus_turbo.gluon.attention.f16_fa_gfx950_rotated_4cluster"
+        raise import_error
+
+    monkeypatch.setattr(attention_gluon_impl, "_import_module", unavailable_raw_module)
+    monkeypatch.setitem(sys.modules, "triton", SimpleNamespace(__version__="test-triton-9.9"))
+
+    with pytest.raises(RuntimeError) as error:
+        attention_gluon_impl._load_flash_attn_gluon_raw()
+
+    message = str(error.value)
+    assert "Gluon" in message
+    assert "Triton test-triton-9.9" in message
+    assert "triton.experimental.gluon" in message
+    assert "CDNA4" in message
+    assert error.value.__cause__ is import_error
+
+
+def test_gluon_forward_only_allows_requires_grad_inputs_under_no_grad(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q, k, v = _fake_public_gluon_tensors((True, True, True))
+
+        with torch.no_grad():
+            out = flash_attn_func(q, k, v, causal=False)
+
+    assert out.shape == q.shape
+    assert out.requires_grad is False
+
+
+def test_gluon_grad_mode_rejects_backward_before_launch(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors((False, True, False))
+
+        with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
+            flash_attn_func(q, k, v, causal=False)
+
+
+def test_gluon_return_lse_preserves_the_public_return_contract(fake_public_gluon_launcher):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors()
+        result = flash_attn_func(q, k, v, causal=False, return_lse=True)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    out, lse = result
+    assert out.shape == q.shape
+    assert lse.shape == (2, 8, 3)
+
+
+def test_gluon_return_attn_probs_is_strictly_rejected_before_launch(
+    fake_public_gluon_launcher,
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode(), torch.enable_grad():
+        q, k, v = _fake_public_gluon_tensors()
+
+        with pytest.raises(ValueError, match="backend GLUON cannot handle the given inputs"):
+            flash_attn_func(q, k, v, causal=False, return_attn_probs=True)
+
+
+def test_gluon_lifecycle_direct_apply_rejects_backward_before_launch_under_optimize():
+    script = r"""
+import torch
+from primus_turbo.pytorch.core.backend import BackendType
+from primus_turbo.pytorch.ops.attention import flash_attn_interface
+
+launches = []
+def launch(*args, **kwargs):
+    launches.append((args, kwargs))
+    return torch.empty_like(args[0]), torch.empty((1, 1, 1))
+
+flash_attn_interface.flash_attn_gluon_forward_impl = launch
+q = torch.empty((1, 1, 1, 8), dtype=torch.float16, requires_grad=True)
+k = torch.empty_like(q)
+v = torch.empty_like(q)
+try:
+    flash_attn_interface.FlashAttnFunc.apply(
+        q, k, v, 0.0, None, False, (-1, -1), None, None,
+        False, False, False, True, 1, None, "bshd", BackendType.GLUON,
+    )
+except RuntimeError as error:
+    if str(error) != "gluon flash-attn is forward-only; Q/K/V backward is not implemented":
+        raise AssertionError("optimized direct Gluon apply used the wrong error")
+else:
+    raise AssertionError("optimized direct Gluon apply did not reject backward")
+if launches:
+    raise AssertionError("optimized direct Gluon apply reached the launcher")
+print("optimized Gluon direct apply rejected before launch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "optimized Gluon direct apply rejected before launch"
+
+
+@pytest.mark.parametrize(
+    (
+        "dtype",
+        "qkv_format",
+        "causal",
+        "seqlen_q",
+        "seqlen_kv",
+        "num_heads_q",
+        "num_heads_kv",
+        "head_dim",
+        "softmax_scale",
+    ),
+    _GLUON_CORRECTNESS_CASES,
+)
+def test_gluon_correctness_gfx950(
+    dtype,
+    qkv_format,
+    causal,
+    seqlen_q,
+    seqlen_kv,
+    num_heads_q,
+    num_heads_kv,
+    head_dim,
+    softmax_scale,
+):
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads_q=num_heads_q,
+        num_heads_kv=num_heads_kv,
+        head_dim=head_dim,
+        qkv_format=qkv_format,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad():
+        output_ref, lse_ref = _gluon_attention_fp32_reference(
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal,
+        )
+        with _pinned_gluon_backend():
+            output, lse = flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                return_lse=True,
+            )
+    torch.cuda.synchronize(device)
+
+    assert output.device == q.device
+    assert output.dtype == dtype
+    assert output.shape == q.shape
+    assert lse.device == q.device
+    assert lse.dtype == torch.float32
+    assert lse.shape == (1, num_heads_q, seqlen_q)
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(lse).all()
+    output_snr = compute_snr(output_ref, output)
+    assert output_snr > 40.0, f"Gluon output SNR {output_snr:.2f} dB is not above 40 dB"
+    torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "qkv_format", "seqlen"),
+    [
+        pytest.param(torch.float16, "bshd", 384, id="fp16-bshd-s384"),
+        pytest.param(torch.bfloat16, "bhsd", 512, id="bf16-bhsd-s512"),
+    ],
+)
+def test_gluon_short_causal_compile_boundaries_gfx950(dtype, qkv_format, seqlen):
+    """The aligned D128 causal specialization compiles at S384/S512."""
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=seqlen,
+        seqlen_kv=seqlen,
+        num_heads_q=64,
+        num_heads_kv=64,
+        head_dim=128,
+        qkv_format=qkv_format,
+        dtype=dtype,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad():
+        output_ref, lse_ref = _gluon_attention_fp32_reference(q, k, v, None, True)
+        with _pinned_gluon_backend():
+            output, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+    torch.cuda.synchronize(device)
+
+    assert output.shape == q.shape
+    assert lse.shape == (1, 64, seqlen)
+    assert compute_snr(output_ref, output) > 40.0
+    torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("qkv_format", "expected_output_stride"),
+    [
+        pytest.param("bshd", (18944, 512, 64, 1), id="bshd"),
+        pytest.param("bhsd", (18944, 64, 2368, 1), id="bhsd"),
+    ],
+)
+@pytest.mark.filterwarnings("error:Dynamo detected a call to a .*lru_cache.*attention_impl\\.py")
+def test_gluon_compile_fullgraph_values_and_exact_strides_gfx950(
+    qkv_format,
+    expected_output_stride,
+):
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=2,
+        seqlen_q=37,
+        seqlen_kv=53,
+        num_heads_q=8,
+        num_heads_kv=2,
+        head_dim=64,
+        qkv_format=qkv_format,
+        dtype=torch.float16,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    def forward(query, key, value):
+        return flash_attn_func(
+            query,
+            key,
+            value,
+            softmax_scale=0.19,
+            causal=False,
+            return_lse=True,
+        )
+
+    previous_backend = GlobalBackendManager._attn_backend
+    GlobalBackendManager._attn_backend = None if previous_backend is None else dict(previous_backend)
+    GlobalBackendManager.set_attn_backend(
+        BackendType.GLUON,
+        PrecisionType.BF16_FP16_FP32,
+    )
+    torch._dynamo.reset()
+    try:
+        with torch.no_grad():
+            eager_output, eager_lse = forward(q, k, v)
+            attention_impl._GFX950_DEVICE_CACHE.clear()
+            compiled_forward = torch.compile(forward, fullgraph=True)
+            compiled_output, compiled_lse = compiled_forward(q, k, v)
+        torch.cuda.synchronize(device)
+    finally:
+        GlobalBackendManager._attn_backend = previous_backend
+        torch._dynamo.reset()
+
+    assert q.stride() == expected_output_stride
+    assert eager_output.stride() == expected_output_stride
+    assert compiled_output.stride() == expected_output_stride
+    assert eager_lse.stride() == (296, 37, 1)
+    assert compiled_lse.stride() == (296, 37, 1)
+    assert torch.isfinite(eager_output).all()
+    assert torch.isfinite(eager_lse).all()
+    torch.testing.assert_close(compiled_output, eager_output, rtol=0, atol=0)
+    torch.testing.assert_close(compiled_lse, eager_lse, rtol=0, atol=0)
+
+
+def test_gluon_non_default_stream_uses_q_device_gfx950():
+    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    target_device = _gfx950_device_for_test(prefer_nonzero=device_count >= 2)
+    original_device_index = torch.cuda.current_device()
+    original_target_stream = torch.cuda.current_stream(target_device)
+    launch_stream = torch.cuda.Stream(device=target_device)
+    other_device_index = next(
+        (index for index in range(device_count) if index != target_device.index),
+        target_device.index,
+    )
+
+    try:
+        torch.cuda.set_device(target_device)
+        torch.cuda.set_stream(launch_stream)
+        assert torch.cuda.current_stream(target_device) == launch_stream
+        assert launch_stream != original_target_stream
+
+        generator = torch.Generator(device=target_device).manual_seed(20260818)
+        q, k, v = _make_gluon_runtime_inputs(
+            batch=1,
+            seqlen_q=37,
+            seqlen_kv=53,
+            num_heads_q=16,
+            num_heads_kv=4,
+            head_dim=64,
+            qkv_format="bshd",
+            dtype=torch.float16,
+            device=target_device,
+            generator=generator,
+        )
+        _require_exact_gfx950(q)
+        with torch.no_grad():
+            output_ref, lse_ref = _gluon_attention_fp32_reference(q, k, v, 0.2, True)
+
+        if device_count >= 2:
+            torch.cuda.set_device(other_device_index)
+            assert torch.cuda.current_device() != q.device.index
+
+        with torch.no_grad(), _pinned_gluon_backend():
+            output, lse = flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=0.2,
+                causal=True,
+                return_lse=True,
+            )
+
+        expected_current_device = other_device_index if device_count >= 2 else target_device.index
+        assert torch.cuda.current_device() == expected_current_device
+        launch_stream.synchronize()
+
+        assert {q.device, k.device, v.device, output.device, lse.device} == {target_device}
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(lse).all()
+        assert compute_snr(output_ref, output) > 40.0
+        torch.testing.assert_close(output.float(), output_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+    finally:
+        torch.cuda.set_device(target_device)
+        torch.cuda.set_stream(original_target_stream)
+        torch.cuda.set_device(original_device_index)
+
+
+@pytest.mark.deterministic
+def test_gluon_repeatability_is_bitwise_after_warmup_gfx950():
+    device = _gfx950_device_for_test()
+    generator = torch.Generator(device=device).manual_seed(20260818)
+    q, k, v = _make_gluon_runtime_inputs(
+        batch=1,
+        seqlen_q=128,
+        seqlen_kv=257,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+        qkv_format="bhsd",
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    _require_exact_gfx950(q)
+
+    with torch.no_grad(), _pinned_gluon_backend():
+        flash_attn_func(q, k, v, causal=False, return_lse=True)
+        torch.cuda.synchronize(device)
+        repeated = [flash_attn_func(q, k, v, causal=False, return_lse=True) for _ in range(3)]
+        torch.cuda.synchronize(device)
+
+    first_output, first_lse = repeated[0]
+    assert torch.isfinite(first_output).all()
+    assert torch.isfinite(first_lse).all()
+    for output, lse in repeated[1:]:
+        assert torch.equal(output, first_output), "Gluon output changed bitwise after warmup"
+        assert torch.equal(lse, first_lse), "Gluon LSE changed bitwise after warmup"
+
+
+@pytest.mark.skipif(
+    not _has_gfx950(),
+    reason="Gluon FA forward runtime coverage requires an exact gfx950 device",
+)
+@pytest.mark.parametrize("case", WORKERS)
+def test_gluon_causal_regression_in_isolated_process(case: str) -> None:
+    result = _run_worker(case)
+    assert result.returncode == 0, result.stdout
+    assert "PASS" in result.stdout, result.stdout
+
 
 test_cases = [
     AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=32, num_head_kv=32, head_dim_qk=128, head_dim_v=128),
@@ -40,6 +779,11 @@ test_cases = [
     AttnConfig(seqlen_q=2048, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
     # end regression tests for https://ontrack-internal.amd.com/browse/SWDEV-548136
     AttnConfig(seqlen_q=512, seqlen_kv=512, num_head_q=40, num_head_kv=40, head_dim_qk=192, head_dim_v=128),
+    # head_dim 64, and a query chunk against a longer kv context: the rest of the table is
+    # square at head_dim 128/192, so neither the 64-wide kernels nor the bottom-right causal
+    # offset a rectangular shape carries would be reached otherwise.
+    AttnConfig(seqlen_q=1024, seqlen_kv=1024, num_head_q=64, num_head_kv=8, head_dim_qk=64, head_dim_v=64),
+    AttnConfig(seqlen_q=512, seqlen_kv=2048, num_head_q=64, num_head_kv=8, head_dim_qk=128, head_dim_v=128),
 ]
 
 
@@ -51,8 +795,13 @@ test_cases = [
 @pytest.mark.parametrize("window_size_left", [-1, 32, 64, 128])
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 @pytest.mark.parametrize("is_v3_atomic_fp32", [False, True])
+# None is whatever resolves; the rest pin one backend so its own path stays covered.
+# HIPKITTENS takes a narrow slice of this table -- bf16, causal, sbhd, head dim 64/128, no
+# sink -- and pinned_backend_takes asserts it refuses the rest rather than letting another
+# backend answer for it.
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.HIPKITTENS])
 def test_attention_16bit(
-    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32
+    batch, dtype, config, causal, enable_sink, window_size_left, qkv_format, is_v3_atomic_fp32, backend
 ):
     os.environ["PRIMUS_TURBO_ATTN_V3_ATOMIC_FP32"] = "1" if is_v3_atomic_fp32 else "0"
 
@@ -133,6 +882,26 @@ def test_attention_16bit(
     sink_ref = None
     if enable_sink:
         sink = torch.randn((num_head_q,), device=device, dtype=torch.float32, requires_grad=True)
+
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=query,
+        k=key,
+        v=value,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=window_size,
+        bias=None,
+        alibi_slopes=None,
+        sink=sink,
+        qkv_format=_infer_qkv_format(query, key, value),
+    ):
+        return
+
+    if enable_sink:
         sink_ref = sink.clone().detach().requires_grad_()
         o_ref = attention_with_sink_ref_impl(
             query_ref,
@@ -150,21 +919,25 @@ def test_attention_16bit(
         )
 
     o_ref.backward(grad_out_ref)
-    o = flash_attn_func(
-        query,
-        key,
-        value,
-        dropout_p=0.0,
-        softmax_scale=sm_scale,
-        causal=causal,
-        window_size=window_size,
-        bias=None,
-        alibi_slopes=None,
-        deterministic=False,
-        return_lse=False,
-        return_attn_probs=False,
-        sink=sink,
-    )
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        o = flash_attn_func(
+            query,
+            key,
+            value,
+            dropout_p=0.0,
+            softmax_scale=sm_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=None,
+            alibi_slopes=None,
+            deterministic=False,
+            return_lse=False,
+            return_attn_probs=False,
+            sink=sink,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
     o.backward(grad_out)
 
     torch.cuda.synchronize()
@@ -204,9 +977,10 @@ def test_attention_16bit(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.HIPKITTENS])
 @pytest.mark.skip(reason="Temporarily disabled due to external dependency issues.")
 @pytest.mark.deterministic
-def test_attention_16bit_deterministic(batch, dtype, config, causal):
+def test_attention_16bit_deterministic(batch, dtype, config, causal, backend):
     device = "cuda"
     seqlen_q, seqlen_kv, num_head_q, num_head_kv, head_dim_qk, head_dim_v = (
         config.seqlen_q,
@@ -241,6 +1015,24 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     grad_out = torch.randn(o_layout, device=device, dtype=dtype)
 
     sm_scale = head_dim_qk ** (-0.5)
+
+    # Ahead of the reference, which is the expensive part and pointless for a combo the
+    # pinned backend does not implement (that case is covered by the refusal assert inside).
+    if not pinned_backend_takes(
+        backend,
+        q=q0,
+        k=k0,
+        v=v0,
+        dropout_p=0.0,
+        softmax_scale=sm_scale,
+        causal=causal,
+        window_size=(-1, -1),
+        bias=None,
+        alibi_slopes=None,
+        sink=None,
+        qkv_format="bshd",
+    ):
+        return
 
     # Correctness check against reference implementation
     q_ref = q0.clone().detach().requires_grad_()
@@ -280,9 +1072,13 @@ def test_attention_16bit_deterministic(batch, dtype, config, causal):
     # Determinism check (bitwise identical across multiple runs).
     repeats = 10
     outs = []
-    for _ in range(repeats):
-        outs.append(_run_once())
-        torch.cuda.synchronize()
+    GlobalBackendManager.set_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    try:
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
 
     o1, dq1, dk1, dv1 = outs[0]
     for i in range(1, repeats):
@@ -526,3 +1322,430 @@ def test_attention_fake_kernel_strides(qkv_format):
         f"compiled={out_compiled.stride()}, eager={eager_strides}"
     )
     assert out_compiled.shape == out_eager.shape
+
+
+# ============================================================================
+# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X).
+# ============================================================================
+
+# Fixed dims: kv_lora_rank (single latent, K == V) + rope pad; SWA local window.
+SPARSE_MLA_ROPE_DIM = 64
+SPARSE_MLA_HEAD_DIM = 512
+SPARSE_MLA_SWA_WINDOW = 128
+# (variant -> num_heads, index-topk cap). cr spans pure-SWA / random-pool / deterministic-pool (HCA).
+SPARSE_MLA_VARIANTS = {"flash": (64, 512), "pro": (128, 1024)}
+
+
+def _sparse_mla_topk(variant, cr, seqlen):
+    if cr == 0:
+        return 0, 0, SPARSE_MLA_SWA_WINDOW
+    if cr == 4:
+        pool = max(seqlen // 4, 1)
+        topk_pool = min(SPARSE_MLA_VARIANTS[variant][1], pool)
+        return pool, topk_pool, SPARSE_MLA_SWA_WINDOW + topk_pool
+    pool = max(seqlen // cr, 1)
+    return pool, 0, SPARSE_MLA_SWA_WINDOW + pool
+
+
+def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
+    """DSV4 sparse-MLA inputs: single-latent kv, per-token top-k (SWA band + optional pool),
+    zero-padded rope cols, random sink / grad_out."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    dev, dt, d, w = "cuda", torch.bfloat16, SPARSE_MLA_HEAD_DIM, SPARSE_MLA_SWA_WINDOW
+    latent = torch.randn(seqlen, d, generator=gen, device=dev, dtype=dt)
+    q = torch.randn(seqlen, num_heads, d, generator=gen, device=dev, dtype=dt)
+    q = torch.cat([q, torch.zeros(seqlen, num_heads, SPARSE_MLA_ROPE_DIM, device=dev, dtype=dt)], -1)
+    sink = torch.randn(num_heads, generator=gen, device=dev, dtype=torch.float32) * 0.1
+    grad_out = torch.randn(seqlen, num_heads, d, generator=gen, device=dev, dtype=dt)
+
+    tok = torch.arange(seqlen, device=dev).view(seqlen, 1)
+    win = tok - w + 1 + torch.arange(w, device=dev).view(1, w)
+    win = torch.where(win >= 0, win, torch.full_like(win, -1))
+    if cr == 0:
+        kv = latent.unsqueeze(1)
+        topk = win
+    else:
+        p = torch.randn(pool, d, generator=gen, device=dev, dtype=dt)
+        kv = torch.cat([latent, p], 0).unsqueeze(1)
+        if cr == 4:
+            pool_topk = seqlen + torch.randint(0, pool, (seqlen, topk_pool), generator=gen, device=dev)
+        else:
+            ps = torch.arange(pool, device=dev).view(1, pool)
+            pool_topk = torch.where(
+                ((ps + 1) * cr - 1) <= tok, seqlen + ps, torch.full_like(ps.expand(seqlen, pool), -1)
+            )
+        topk = torch.cat([win, pool_topk], 1)
+    pad = ((topk.shape[1] + 63) // 64) * 64 - topk.shape[1]
+    if pad > 0:
+        topk = torch.cat([topk, torch.full((seqlen, pad), -1, device=dev, dtype=topk.dtype)], 1)
+    kv = torch.cat([kv, torch.zeros(kv.shape[0], 1, SPARSE_MLA_ROPE_DIM, device=dev, dtype=dt)], -1)
+    return q.contiguous(), kv.contiguous(), topk.to(torch.int32).contiguous(), sink, grad_out
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+)
+@pytest.mark.parametrize("seqlen", [512, 1024, 2048])
+@pytest.mark.parametrize("variant", ["flash", "pro"])
+@pytest.mark.parametrize("cr", [0, 4, 128])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL, BackendType.TRITON])
+@pytest.mark.parametrize("auto_tune", [False, True])
+def test_sparse_mla_op(variant, cr, seqlen, backend, auto_tune):
+    """Public multi-backend training op ``sparse_mla_func``, against the triton kernels called
+    directly as oracle. Covers the pure-SWA (cr=0), random-pool (cr=4) and
+    deterministic-pool/HCA (cr=128) paths; seqlen=512 also exercises the cr=4 small-seq
+    dkv-dispatch guard."""
+    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
+    if backend is not None and auto_tune:
+        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+
+    d = SPARSE_MLA_HEAD_DIM
+    num_heads = SPARSE_MLA_VARIANTS[variant][0]
+    pool, topk_pool, _ = _sparse_mla_topk(variant, cr, seqlen)
+    scale = 1.0 / math.sqrt(d)
+    q, kv, topk_idx, sink, grad_out = _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool)
+
+    # Oracle: the triton kernels called directly, outside the op.
+    out_ref, lse_ref = sparse_mla_fwd_triton(q, kv, topk_idx, attn_sink=sink, kv_lora_rank=d, scale=scale)
+    dq_ref, dkv_ref, dsink_ref = sparse_mla_bwd_triton(
+        q, kv, out_ref, grad_out, topk_idx, lse_ref, attn_sink=sink, kv_lora_rank=d, scale=scale
+    )
+    # Pinned TRITON is the oracle's own kernels; FLYDSL is a separate bf16 implementation.
+    snr_floor = 60.0 if backend == BackendType.TRITON else 40.0
+
+    GlobalBackendManager.set_sparse_attn_backend(backend, PrecisionType.BF16_FP16_FP32)
+    GlobalBackendManager.set_auto_tune(auto_tune)
+
+    def _run_op():
+        qg = q.clone().requires_grad_(True)
+        kvg = kv.clone().requires_grad_(True)
+        sg = sink.clone().requires_grad_(True)
+        o = sparse_mla_func(qg, kvg, topk_idx, attn_sink=sg, kv_lora_rank=d, scale=scale)
+        o.backward(grad_out)
+        return o, qg.grad, kvg.grad, sg.grad
+
+    try:
+        out, dq, dkv, dsink = _run_op()
+        assert torch.isfinite(out).all(), "op forward produced non-finite values"
+        assert compute_snr(out_ref, out) > snr_floor, f"op fwd SNR <= {snr_floor}"
+        assert compute_snr(dq_ref, dq) > snr_floor, f"op dq SNR <= {snr_floor}"
+        assert compute_snr(dkv_ref, dkv) > snr_floor, f"op dkv SNR <= {snr_floor}"
+        assert compute_snr(dsink_ref, dsink) > snr_floor, f"op dsink SNR <= {snr_floor}"
+
+        # Determinism: one WG owns each output tile (no float atomics), so a re-run is bit-exact.
+        out2, dq2, dkv2, dsink2 = _run_op()
+        assert torch.equal(out, out2), "op forward is not deterministic"
+        assert torch.equal(dq, dq2), "op dq is not deterministic"
+        assert torch.equal(dkv, dkv2), "op dkv is not deterministic"
+        assert torch.equal(dsink, dsink2), "op dsink is not deterministic"
+
+        # Each pass owns a dispatcher, so auto-tune has to leave a winner in both tune caches.
+        if auto_tune:
+            assert len(SparseMlaFwdDispatcher._cache) == 1, "forward was not auto-tuned"
+            assert len(SparseMlaBwdDispatcher._cache) == 1, "backward was not auto-tuned"
+    finally:
+        GlobalBackendManager.reset()
+
+
+# =============================================================================
+# HipKittens attention (gfx950). The shape families the kernels were tuned against.
+#
+# The backend axis above already crosses HipKittens with the shared table, which is what
+# covers its eligibility and its refusals. What that table does not have is the two shape
+# families these kernels were measured on, so they live here: the rectangular/windowed meta
+# configs, and the head structures real pretrains run at.
+# =============================================================================
+
+hipkittens_only = pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx950()),
+    reason="HipKittens attention is gfx950-only",
+)
+
+# (Hq, Hkv, Sq, Skv, window_left), each run full-causal and windowed. Run at 1/8 the measured
+# sequence lengths: the fp32 reference materialises a whole [B, Hq, Sq, Skv] score matrix,
+# which at the real lengths cannot share a device with anything else. The head structure, the
+# rectangular ratios and the window are what this set covers, and all three survive the
+# scale-down.
+_HK_META = [
+    (128, 16, 2048, 16384, 2048),
+    (128, 16, 4096, 16384, 2048),
+    (128, 16, 8192, 16384, 2048),
+    (128, 16, 16384, 16384, 2048),
+    (48, 6, 4096, 4096, 2047),
+    (48, 6, 4096, 8192, 2047),
+    (48, 6, 4096, 12288, 2047),
+    (48, 6, 4096, 16384, 2047),
+    (64, 8, 1024, 1024, 2047),
+    (64, 8, 1024, 16384, 2047),
+]
+_HK_META_SCALE = 8
+
+_HK_META_CASES = []
+for _hq, _hkv, _sq, _skv, _w in _HK_META:
+    _sq_s, _skv_s = _sq // _HK_META_SCALE, _skv // _HK_META_SCALE
+    _HK_META_CASES.append((_hq, _hkv, _sq_s, _skv_s, -1))
+    _HK_META_CASES.append((_hq, _hkv, _sq_s, _skv_s, max(1, _w // _HK_META_SCALE)))
+
+# (Hq, Hkv) of eleven real pretrain configs, deduplicated to eight -- an average over this set
+# is meant to become an accept metric, and a set that measures one shape twice silently gives
+# it double weight. All head dim 128; gpt-oss is excluded as head dim 64, which the meta set
+# above already covers.
+_HK_MODEL_HEADS = [
+    (40, 8),  # llama4_17B128E, llama4_17B16E
+    (48, 8),  # minimax_m2.5
+    (64, 4),  # qwen3_235B_A22B
+    (32, 4),  # qwen3_30B_A3B
+    (32, 8),  # lfm2_8B_A1B, mixtral_8x7B_v0.1
+    (16, 16),  # deepseek_v2_lite (MHA)
+    (64, 8),  # grok2
+    (48, 8),  # grok1, mixtral_8x22B_v0.1
+]
+_HK_MODEL_SEQLEN = 1024
+
+
+def _hk_ref(q, k, v, window_left, scale):
+    """fp32 reference over SBHD tensors, bottom-right aligned.
+
+    Not attention_vanilla_forward_pytorch_ref_impl: that takes the op's [b, s, h, d] view,
+    and these kernels are driven directly here in their own layout.
+    """
+    Sq, _, Hq, _ = q.shape
+    Skv, _, Hkv, _ = k.shape
+    g = Hq // Hkv
+    qf = q.float().permute(1, 2, 0, 3)
+    kf = k.float().permute(1, 2, 0, 3).repeat_interleave(g, 1)
+    vf = v.float().permute(1, 2, 0, 3).repeat_interleave(g, 1)
+    s = (qf @ kf.transpose(-1, -2)) * scale
+    off = Skv - Sq
+    qi = torch.arange(Sq, device=q.device)[:, None]
+    ki = torch.arange(Skv, device=q.device)[None, :]
+    keep = ki <= qi + off
+    if window_left >= 0:
+        keep &= ki >= qi + off - window_left
+    p = torch.softmax(s.masked_fill(~keep, float("-inf")), dim=-1)
+    return (p @ vf).permute(2, 0, 1, 3)
+
+
+def _run_hk_case(Sq, Skv, B, Hq, Hkv, D, window_left, bar=40.0):
+    from primus_turbo.hipkittens.attention import (
+        hipkittens_attn_backward,
+        hipkittens_attn_forward,
+    )
+
+    torch.manual_seed(0)
+    scale = D**-0.5
+
+    def mk(s, h):
+        return torch.randn(s, B, h, D, device="cuda", dtype=torch.bfloat16) * 0.5
+
+    q, k, v = mk(Sq, Hq), mk(Skv, Hkv), mk(Skv, Hkv)
+    out, lse = hipkittens_attn_forward(q, k, v, scale, True, (window_left, 0))
+    assert out.shape == q.shape
+    assert lse.shape == (B, Hq, 1, Sq)
+    assert compute_snr(_hk_ref(q, k, v, window_left, scale), out) > bar, "forward SNR too low"
+
+    dout = torch.randn_like(out)
+    dq, dk, dv = hipkittens_attn_backward(dout, q, k, v, out, lse, scale, True, (window_left, 0))
+    assert (dq.shape, dk.shape, dv.shape) == (q.shape, k.shape, v.shape)
+
+    qd, kd, vd = (t.detach().clone().float().requires_grad_(True) for t in (q, k, v))
+    _hk_ref(qd, kd, vd, window_left, scale).backward(dout.float())
+    for name, ref_g, got in (("dq", qd.grad, dq), ("dk", kd.grad, dk), ("dv", vd.grad, dv)):
+        assert compute_snr(ref_g, got) > bar, f"{name} SNR too low"
+
+
+@hipkittens_only
+@pytest.mark.parametrize("Hq, Hkv, Sq, Skv, window_left", _HK_META_CASES, ids=str)
+def test_attention_hipkittens_meta_shapes(Hq, Hkv, Sq, Skv, window_left):
+    """Rectangular Sq < Skv, GQA, full-causal and sliding-window, head dim 64."""
+    _run_hk_case(Sq, Skv, 1, Hq, Hkv, 64, window_left)
+
+
+@hipkittens_only
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("heads", _HK_MODEL_HEADS, ids=lambda h: f"H{h[0]}x{h[1]}")
+def test_attention_hipkittens_model_shapes(heads, batch):
+    """Head dim 128, square, full causal -- the head structures real pretrains run at, over
+    the batches the benchmark sweeps. Small batches change the grid and hence which CTAs are
+    masked at the causal boundary, so this is not redundant with the head sweep."""
+    Hq, Hkv = heads
+    _run_hk_case(_HK_MODEL_SEQLEN, _HK_MODEL_SEQLEN, batch, Hq, Hkv, 128, -1)
+
+
+@hipkittens_only
+def test_attention_hipkittens_deterministic():
+    """Same inputs must give bit-identical results across launches, forward and backward.
+
+    Constructive rather than hopeful: one workgroup owns each output tile, there are no float
+    atomics, and the split-K partials are folded in a fixed band order.
+    """
+    from primus_turbo.hipkittens.attention import (
+        hipkittens_attn_backward,
+        hipkittens_attn_forward,
+    )
+
+    D, S, B, Hq, Hkv = 128, 1024, 2, 32, 4
+    torch.manual_seed(0)
+    scale = D**-0.5
+    q = torch.randn(S, B, Hq, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(S, B, Hkv, D, device="cuda", dtype=torch.bfloat16)
+
+    o1, l1 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
+    o2, l2 = hipkittens_attn_forward(q, k, v, scale, True, (-1, 0))
+    assert torch.equal(o1, o2) and torch.equal(l1, l2), "forward is not run-to-run deterministic"
+
+    do = torch.randn_like(o1)
+    g1 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    g2 = hipkittens_attn_backward(do, q, k, v, o1, l1, scale, True, (-1, 0))
+    for name, a, b in zip(("dq", "dk", "dv"), g1, g2):
+        assert torch.equal(a, b), f"{name} is not run-to-run deterministic"
+
+
+@hipkittens_only
+@pytest.mark.parametrize(
+    "case, needle",
+    [
+        ("fp16", "bf16"),
+        ("non_causal", "causal"),
+        ("sink", "sink"),
+        ("right_window", "left window"),
+        ("head_dim", "head dim"),
+        ("sq_gt_skv", "Sq > Skv"),
+        ("varlen", "varlen"),
+        ("non_contiguous", "contiguous"),
+    ],
+)
+def test_attention_hipkittens_envelope(case, needle):
+    """Everything outside the envelope must be refused with a reason, not computed wrongly.
+
+    These kernels read out of bounds or leave output unwritten rather than failing, so the
+    checks are load-bearing. Two are worth naming: fp16 would be reinterpreted bit-for-bit
+    because the kernels declare gl<bf16, ...>, and Sq > Skv leaves the leading Sq - Skv query
+    rows -- which attend to no key at all -- unwritten by the forward.
+    """
+    from primus_turbo.hipkittens.attention import hipkittens_attn_supported
+
+    dtype = torch.float16 if case == "fp16" else torch.bfloat16
+    D = 32 if case == "head_dim" else 64
+    Sq, Skv = (256, 128) if case == "sq_gt_skv" else (128, 128)
+    kw = dict(causal=True, window_size=(-1, -1))
+
+    if case == "varlen":
+        t = torch.randn(1024, 8, D, device="cuda", dtype=dtype)  # THD packing is 3-D
+        q = k = v = t
+    else:
+        q = torch.randn(Sq, 1, 8, D, device="cuda", dtype=dtype)
+        k = v = torch.randn(Skv, 1, 8, D, device="cuda", dtype=dtype)
+
+    if case == "non_causal":
+        kw["causal"] = False
+    elif case == "sink":
+        kw["sink"] = torch.zeros(8, device="cuda", dtype=torch.float32)
+    elif case == "right_window":
+        kw["window_size"] = (64, 64)
+    elif case == "non_contiguous":
+        q = torch.randn(Sq, 2, 8, D, device="cuda", dtype=dtype).transpose(0, 1)
+        k = v = torch.randn(Skv, 2, 8, D, device="cuda", dtype=dtype)
+
+    ok, why = hipkittens_attn_supported(q, k, v, **kw)
+    assert not ok and needle in why, f"expected a refusal mentioning {needle!r}, got {ok} / {why!r}"
+
+
+# ---------------------------------------------------------------------------
+# Dense Triton backend (gfx1250)
+# ---------------------------------------------------------------------------
+
+
+def _triton_gate(monkeypatch, **kwargs):
+    """Run DenseAttnFwdTritonBackend.can_handle as if we were on gfx1250.
+
+    The gating rules are arch-independent, but can_handle short-circuits on is_gfx1250()
+    first, so on any other card every case below would pass for the wrong reason.
+    """
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: True)
+    q = kwargs.pop("q", None)
+    if q is None:
+        q = torch.empty(1, 8, 4, 64, dtype=torch.bfloat16)
+    args = dict(k=torch.empty_like(q), v=torch.empty_like(q), qkv_format="bshd")
+    args.update(kwargs)
+    return attention_impl.DenseAttnFwdTritonBackend.can_handle(q, **args)
+
+
+def test_triton_dense_gate_accepts_a_plain_causal_call(monkeypatch):
+    assert _triton_gate(monkeypatch) is True
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"dropout_p": 0.1},
+        {"bias": torch.empty(1)},
+        {"alibi_slopes": torch.empty(4)},
+        {"return_softmax": True},
+        {"k": None},
+        {"v": None},
+    ],
+    ids=["dropout", "bias", "alibi", "return_softmax", "no_k", "no_v"],
+)
+def test_triton_dense_gate_refuses_what_the_kernel_lacks(monkeypatch, unsupported):
+    # Each of these would otherwise be ignored and quietly answer a different problem.
+    assert _triton_gate(monkeypatch, **unsupported) is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int8], ids=["fp32", "int8"])
+def test_triton_dense_gate_refuses_unsupported_dtypes(monkeypatch, dtype):
+    assert _triton_gate(monkeypatch, q=torch.empty(1, 8, 4, 64, dtype=dtype)) is False
+
+
+@pytest.mark.parametrize("sink_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_triton_dense_gate_takes_a_sink_of_any_float_dtype(monkeypatch, sink_dtype):
+    # The adapter casts the sink to fp32 itself. Requiring fp32 here would push a bf16 sink
+    # -- gpt-oss trains with one -- back to aiter, i.e. to CK on gfx1250.
+    assert _triton_gate(monkeypatch, sink=torch.empty(4, dtype=sink_dtype)) is True
+
+
+@pytest.mark.parametrize("numel", [3, 5], ids=["too_few", "too_many"])
+def test_triton_dense_gate_refuses_a_sink_that_is_not_per_head(monkeypatch, numel):
+    assert _triton_gate(monkeypatch, sink=torch.empty(numel, dtype=torch.float32)) is False
+
+
+def test_triton_dense_gate_is_off_outside_gfx1250(monkeypatch):
+    monkeypatch.setattr(attention_impl, "is_gfx1250", lambda: False)
+    q = torch.empty(1, 8, 4, 64, dtype=torch.bfloat16)
+    assert (
+        attention_impl.DenseAttnFwdTritonBackend.can_handle(
+            q, k=torch.empty_like(q), v=torch.empty_like(q), qkv_format="bshd"
+        )
+        is False
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_gfx1250()),
+    reason="the dense Triton backend is validated on gfx1250 only",
+)
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_dense_backend_matches_the_reference(causal, dtype):
+    """Pinned TRITON, forward and backward, against the fp32 reference."""
+    b, s, hq, hkv, d = 2, 256, 8, 2, 64
+    dev = "cuda"
+    q, k, v = (torch.randn(b, s, h, d, device=dev, dtype=dtype, requires_grad=True) for h in (hq, hkv, hkv))
+    grad_out = torch.randn(b, s, hq, d, device=dev, dtype=dtype)
+
+    GlobalBackendManager.set_attn_backend(BackendType.TRITON, PrecisionType.BF16_FP16_FP32)
+    try:
+        out = flash_attn_func(q, k, v, causal=causal)
+        out.backward(grad_out)
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+
+    qr, kr, vr = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    out_ref = attention_vanilla_forward_pytorch_ref_impl(qr, kr, vr, d**-0.5, causal, qkv_format="bshd")
+    out_ref.backward(grad_out.float())
+
+    assert compute_snr(out_ref, out.float()) > 40.0
+    assert compute_snr(qr.grad, q.grad.float()) > 40.0
+    assert compute_snr(kr.grad, k.grad.float()) > 40.0
+    assert compute_snr(vr.grad, v.grad.float()) > 40.0

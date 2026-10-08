@@ -206,6 +206,21 @@ MoEModelConfigs = {
         "seqlen": 4096,
         "num_topk": 6,
     },
+    # https://huggingface.co/MiniMaxAI/MiniMax-M3
+    #
+    # Its experts use `hidden_act: swigluoai` (GLUActivation.swigluoai() in MegaMoE), not SiLU.
+    # seqlen is the training sequence length, not max_position_embeddings (1M).
+    "MiniMax-M3": {
+        "n_routed_experts": 128,
+        "moe_intermediate_size": 3072,
+        "hidden_size": 6144,
+        # GQA attention config (MiniMax Sparse Attention is layered on top of it)
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "seqlen": 4096,
+        "num_topk": 4,
+    },
     # https://modelscope.cn/models/deepseek-ai/DeepSeek-V2/file/view/master/config.json
     "DeepSeek-V2": {
         "n_routed_experts": 160,
@@ -243,6 +258,27 @@ MoEModelConfigs = {
         "head_dim": 128,
         "seqlen": 8192,
         "num_topk": 2,
+    },
+    # https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json
+    #
+    # seqlen is initial_context_length (4096), not max_position_embeddings (131072): the
+    # latter is what YaRN scaling reaches at inference, and this table is what training runs
+    # attention at.
+    #
+    # Note the attention table below only emits full-causal shapes, while gpt-oss alternates
+    # sliding_attention and full_attention layer by layer -- 12 of its 24 layers run a
+    # 128-wide left window. So the row this contributes is the full-causal half; the windowed
+    # half is not covered here.
+    "GPT-OSS-20B": {
+        "n_routed_experts": 32,
+        "moe_intermediate_size": 2880,
+        "hidden_size": 2880,
+        # GQA attention config
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "seqlen": 4096,
+        "num_topk": 4,
     },
     # https://modelscope.cn/models/Qwen/Qwen3-30B-A3B-Instruct-2507/file/view/master/config.json
     "Qwen3-30B-A3B": {
@@ -508,6 +544,41 @@ def gen_grouped_gemm_test_cases():
         )
         all_test_cases.extend(test_cases)
     return all_test_cases
+
+
+# THD document packing: uniform is the zero-waste baseline, the rest are ragged with
+# increasing segment-length skew, which is what a max_seqlen-tiled kernel pays for.
+# (name, segment lengths, window_left)
+ATTENTION_VARLEN_CONFIGS = [
+    (name, segments, window)
+    for name, segments in (
+        ("uniform", [2048, 2048, 2048, 2048]),
+        ("mild", [1024, 2048, 4096, 1024]),
+        ("skew", [512, 2048, 1024, 4096]),
+        ("longtail", [4096, 512, 256, 128]),
+    )
+    for window in (-1, 2048)
+]
+
+# Head dims the attention kernels are built for. The table above is head-dim agnostic --
+# the same packing is the same work at either -- so it sweeps both rather than taking a flag.
+ATTENTION_HEAD_DIMS = (64, 128)
+
+
+def gen_attention_varlen_test_cases():
+    """THD document-packing cases: every segment layout at both head dims."""
+    return [
+        {
+            "name": name,
+            "segments": segments,
+            "window_left": window,
+            "num_head_q": 64,
+            "num_head_kv": 8,  # GQA group 8: the smallest the deterministic backward takes
+            "head_dim": head_dim,
+        }
+        for head_dim in ATTENTION_HEAD_DIMS
+        for name, segments, window in ATTENTION_VARLEN_CONFIGS
+    ]
 
 
 def gen_attention_test_cases():

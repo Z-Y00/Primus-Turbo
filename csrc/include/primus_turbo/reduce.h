@@ -1,6 +1,9 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
+
 #pragma once
 
 #include "primus_turbo/common.h"
@@ -26,7 +29,7 @@ int64_t get_reduce_row_workspace_sizes(const int64_t &outer_len, const int64_t &
 template <typename ComputeType>
 int64_t get_reduce_col_workspace_sizes(const int64_t batch, const int64_t m, const int64_t n) {
     const int BLOCK    = 256;
-    const int NUM_WARP = BLOCK / THREADS_PER_WARP;
+    const int NUM_WARP = BLOCK / warp_size();
     const int UNROLL_M = 8;
 
     const int64_t cnt =

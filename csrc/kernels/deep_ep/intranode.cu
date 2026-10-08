@@ -1,10 +1,11 @@
-/*
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2025 DeepSeek. All rights reserved.
  *
  * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE for license information.
- */
+ **************************************************************************************************/
 
 #include "buffer.cuh"
 #include "hip/hip_runtime.h"
@@ -175,7 +176,8 @@ void cached_notify_dispatch(const int *rank_prefix_matrix, int num_memset_int, v
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
-template <int kNumRanks, int kNumThreads, bool kUseCheapFence, typename topk_idx_t>
+template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp, bool kUseCheapFence,
+          typename topk_idx_t>
 __global__ void __launch_bounds__(kNumThreads, 1)
     dispatch(int4 *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t *recv_topk_idx,
              float *recv_topk_weights, int *recv_channel_offset, int *send_head, const int4 *x,
@@ -184,6 +186,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
              int num_worst_tokens, int hidden_int4, int num_topk, int num_experts, int num_scales,
              int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
              int num_max_send_tokens, int num_recv_buffer_tokens) {
+    constexpr bool kCheapFence = kUseCheapFence and kHasCheapFence;
+
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -244,8 +248,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto channel_x_scales_buffers =
         Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_scales,
                       channel_rank_offset * num_recv_buffer_tokens * num_scales);
+    const ChannelPayload<kCheapFence> channel_x_payload(channel_x_buffers.buffer());
 
-    BARRIER_SYNC_INIT();
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -276,11 +281,18 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
+        // The cheap fence's read of the head ahead of each publish (see below); the head only
+        // grows, so an old value can only understate the free slots
+        int prefetched_channel_head_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
             auto start_time = clock64();
-            while (lane_id == 0) {
+            bool has_free_slots =
+                kCheapFence and
+                num_recv_buffer_tokens - (cached_channel_tail_idx - prefetched_channel_head_idx) >=
+                    num_max_send_tokens;
+            while (lane_id == 0 and not has_free_slots) {
                 // NOTES: we only consider the worst case, because counting the real numbers are
                 // time-consuming
                 int num_used_slots =
@@ -360,11 +372,15 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Move tail index
-            // NOTES: here all warps should share the same new tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            // NOTES: here all warps should share the same new tail; the cheap fence reads the head
+            // for the next round here, so the wait in front of the publish covers that read and
+            // this warp's stores at once
+            if (kCheapFence and lane_id == 0)
+                prefetched_channel_head_idx = ld_volatile_global(channel_head_idx.buffer());
+            sync_barrier_before_publish(kCheapFence, responsible_rank, num_threads_per_rank);
             if (send_warp_id_in_rank == 0 and lane_id == 0)
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
-                                                      cached_channel_tail_idx);
+                st_release_sys_global<kCheapFence>(channel_tail_idx.buffer(),
+                                                   cached_channel_tail_idx);
         }
     } else {
         // Workers for receiving and copying into buffer
@@ -411,7 +427,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // different warps are the same
             while (recv_thread_id_in_rank == 0) {
                 cached_channel_tail_idx =
-                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx.buffer());
+                    ld_acquire_sys_global<kCheapFence>(channel_tail_idx.buffer());
 
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
@@ -429,7 +445,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             }
 
             // Synchronize queue tail
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
             // Copy data
@@ -443,7 +459,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 auto shifted_recv_x_int4 =
                     recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
                 UNROLLED_WARP_COPY(2, lane_id, hidden_int4, shifted_recv_x_int4,
-                                   shifted_buffer_x_int4, ld_nc_global, st_na_global);
+                                   shifted_buffer_x_int4, channel_x_payload.ld, st_na_global);
             }
 
 // Copy `src_idx`
@@ -451,8 +467,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             for (int chunk_idx = cached_channel_head_idx + recv_thread_id_in_rank;
                  chunk_idx < cached_channel_tail_idx;
                  chunk_idx += kWarpSize * num_recv_warps_per_rank)
-                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] = ld_nc_global(
-                    channel_src_idx_buffers.buffer() + chunk_idx % num_recv_buffer_tokens);
+                recv_src_idx[total_offset + chunk_idx - cached_channel_head_idx] =
+                    ld_payload<kCheapFence>(channel_src_idx_buffers.buffer() +
+                                            chunk_idx % num_recv_buffer_tokens);
 
 // Copy `topk_idx` and `topk_weights`
 #pragma unroll 2
@@ -465,9 +482,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     static_cast<int64_t>(total_offset + chunk_idx) * num_topk + token_topk_idx;
                 auto buffer_idx = token_idx_in_buffer * num_topk + token_topk_idx;
                 recv_topk_idx[recv_idx] =
-                    ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
+                    ld_payload<kCheapFence>(channel_topk_idx_buffers.buffer() + buffer_idx);
                 recv_topk_weights[recv_idx] =
-                    ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx);
+                    ld_payload<kCheapFence>(channel_topk_weights_buffers.buffer() + buffer_idx);
             }
 
 // Copy `x_scales`
@@ -479,14 +496,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 recv_x_scales[static_cast<int64_t>(total_offset + chunk_idx) * num_scales +
                               scales_idx] =
-                    ld_nc_global(channel_x_scales_buffers.buffer() +
-                                 token_idx_in_buffer * num_scales + scales_idx);
+                    ld_payload<kCheapFence>(channel_x_scales_buffers.buffer() +
+                                            token_idx_in_buffer * num_scales + scales_idx);
             }
 
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
-            BARRIER_SYNC(__threadfence_block(), responsible_rank, num_threads_per_rank);
+            sync_barrier(responsible_rank, num_threads_per_rank);
             if (recv_warp_id_in_rank == num_recv_warps_per_rank - 1 and lane_id == 0)
                 st_relaxed_sys_global(channel_head_idx.buffer(), cached_channel_head_idx);
 
@@ -517,7 +534,8 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
               int scale_token_stride, int scale_hidden_stride, void **buffer_ptrs, int rank,
               int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
               int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 8192;
 
     // Make sure never OOB
     PRIMUS_TURBO_CHECK(static_cast<int64_t>(num_scales) * scale_hidden_stride <
@@ -527,8 +545,11 @@ void dispatch(void *recv_x, float *recv_x_scales, int *recv_src_idx, topk_idx_t 
 
 #define DISPATCH_LAUNCH_CASE(ranks)                                                                \
     {                                                                                              \
-        auto dispatch_func = use_cheap_fence ? dispatch<ranks, kNumThreads, true, topk_idx_t>      \
-                                             : dispatch<ranks, kNumThreads, false, topk_idx_t>;    \
+        auto dispatch_func =                                                                       \
+            use_cheap_fence                                                                        \
+                ? dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, true, topk_idx_t>              \
+                : dispatch<ranks, kNumThreads, kNumTMABytesPerWarp, false, topk_idx_t>;            \
+        SET_SHARED_MEMORY_FOR_TMA(dispatch_func);                                                  \
         LAUNCH_KERNEL_NON_COOPERATIVE(                                                             \
             &cfg, dispatch_func, reinterpret_cast<int4 *>(recv_x), recv_x_scales, recv_src_idx,    \
             recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,                      \
@@ -615,13 +636,16 @@ void cached_notify_combine(void **buffer_ptrs, int *send_head, int num_channels,
 #undef CACHED_NOTIFY_COMBINE
 }
 
-template <typename dtype_t, int kNumRanks, int kNumThreads, bool kUseCheapFence>
+template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp,
+          bool kUseCheapFence>
 __global__ void __launch_bounds__(kNumThreads, 1)
     combine(dtype_t *recv_x, float *recv_topk_weights, const dtype_t *x, const float *topk_weights,
             const dtype_t *bias_0, const dtype_t *bias_1, const int *src_idx,
             const int *rank_prefix_matrix, const int *channel_prefix_matrix, int *send_head,
             int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
             int rank, int num_max_send_tokens, int num_recv_buffer_tokens) {
+    constexpr bool kCheapFence = kUseCheapFence and kHasCheapFence;
+
     const auto num_sms   = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto sm_id = static_cast<int>(blockIdx.x), lane_id = get_lane_id();
@@ -637,7 +661,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     auto          bias_1_int4   = reinterpret_cast<const int4 *>(bias_1);
     auto          recv_int4     = reinterpret_cast<int4 *>(recv_x);
 
-    BARRIER_SYNC_INIT();
+    sync_barrier_init();
 
     if (is_sender) {
         // Workers for sending
@@ -692,12 +716,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
         // Iterate over all tokens and send by chunks
         int current_channel_tail_idx = 0;
+        // The cheap fence's read of the head ahead of each publish (see below); the head only
+        // grows, so an old value can only understate the free slots
+        int prefetched_channel_head_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = wall_clock64();
             int  num_round_tokens =
                 min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
-            while (lane_id == 0) {
+            bool has_free_slots =
+                kCheapFence and
+                num_recv_buffer_tokens - (current_channel_tail_idx - prefetched_channel_head_idx) >=
+                    num_round_tokens;
+            while (lane_id == 0 and not has_free_slots) {
                 // NOTES: we only consider the worst case, because counting the real numbers are
                 // time-consuming
                 int num_used_slots =
@@ -740,10 +771,14 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             current_channel_tail_idx += num_round_tokens;
 
             // Move tail index
-            BARRIER_SYNC(__threadfence_block(), send_rank_id, num_threads_per_rank);
+            // NOTES: the cheap fence reads the head for the next round here, so the wait in front
+            // of the publish covers that read and this warp's stores at once
+            if (kCheapFence and lane_id == 0)
+                prefetched_channel_head_idx = ld_volatile_global(channel_head_idx.buffer());
+            sync_barrier_before_publish(kCheapFence, send_rank_id, num_threads_per_rank);
             if (lane_id == 0 and send_warp_id_in_rank == 0)
-                st_release_sys_global<kUseCheapFence>(channel_tail_idx.buffer(),
-                                                      current_channel_tail_idx);
+                st_release_sys_global<kCheapFence>(channel_tail_idx.buffer(),
+                                                   current_channel_tail_idx);
         }
     } else {
         // Workers for receiving
@@ -784,7 +819,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
                 // Update queue tail
                 channel_tail_idx[lane_id] =
-                    ld_acquire_sys_global<kUseCheapFence>(channel_tail_idx_ptr);
+                    ld_acquire_sys_global<kCheapFence>(channel_tail_idx_ptr);
 
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
@@ -829,6 +864,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     Buffer<float>(ptr, num_channels_total * num_recv_buffer_tokens * num_topk,
                                   channel_rank_offset * num_recv_buffer_tokens * num_topk);
             }
+            // Every rank's `x_buffers` slots of this channel follow rank 0's, so one payload
+            // spanning them all serves every load of the reduction below.
+            const ChannelPayload<kCheapFence> channel_x_payload(channel_x_buffers[0].buffer());
 
             // The same tokens as the dispatch process
             int token_start_idx, token_end_idx;
@@ -887,8 +925,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                     static_cast<float>(bias_1_values[j]);
 #pragma unroll 2
                     for (int j = 0; j < num_topk_ranks; ++j) {
-                        int4 recv_value = __ldg(channel_x_buffers[topk_ranks[j]].buffer() +
-                                                slot_indices[j] * hidden_int4 + i);
+                        auto recv_row = channel_x_buffers[topk_ranks[j]].buffer() +
+                                        slot_indices[j] * hidden_int4;
+                        int4 recv_value;
+                        if constexpr (kCheapFence)
+                            recv_value = channel_x_payload.ld(recv_row + i);
+                        else
+                            recv_value = __ldg(recv_row + i);
                         const dtype_t *recv_dtypes = reinterpret_cast<const dtype_t *>(&recv_value);
 
 #pragma unroll
@@ -911,8 +954,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     float value = 0;
 #pragma unroll 2
                     for (int i = 0; i < num_topk_ranks; ++i)
-                        value += ld_nc_global(channel_topk_weights_buffers[topk_ranks[i]].buffer() +
-                                              slot_indices[i] * num_topk + lane_id);
+                        value += ld_payload<kCheapFence>(
+                            channel_topk_weights_buffers[topk_ranks[i]].buffer() +
+                            slot_indices[i] * num_topk + lane_id);
                     recv_topk_weights[token_idx * num_topk + lane_id] = value;
                 }
 
@@ -936,14 +980,17 @@ void combine(hipDataType type, void *recv_x, float *recv_topk_weights, const voi
              int num_tokens, int num_recv_tokens, int hidden, int num_topk, void **buffer_ptrs,
              int rank, int num_ranks, hipStream_t stream, int num_sms, int num_max_send_tokens,
              int num_recv_buffer_tokens) {
-    constexpr int kNumThreads = 1024;
+    constexpr int kNumThreads         = 1024;
+    constexpr int kNumTMABytesPerWarp = 4096;
 
     static const bool use_cheap_fence = is_enable_cheap_fence();
 
 #define COMBINE_LAUNCH_CASE(dtype, ranks)                                                          \
     {                                                                                              \
-        auto combine_func = use_cheap_fence ? combine<dtype, ranks, kNumThreads, true>             \
-                                            : combine<dtype, ranks, kNumThreads, false>;           \
+        auto combine_func = use_cheap_fence                                                        \
+                                ? combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, true>    \
+                                : combine<dtype, ranks, kNumThreads, kNumTMABytesPerWarp, false>;  \
+        SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                   \
         LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, reinterpret_cast<dtype *>(recv_x),       \
                                       recv_topk_weights, reinterpret_cast<const dtype *>(x),       \
                                       topk_weights, reinterpret_cast<const dtype *>(bias_0),       \

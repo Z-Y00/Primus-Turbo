@@ -11,9 +11,10 @@ import torch
 _torch_custom_op_wrapper = torch.library.custom_op
 
 from primus_turbo.flydsl.gemm.gemm_fp8_kernel import gemm_fp8_tensorwise_flydsl_kernel
-from primus_turbo.flydsl.gemm.mxfp8_gemm_kernel import gemm_mxfp8_flydsl_kernel
+from primus_turbo.flydsl.gemm.gemm_mxfp8_kernel import gemm_mxfp8_flydsl_kernel
 from primus_turbo.pytorch.core.backend import (
     AutoKernelDispatcher,
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -26,7 +27,12 @@ from primus_turbo.pytorch.core.low_precision import (
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    build_ck,
+    is_gfx942,
+    is_gfx950,
+    is_gfx1250,
+)
 from primus_turbo.triton.gemm.gemm_fp8_kernel import (
     gemm_fp8_blockwise_triton_kernel,
     gemm_fp8_rowwise_triton_kernel,
@@ -90,12 +96,25 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ) -> bool:
         supported = True
+        if granularity == ScalingGranularity.MX_BLOCKWISE:
+            supported &= not is_gfx942()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8HipBLASLtBackend.SUPPORTED_GRANULARITIES
         # check dtype
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8HipBLASLtBackend.SUPPORTED_DTYPES
+
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and out.dtype in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
 
         # TODO:
         # check layout
@@ -116,9 +135,23 @@ class GEMMFP8HipBLASLtBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ):
+        beta = 1.0 if inplace_add_to_out else 0.0
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_gemm_fp8(
-            a, a_scale_inv, b, b_scale_inv, out_dtype, trans_a, trans_b, trans_c, granularity.name
+            a,
+            a_scale_inv,
+            b,
+            b_scale_inv,
+            out_dtype,
+            trans_a,
+            trans_b,
+            trans_c,
+            granularity.name,
+            beta,
+            out,
         )
 
 
@@ -142,8 +175,15 @@ class GEMMFP8CKBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         # check ScalingGranularity
         supported &= granularity in GEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         # check dtype
@@ -226,10 +266,16 @@ class GEMMFP8TritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
         supported = True
         supported &= granularity in GEMMFP8TritonBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TritonBackend.SUPPORTED_DTYPES
+        # Only the TENSORWISE kernel implements the beta=1 epilogue; the ROWWISE /
+        # BLOCKWISE ones would ignore `out` and silently produce no gradient.
+        if inplace_add_to_out:
+            supported &= granularity == ScalingGranularity.TENSORWISE
         return supported
 
     @staticmethod
@@ -243,7 +289,12 @@ class GEMMFP8TritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ):
+        beta = 1.0 if inplace_add_to_out else 0.0
+
         if granularity == ScalingGranularity.TENSORWISE:
             return gemm_fp8_tensorwise_triton_kernel(
                 a,
@@ -254,8 +305,14 @@ class GEMMFP8TritonBackend(KernelBackend):
                 trans_b=trans_b,
                 out_dtype=out_dtype,
                 trans_c=trans_c,
+                beta=beta,
+                out=out,
             )
-        elif granularity == ScalingGranularity.ROWWISE:
+
+        assert not inplace_add_to_out, (
+            f"Fused accumulation into `out` is only implemented for TENSORWISE, got {granularity}"
+        )
+        if granularity == ScalingGranularity.ROWWISE:
             return gemm_fp8_rowwise_triton_kernel(
                 a,
                 a_scale_inv,
@@ -305,8 +362,13 @@ class GEMMFP8TurboBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        supported &= is_gfx950()
         supported &= granularity in GEMMFP8TurboBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8TurboBackend.SUPPORTED_DTYPES
         supported &= not trans_a and trans_b and not trans_c
@@ -356,10 +418,16 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ) -> bool:
         supported = True
+        if inplace_add_to_out:
+            supported &= out is not None and out.dtype == out_dtype
+            supported &= out_dtype in (torch.bfloat16, torch.float16)
         # gfx950 (CDNA4) only: kernel uses mfma_f32_16x16x128_f8f6f4, absent on gfx942-.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
         supported &= granularity in GEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= (a.dtype, b.dtype, out_dtype) in GEMMFP8FlyDSLBackend.SUPPORTED_DTYPES
         m, n, k = get_gemm_logical_shape(a, b, trans_a, trans_b)
@@ -370,6 +438,7 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             supported &= k % 128 == 0 and k >= 256
             supported &= a_scale_inv.shape == (m, k // 32) and b_scale_inv.shape == (n, k // 32)
             supported &= a_scale_inv.element_size() == 1 and b_scale_inv.element_size() == 1
+            supported &= not (inplace_add_to_out and trans_c)
             return supported
 
         # TENSORWISE: NT/NN/TN native (TT unsupported), scalar per-tensor scales.
@@ -389,12 +458,21 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         trans_c: bool,
         granularity: ScalingGranularity,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
+        **kwargs,
     ):
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            out = gemm_mxfp8_flydsl_kernel(
-                a, a_scale_inv.view(torch.uint8), b, b_scale_inv.view(torch.uint8), out_dtype=out_dtype
+            res = gemm_mxfp8_flydsl_kernel(
+                a,
+                a_scale_inv.view(torch.uint8),
+                b,
+                b_scale_inv.view(torch.uint8),
+                out_dtype=out_dtype,
+                beta=1.0 if inplace_add_to_out else 0.0,
+                out=out if inplace_add_to_out else None,
             )
-            return out.t().contiguous() if trans_c else out
+            return res.t().contiguous() if trans_c else res
 
         if trans_c:
             lhs, rhs = b, a
@@ -413,6 +491,8 @@ class GEMMFP8FlyDSLBackend(KernelBackend):
             trans_b=trans_rhs,
             out_dtype=out_dtype,
             trans_c=False,
+            beta=1.0 if inplace_add_to_out else 0.0,
+            out=out if inplace_add_to_out else None,
         )
 
 
@@ -448,8 +528,8 @@ def gemm_fp8_impl(
     granularity: int,
     default_backend: int,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -464,7 +544,53 @@ def gemm_fp8_impl(
         granularity=granularity_enum,
     )
 
-    return GEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@_torch_custom_op_wrapper("primus_turbo::gemm_fp8_accum_impl", mutates_args={"out"}, device_types="cuda")
+def gemm_fp8_accum_impl(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    out: torch.Tensor,
+    default_backend: int,
+) -> None:
+    """Dense FP8 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += op(A) @ op(B)``, folding the accumulation into the GEMM
+    epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_gemm_backend(PrecisionType.FP8)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scale_inv=a_scale_inv,
+        b_scale_inv=b_scale_inv,
+        out_dtype=out_dtype,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        granularity=granularity_enum,
+        inplace_add_to_out=True,
+        out=out,
+    )
+
+    # The tuner benchmarks a backend by launching it repeatedly, so letting it tune on
+    # the caller's buffer would accumulate the wgrad once per warmup and timing
+    # iteration.
+    if GlobalBackendManager.auto_tune_enabled() and not GEMMFP8KernelDispatcher._is_graph_capturing():
+        GEMMFP8KernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
 
 
 @gemm_fp8_impl.register_fake
@@ -484,3 +610,24 @@ def gemm_fp8_impl_meta(
     if trans_c:
         m, n = n, m
     return torch.empty(m, n, dtype=out_dtype, device=a.device)
+
+
+@gemm_fp8_accum_impl.register_fake
+def gemm_fp8_accum_impl_meta(
+    a: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    trans_a: bool,
+    b: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    trans_c: bool,
+    granularity: int,
+    out: torch.Tensor,
+    default_backend: int,
+) -> None:
+    m, n, _ = get_gemm_logical_shape(a, b, trans_a, trans_b)
+    if trans_c:
+        m, n = n, m
+    assert tuple(out.shape) == (m, n), f"out shape {tuple(out.shape)} must equal {(m, n)}"
+    return None

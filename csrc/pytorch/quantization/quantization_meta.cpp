@@ -1,6 +1,8 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #include "primus_turbo/quantization.h"
 #include "primus_turbo/shuffle.h"
@@ -10,8 +12,25 @@ namespace primus_turbo::pytorch {
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
-                                                     c10::optional<at::Tensor> scale_opt) {
-    auto input_fp8 = at::empty_like(input, at::dtype(dest_dtype).device(at::kMeta));
+                                                     c10::optional<at::Tensor> scale_opt,
+                                                     const int64_t             padding_align_size,
+                                                     const int64_t pad_penultimate_align_size,
+                                                     c10::optional<at::Tensor> amax_partials_opt) {
+    PRIMUS_TURBO_CHECK(input.dim() >= 1, "input must have at least 1 dim");
+    PRIMUS_TURBO_CHECK(padding_align_size >= 1, "padding_align_size must be >= 1");
+    const int64_t K  = input.size(-1);
+    const int64_t Kp = ((K + padding_align_size - 1) / padding_align_size) * padding_align_size;
+
+    std::vector<int64_t> out_shape(input.sizes().begin(), input.sizes().end());
+    out_shape.back() = Kp;
+    if (pad_penultimate_align_size > 1 && input.dim() >= 2) {
+        const int64_t N  = input.size(-2);
+        const int64_t Np = ((N + pad_penultimate_align_size - 1) / pad_penultimate_align_size) *
+                           pad_penultimate_align_size;
+        if (Np > N)
+            out_shape[out_shape.size() - 2] = Np;
+    }
+    auto input_fp8 = at::empty(out_shape, at::dtype(dest_dtype).device(at::kMeta));
     auto scale_inv = at::empty({}, input.options().dtype(at::kFloat).device(at::kMeta));
     return {input_fp8, scale_inv};
 }
@@ -144,7 +163,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
     const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
     const bool shuffle_rowwise_scale, const bool shuffle_rowwise, const bool shuffle_colwise_scale,
-    const bool shuffle_colwise) {
+    const bool shuffle_colwise, const int64_t scale_rounding_mode) {
     using namespace primus_turbo::detail;
 
     std::function<int64_t(int64_t, int64_t)> cdiv = [](int64_t a, int64_t b) -> int64_t {
@@ -160,6 +179,7 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     PRIMUS_TURBO_CHECK(padding_align_size == MXFP4_K_DIM_PADDING_ALIGN_SIZE,
                        "padding_align_size must be ", MXFP4_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP4. But got padding_align_size=", padding_align_size);
+    (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Mirror the CUDA impl: 2D keeps ``G == 1`` and the 2D layout; 3D carries a
     // leading group dim ``G`` on every per-group buffer and returns 3D views.
@@ -247,7 +267,8 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
                                             const int64_t axis, const int64_t padding_align_size,
                                             const bool use_2d_block, const bool use_sr,
                                             const bool use_rht, const bool shuffle_scale,
-                                            const bool shuffle_out) {
+                                            const bool    shuffle_out,
+                                            const int64_t scale_rounding_mode) {
     using namespace primus_turbo::detail;
 
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
@@ -261,6 +282,7 @@ std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::Sc
     PRIMUS_TURBO_CHECK(padding_align_size == MXFP4_K_DIM_PADDING_ALIGN_SIZE,
                        "padding_align_size must be ", MXFP4_K_DIM_PADDING_ALIGN_SIZE,
                        " for MXFP4. But got padding_align_size=", padding_align_size);
+    (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     // Mirror the CUDA impl: 2D uses axis in {0, 1}; 3D uses axis in {1, 2}.
     // 2D maps axis==0 -> COLWISE / axis==1 -> ROWWISE; 3D maps axis==1 ->
@@ -554,12 +576,11 @@ grouped_quantize_mxfp8_dual_meta(const at::Tensor input, const at::Tensor group_
             group_lens_padded_colwise,       group_offs_padded_colwise};
 }
 
-std::vector<at::Tensor>
-grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_lens,
-                                 const at::Tensor group_offs, const at::ScalarType dest_dtype,
-                                 const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-                                 const bool rowwise_use_rht, const bool colwise_use_2d_block,
-                                 const bool colwise_use_sr, const bool colwise_use_rht) {
+std::vector<at::Tensor> grouped_quantize_mxfp4_dual_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool colwise_use_2d_block, const bool colwise_use_sr,
+    const bool colwise_use_rht, const int64_t scale_rounding_mode) {
     using namespace primus_turbo::detail;
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
 
@@ -567,6 +588,7 @@ grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_
                        "Input must be BFloat16 or Half");
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
+    (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     constexpr int64_t COL_ALIGN = MXFP4_K_DIM_PADDING_ALIGN_SIZE; // = 128
 
@@ -607,12 +629,11 @@ grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_
             group_offs_padded_colwise};
 }
 
-std::vector<at::Tensor> grouped_quantize_mxfp4_meta(const at::Tensor     input,
-                                                    const at::Tensor     group_lens,
-                                                    const at::Tensor     group_offs,
-                                                    const at::ScalarType dest_dtype,
-                                                    const int64_t axis, const bool use_2d_block,
-                                                    const bool use_sr, const bool use_rht) {
+std::vector<at::Tensor>
+grouped_quantize_mxfp4_meta(const at::Tensor input, const at::Tensor group_lens,
+                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
+                            const int64_t axis, const bool use_2d_block, const bool use_sr,
+                            const bool use_rht, const int64_t scale_rounding_mode) {
     using namespace primus_turbo::detail;
     auto cdiv = [](int64_t a, int64_t b) -> int64_t { return (a + b - 1) / b; };
 
@@ -621,6 +642,7 @@ std::vector<at::Tensor> grouped_quantize_mxfp4_meta(const at::Tensor     input,
     PRIMUS_TURBO_CHECK(input.dim() == 2, "Input must be 2D");
     PRIMUS_TURBO_CHECK(dest_dtype == at::kFloat4_e2m1fn_x2, "Output must be Float4_e2m1fn_x2");
     PRIMUS_TURBO_CHECK(axis == 0 || axis == 1, "Axis must be 0 or 1");
+    (void) mxfp4_scale_rounding_bias(scale_rounding_mode);
 
     const bool is_rowwise = (axis != 0);
 

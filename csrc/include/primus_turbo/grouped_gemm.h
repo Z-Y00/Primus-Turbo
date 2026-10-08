@@ -1,10 +1,14 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #pragma once
 
+#ifdef BUILD_CK_BACKEND
 #include "ck_tile/ops/gemm_quant/pipeline/tile_gemm_quant_traits.hpp"
+#endif
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -12,8 +16,10 @@
 
 namespace primus_turbo {
 
+#ifdef BUILD_CK_BACKEND
 std::int64_t get_ck_grouped_gemm_args_sizes(const int group_num);
 std::int64_t get_ck_grouped_gemm_fp8_args_sizes(const int group_num);
+#endif
 
 std::int64_t get_hipblaslt_grouped_gemm_workspace_size();
 
@@ -56,6 +62,7 @@ template <typename AType, typename BType, typename CType> struct GroupedGemmPara
     int32_t  ws_local_per_xcd = 0;
 };
 
+#ifdef BUILD_CK_BACKEND
 template <typename AType, typename BType, typename CType>
 struct CKGroupedGemmParams : public GroupedGemmParams<AType, BType, CType> {
     void *args_ptr = nullptr;
@@ -66,6 +73,7 @@ struct CKGroupedGemmFP8Params : public CKGroupedGemmParams<AType, BType, CType> 
     const ACCType *aq_ptr = nullptr;
     const ACCType *bq_ptr = nullptr;
 };
+#endif // BUILD_CK_BACKEND
 
 struct HipblasltGroupedGemmParams {
     const void          *a_ptr       = nullptr;
@@ -81,6 +89,8 @@ struct HipblasltGroupedGemmParams {
     void                *c_ptr = nullptr;
     hipDataType          c_type;
     std::vector<int64_t> c_shape;
+
+    float beta = 0.0f;
 
     const int64_t *group_lens_ptr = nullptr;
     const int64_t *group_offs_ptr = nullptr;
@@ -99,6 +109,7 @@ struct HipblasltGroupedGemmParams {
 //==================================================================
 //  CK Grouped GEMM
 //==================================================================
+#ifdef BUILD_CK_BACKEND
 
 template <typename ADataType, typename BDataType, typename CDataType, typename AccDataType = float>
 void ck_grouped_gemm(const CKGroupedGemmParams<ADataType, BDataType, CDataType> &params);
@@ -115,6 +126,8 @@ template <typename ADataType, typename BDataType, typename CDataType, typename A
           ck_tile::QuantType QuantMode>
 void ck_grouped_gemm_fp8_variable_k(
     const CKGroupedGemmFP8Params<ADataType, BDataType, CDataType, AccDataType> &params);
+
+#endif // BUILD_CK_BACKEND
 
 //==================================================================
 //  hipBLASLt Grouped GEMM

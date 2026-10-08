@@ -1,10 +1,11 @@
-/*
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2025 DeepSeek. All rights reserved.
  *
  * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE for license information.
- */
+ **************************************************************************************************/
 
 #pragma once
 
@@ -59,6 +60,10 @@ inline void LAUNCH_KERNEL_NON_COOPERATIVE(T &&config, Kern &&kernel, Args &&...a
 }
 
 #endif // #ifndef LAUNCH_KERNEL
+
+#ifndef SET_SHARED_MEMORY_FOR_TMA
+#define SET_SHARED_MEMORY_FOR_TMA(kernel) void()
+#endif
 
 #define SWITCH_RANKS(case_macro)                                                                   \
     switch (num_ranks) {                                                                           \

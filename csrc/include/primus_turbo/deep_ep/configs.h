@@ -1,10 +1,11 @@
-/*
+/***************************************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2025 DeepSeek. All rights reserved.
  *
  * Modification Copyright© 2025 Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE for license information.
- */
+ **************************************************************************************************/
 
 #pragma once
 
@@ -82,6 +83,14 @@ static inline int get_num_cpu_timeout_secs() {
     return timeout;
 }
 
+// Selects how the intranode dispatch / combine channels publish their ring-buffer tails (see the
+// cheap-fence notes in the deep_ep utils header). The cheap fence, the default, has every sending
+// warp drain its own payload stores before the tail is published and reads the payload with
+// system-scope loads. The full fence instead makes the tail store a system-scope release and the
+// poll an acquire, which adds a GPU-wide L2 write-back per publish and a cache invalidate per
+// poll: on gfx950 (EP=8, DSv3 shapes, 32 CUs) that makes dispatch 23-30% and combine 35% slower,
+// and GEMMs running alongside 12% slower. Set PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE=1 for the
+// full fence; gfx1250 always uses it.
 inline static bool is_enable_cheap_fence() {
     char const *v = std::getenv("PRIMUS_TURBO_DEEPEP_DISABLE_CHEAP_FENCE");
     if (!v || v[0] == '\0')

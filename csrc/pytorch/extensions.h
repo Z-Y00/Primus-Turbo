@@ -1,6 +1,8 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #pragma once
 
@@ -27,11 +29,17 @@ namespace primus_turbo::pytorch {
 
 std::vector<at::Tensor> quantize_fp8_tensorwise(const at::Tensor          input,
                                                 const at::ScalarType      dest_dtype,
-                                                c10::optional<at::Tensor> scale_opt);
+                                                c10::optional<at::Tensor> scale_opt,
+                                                const int64_t             padding_align_size,
+                                                const int64_t pad_penultimate_align_size,
+                                                c10::optional<at::Tensor> amax_partials_opt);
 
 std::vector<at::Tensor> quantize_fp8_tensorwise_meta(const at::Tensor          input,
                                                      const at::ScalarType      dest_dtype,
-                                                     c10::optional<at::Tensor> scale_opt);
+                                                     c10::optional<at::Tensor> scale_opt,
+                                                     const int64_t             padding_align_size,
+                                                     const int64_t pad_penultimate_align_size,
+                                                     c10::optional<at::Tensor> amax_partials_opt);
 
 std::vector<at::Tensor> quantize_fp8_blockwise_segment_m_row_col(const at::Tensor     input,
                                                                  const at::ScalarType dest_dtype,
@@ -71,12 +79,14 @@ at::Tensor dequantize_fp8_tensorwise(const at::Tensor input, const at::Tensor sc
 at::Tensor dequantize_fp8_tensorwise_meta(const at::Tensor input, const at::Tensor scale_inv,
                                           const at::ScalarType dest_dtype);
 
-std::vector<at::Tensor> quantize_mxfp4_dual(
-    const at::Tensor input, const at::ScalarType dest_dtype, const int64_t padding_align_size,
-    const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
-    const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
-    const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
-    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+std::vector<at::Tensor>
+quantize_mxfp4_dual(const at::Tensor input, const at::ScalarType dest_dtype,
+                    const int64_t padding_align_size, const bool rowwise_use_2d_block,
+                    const bool rowwise_use_sr, const bool rowwise_use_rht,
+                    const bool colwise_use_2d_block, const bool colwise_use_sr,
+                    const bool colwise_use_rht, const bool shuffle_rowwise_scale = false,
+                    const bool shuffle_rowwise = false, const bool shuffle_colwise_scale = false,
+                    const bool shuffle_colwise = false, const int64_t scale_rounding_mode = 0);
 
 at::Tensor dequantize_fp8_rowwise(const at::Tensor input, const at::Tensor scale_inv,
                                   const int64_t axis, const at::ScalarType dest_dtype);
@@ -115,19 +125,22 @@ std::vector<at::Tensor> quantize_mxfp4_dual_meta(
     const bool rowwise_use_2d_block, const bool rowwise_use_sr, const bool rowwise_use_rht,
     const bool colwise_use_2d_block, const bool colwise_use_sr, const bool colwise_use_rht,
     const bool shuffle_rowwise_scale = false, const bool shuffle_rowwise = false,
-    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false);
+    const bool shuffle_colwise_scale = false, const bool shuffle_colwise = false,
+    const int64_t scale_rounding_mode = 0);
 
 std::vector<at::Tensor> quantize_mxfp4(const at::Tensor input, const at::ScalarType dest_dtype,
                                        const int64_t axis, const int64_t padding_align_size,
                                        const bool use_2d_block, const bool use_sr,
                                        const bool use_rht, const bool shuffle_scale = false,
-                                       const bool shuffle_out = false);
+                                       const bool    shuffle_out         = false,
+                                       const int64_t scale_rounding_mode = 0);
 
 std::vector<at::Tensor> quantize_mxfp4_meta(const at::Tensor input, const at::ScalarType dest_dtype,
                                             const int64_t axis, const int64_t padding_align_size,
                                             const bool use_2d_block, const bool use_sr,
                                             const bool use_rht, const bool shuffle_scale = false,
-                                            const bool shuffle_out = false);
+                                            const bool    shuffle_out         = false,
+                                            const int64_t scale_rounding_mode = 0);
 
 std::vector<at::Tensor>
 quantize_mxfp8_dual(const at::Tensor input, const at::ScalarType dest_dtype,
@@ -177,32 +190,30 @@ std::vector<at::Tensor> grouped_quantize_mxfp8_meta(
     const at::ScalarType dest_dtype, const int64_t axis, const int64_t padding_align_size,
     const bool use_2d_block, const bool shuffle_scale = false, const bool shuffle_out = false);
 
-std::vector<at::Tensor>
-grouped_quantize_mxfp4_dual(const at::Tensor input, const at::Tensor group_lens,
-                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
-                            const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-                            const bool rowwise_use_rht, const bool colwise_use_2d_block,
-                            const bool colwise_use_sr, const bool colwise_use_rht);
+std::vector<at::Tensor> grouped_quantize_mxfp4_dual(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool colwise_use_2d_block, const bool colwise_use_sr,
+    const bool colwise_use_rht, const int64_t scale_rounding_mode = 0);
 
-std::vector<at::Tensor>
-grouped_quantize_mxfp4_dual_meta(const at::Tensor input, const at::Tensor group_lens,
-                                 const at::Tensor group_offs, const at::ScalarType dest_dtype,
-                                 const bool rowwise_use_2d_block, const bool rowwise_use_sr,
-                                 const bool rowwise_use_rht, const bool colwise_use_2d_block,
-                                 const bool colwise_use_sr, const bool colwise_use_rht);
+std::vector<at::Tensor> grouped_quantize_mxfp4_dual_meta(
+    const at::Tensor input, const at::Tensor group_lens, const at::Tensor group_offs,
+    const at::ScalarType dest_dtype, const bool rowwise_use_2d_block, const bool rowwise_use_sr,
+    const bool rowwise_use_rht, const bool colwise_use_2d_block, const bool colwise_use_sr,
+    const bool colwise_use_rht, const int64_t scale_rounding_mode = 0);
 
 std::vector<at::Tensor> grouped_quantize_mxfp4(const at::Tensor input, const at::Tensor group_lens,
                                                const at::Tensor     group_offs,
                                                const at::ScalarType dest_dtype, const int64_t axis,
                                                const bool use_2d_block, const bool use_sr,
-                                               const bool use_rht);
+                                               const bool    use_rht,
+                                               const int64_t scale_rounding_mode = 0);
 
-std::vector<at::Tensor> grouped_quantize_mxfp4_meta(const at::Tensor     input,
-                                                    const at::Tensor     group_lens,
-                                                    const at::Tensor     group_offs,
-                                                    const at::ScalarType dest_dtype,
-                                                    const int64_t axis, const bool use_2d_block,
-                                                    const bool use_sr, const bool use_rht);
+std::vector<at::Tensor>
+grouped_quantize_mxfp4_meta(const at::Tensor input, const at::Tensor group_lens,
+                            const at::Tensor group_offs, const at::ScalarType dest_dtype,
+                            const int64_t axis, const bool use_2d_block, const bool use_sr,
+                            const bool use_rht, const int64_t scale_rounding_mode = 0);
 
 //==================================================================
 //  Shuffle
@@ -217,32 +228,70 @@ at::Tensor shuffle_weight_impl(const at::Tensor weight, at::IntArrayRef layout);
 at::Tensor shuffle_weight_impl_meta(const at::Tensor weight, at::IntArrayRef layout);
 
 //==================================================================
+//  Weight de-oscillation
+//==================================================================
+
+void weight_deosc_qdq(at::Tensor master, at::Tensor previous, at::Tensor previous_qdq,
+                      at::Tensor dist, at::Tensor dist_qdq, int64_t rows, int64_t cols,
+                      int64_t start, int64_t scale_rounding_mode, bool seed, bool close,
+                      double ratio_threshold, double eps, c10::optional<at::Tensor> reset_count,
+                      bool grouped);
+
+void weight_deosc_qdq_meta(at::Tensor master, at::Tensor previous, at::Tensor previous_qdq,
+                           at::Tensor dist, at::Tensor dist_qdq, int64_t rows, int64_t cols,
+                           int64_t start, int64_t scale_rounding_mode, bool seed, bool close,
+                           double ratio_threshold, double eps,
+                           c10::optional<at::Tensor> reset_count, bool grouped);
+
+void weight_deosc_update(const at::Tensor current, const at::Tensor current_qdq,
+                         const at::Tensor previous, const at::Tensor previous_qdq, at::Tensor dist,
+                         at::Tensor dist_qdq);
+
+void weight_deosc_update_meta(const at::Tensor current, const at::Tensor current_qdq,
+                              const at::Tensor previous, const at::Tensor previous_qdq,
+                              at::Tensor dist, at::Tensor dist_qdq);
+
+void weight_deosc_close(at::Tensor master, at::Tensor previous, const at::Tensor current_qdq,
+                        at::Tensor dist, at::Tensor dist_qdq, double ratio_threshold, double eps,
+                        c10::optional<at::Tensor> reset_count);
+
+void weight_deosc_close_meta(at::Tensor master, at::Tensor previous, const at::Tensor current_qdq,
+                             at::Tensor dist, at::Tensor dist_qdq, double ratio_threshold,
+                             double eps, c10::optional<at::Tensor> reset_count);
+
+//==================================================================
 //  GEMM
 //==================================================================
 
 at::Tensor hipblaslt_gemm(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype, bool transA,
-                          bool transB, bool transC);
+                          bool transB, bool transC, const double beta,
+                          c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_meta(at::Tensor A, at::Tensor B, const at::ScalarType out_dtype,
-                               bool transA, bool transB, bool transC);
+                               bool transA, bool transB, bool transC, const double beta,
+                               c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp8(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp8_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, const double beta,
+                                   c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp4(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                               at::Tensor scaleB_inv, const at::ScalarType out_dtype, bool transA,
-                              bool transB, bool transC, const std::string &granularity);
+                              bool transB, bool transC, const std::string &granularity,
+                              const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_gemm_fp4_meta(at::Tensor A, at::Tensor scaleA_inv, at::Tensor B,
                                    at::Tensor scaleB_inv, const at::ScalarType out_dtype,
                                    bool transA, bool transB, bool transC,
-                                   const std::string &granularity);
+                                   const std::string &granularity, const double beta,
+                                   c10::optional<at::Tensor> out);
 
 at::Tensor ck_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales, at::Tensor &b_scales,
                        const bool transA, const bool transB, at::ScalarType out_dtype,
@@ -314,23 +363,27 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
 
 at::Tensor hipblaslt_grouped_gemm(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                   at::Tensor &group_offs, const bool transA, const bool transB,
-                                  const bool pre_sync);
+                                  const bool pre_sync, const double beta,
+                                  c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA, const bool transB,
-                                       const bool pre_sync);
+                                       const bool pre_sync, const double beta,
+                                       c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_fp8(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                       at::Tensor &b_scales, at::Tensor &group_lens,
                                       at::Tensor &group_offs, const bool transA, const bool transB,
                                       at::ScalarType out_dtype, const std::string &granularity,
-                                      const bool pre_sync);
+                                      const bool pre_sync, const double beta,
+                                      c10::optional<at::Tensor> out);
 
 at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Tensor &a_scales,
                                            at::Tensor &b_scales, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
                                            const bool transB, at::ScalarType out_dtype,
-                                           const std::string &granularity, const bool pre_sync);
+                                           const std::string &granularity, const bool pre_sync,
+                                           const double beta, c10::optional<at::Tensor> out);
 
 at::Tensor grouped_gemm_compute_offs(at::Tensor &group_lens);
 
@@ -392,5 +445,52 @@ void destroy_stream(const int device_id, const int64_t stream_ptr);
 void register_odc_rocshmem_host(pybind11::module_ &m);
 void register_odc_rocshmem_gda(pybind11::module_ &m);
 #endif
+
+//==================================================================
+//  HipKittens attention (gfx950)
+//==================================================================
+// Only present when the *_gfx950.cu kernels were built; see setup.py.
+#ifdef BUILD_HIPKITTENS_BACKEND
+
+void hk_attn_fwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at::Tensor &o,
+                     at::Tensor &lse, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq, int64_t Hkv,
+                     int64_t window_left, double softmax_scale);
+
+void hk_attn_fwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at::Tensor &o,
+                      at::Tensor &lse, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq, int64_t Hkv,
+                      int64_t window_left, double softmax_scale);
+
+void hk_attn_bwd_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                     const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq, at::Tensor &dk,
+                     at::Tensor &dv, const at::Tensor &lse, at::Tensor &delta, at::Tensor &lneg,
+                     at::Tensor &wsk, at::Tensor &wsv, int64_t Sq, int64_t Skv, int64_t B,
+                     int64_t Hq, int64_t Hkv, int64_t window_left, double softmax_scale,
+                     int64_t n_split_req);
+
+void hk_attn_bwd_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                      const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq, at::Tensor &dk,
+                      at::Tensor &dv, const at::Tensor &lse, at::Tensor &delta, at::Tensor &lneg,
+                      at::Tensor &wsk, at::Tensor &wsv, int64_t Sq, int64_t Skv, int64_t B,
+                      int64_t Hq, int64_t Hkv, int64_t window_left, double softmax_scale,
+                      int64_t n_split_req);
+
+void hk_attn_bwd_fused_d64(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                           const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq,
+                           at::Tensor &dk, at::Tensor &dv, at::Tensor &ws, const at::Tensor &lse,
+                           at::Tensor &delta, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                           int64_t Hkv, int64_t window_left, double softmax_scale);
+
+void hk_attn_bwd_fused_d128(const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+                            const at::Tensor &o, const at::Tensor &dO, at::Tensor &dq,
+                            at::Tensor &dk, at::Tensor &dv, at::Tensor &ws, const at::Tensor &lse,
+                            at::Tensor &delta, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                            int64_t Hkv, int64_t window_left, double softmax_scale);
+
+int64_t hk_attn_dkdv_head_split(int64_t head_dim, int64_t Sq, int64_t Skv, int64_t B, int64_t Hq,
+                                int64_t Hkv, int64_t window_left);
+
+std::vector<int64_t> hk_attn_block_sizes(int64_t head_dim);
+
+#endif // BUILD_HIPKITTENS_BACKEND
 
 } // namespace primus_turbo::pytorch

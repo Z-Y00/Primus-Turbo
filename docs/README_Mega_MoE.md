@@ -23,7 +23,7 @@ rank owns a slice of the experts and tokens are routed directly into a peer rank
 - **Activation recompute** — forward saves only the original `x`; backward recomputes the
   dispatched `x`.
 - **No-Sync / CUDA Graph friendly** — no host-side sync points.
-- **Python API** — a single autograd op `mega_moe_fused` that takes external routing
+- **Python API** — a single autograd op `fused_mega_moe` that takes external routing
   (`topk_idx` / `topk_weights`).
 
 ## Core Design
@@ -76,6 +76,13 @@ The backward pass is the **conjugate** of the forward: L2 dgrad (NN) + SwiGLUᵀ
 + L1 dgrad combine (NN) + dW1 (TN). Dispatch and combine swap roles, and the dispatched `x` is
 recomputed by `dispatch_grouped_gemm`.
 
+The gated activation is SiLU-SwiGLU by default (both halves clamped to ±10). The op that owns it
+(`fused_mega_moe`, `fused_mega_moe_stage2`, `fused_mega_moe_fp8_stage2`) also takes an
+`activation=GLUActivation(...)`, computing `g * sigmoid(alpha * g) * (u + glu_offset)` on the clamped
+halves. `GLUActivation.swigluoai()` is MiniMax-M3's `swigluoai` (Megatron's `quick_geglu`): alpha
+1.702, offset 1, gate clamped from above only, up clamped to ±7. The spec is a compile-time constant
+of the kernels, so it has no runtime cost, and the default reproduces the SiLU kernels bit for bit.
+
 ## Performance
 
 ### Test Configuration
@@ -103,8 +110,11 @@ recomputed by `dispatch_grouped_gemm`.
 
 ### Reproduce
 
-A single benchmark script covers both fused operators, selected with `--mode`; each compares the
-fused path against the Primus-Turbo (DeepEP) baseline over 8 ranks. Run from the repo root:
+A single benchmark script covers both fused operators, selected with `--mode`. Each compares the
+fused path against the serial baseline — the same work measured as a separate GEMM-only leg and a
+separate communication-only leg — over 8 ranks, and reports both `speedup (vs serial)` and the
+roofline ratio $\max(T_{\text{comm}}, T_{\text{gemm}}) / T_{\text{measured}}$ used in the tables
+above. Run from the repo root:
 
 ```bash
 export PYTORCH_ROCM_ARCH=gfx950
@@ -120,10 +130,22 @@ python benchmark/ops/training/bench_mega_moe.py --mode grouped_gemm_combine --mo
 
 | Component | File |
 | --- | --- |
-| Autograd op | `primus_turbo/pytorch/ops/moe/mega_moe_fused.py` |
-| Forward / backward custom ops | `primus_turbo/pytorch/kernels/mega_moe/` |
+| Autograd op | `primus_turbo/pytorch/ops/moe/fused_mega_moe.py` |
+| Forward / backward custom ops | `primus_turbo/pytorch/kernels/fused_mega_moe/` |
 | Dispatch + grouped GEMM kernel | `primus_turbo/flydsl/mega/dispatch_grouped_gemm_bf16_kernel.py` |
 | Grouped GEMM + combine kernel | `primus_turbo/flydsl/mega/grouped_gemm_combine_bf16_kernel.py` |
 | Dispatch prologue (routing tables) | `primus_turbo/flydsl/mega/dispatch_prologue_kernel.py` |
-| SwiGLU fwd/bwd | `primus_turbo/flydsl/mega/swiglu_kernel.py` |
+| SwiGLU fwd/bwd | `primus_turbo/flydsl/utils/swiglu_kernel.py` |
+| SwiGLU + MXFP8 quant fwd/bwd | `primus_turbo/flydsl/mega/fp8/swiglu_mxfp8_kernel.py` |
+| Activation spec (`GLUActivation`) | `primus_turbo/flydsl/utils/glu_activation.py` |
 | Cross-rank tiles (dispatch/combine/reduce) | `primus_turbo/flydsl/mega/ep_intranode.py` |
+
+## Acknowledgements
+
+- [**Triton-distributed**](https://github.com/ByteDance-Seed/Triton-distributed) (ByteDance-Seed,
+  MIT License) — Mega MoE's comm-compute overlapping design (symmetric-memory push, signal/wait
+  synchronization, fusing intra-node EP communication into the GEMM kernel) references
+  Triton-distributed's overlapping-kernel approach.
+- [**DeepGEMM**](https://github.com/deepseek-ai/DeepGEMM) (DeepSeek, MIT License) — Mega MoE's
+  cross-rank barrier and symmetric-buffer layout follow DeepGEMM's design; see the file headers of
+  `primus_turbo/flydsl/mega/barrier.py` and `primus_turbo/flydsl/mega/symm_buffer.py` for details.

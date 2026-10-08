@@ -143,19 +143,20 @@ print(c.shape) # [128, 256]
 
 ### 1.4 Mega MoE
 
-`mega_moe_fused` is an EP intra-node MoE op that fuses communication with the grouped GEMM
+`fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
 (`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
 communication buffer is allocated once and cached internally. See
 [README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
 
-> **Hardware requirements:** `gfx950` or higher, intra-node expert parallelism (one rank per GPU).
+> **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
+> (one rank per GPU).
 
 ```python
 import torch
 import torch.distributed as dist
 
 from primus_turbo.flydsl.mega.symm_buffer import get_symm_buffer_for_mega_moe
-from primus_turbo.pytorch.ops.moe.mega_moe_fused import mega_moe_fused
+from primus_turbo.pytorch.ops.moe.fused_mega_moe import fused_mega_moe
 
 # --- distributed setup (one rank per GPU, intra-node EP) ---
 dist.init_process_group("nccl")
@@ -192,7 +193,7 @@ topk_idx = torch.randint(0, E, (T, K), device="cuda", dtype=torch.int64)   # glo
 topk_w   = torch.rand(T, K, device="cuda", dtype=torch.float32)            # routing weights
 
 # --- fused forward + backward ---
-y = mega_moe_fused(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
+y = fused_mega_moe(group, x, topk_idx, topk_w, w1, w2)   # [T, H]
 y.sum().backward()                                        # grads for x, w1, w2, topk_w
 # run with torchrun --nproc_per_node=8 --nnodes=1 this_code.py
 ```
@@ -590,7 +591,7 @@ Priority (high to low):
 
 1. Code settings (`GlobalBackendManager.set_*_backend(...)`)
 2. Environment variables (`PRIMUS_TURBO_*_BACKEND`)
-3. AutoTune (`PRIMUS_TURBO_AUTO_TUNE=1`)
+3. AutoTune (`PRIMUS_TURBO_AUTO_TUNE=1`, or `PRIMUS_TURBO_*_BACKEND=autotune` for a single operator)
 4. Operator defaults
 5. Fallback: try all registered backends
 
@@ -658,6 +659,20 @@ print(out.shape)
 GlobalBackendManager.reset()
 ```
 
+`set_auto_tune(True)` turns AutoTune on for every operator. To auto-tune a single
+operator (or a single precision of it) while leaving everything else alone, pass
+`auto_tune=True` instead of naming a backend:
+
+```python
+from primus_turbo.pytorch.core.backend import GlobalBackendManager, PrecisionType
+
+# AutoTune FP8 GEMM only; other precisions keep their defaults.
+GlobalBackendManager.set_gemm_backend(auto_tune=True, precision=PrecisionType.FP8)
+```
+
+NOTE: a backend and `auto_tune=True` are mutually exclusive. MoE dispatch/combine
+does not support AutoTune at all.
+
 ### 5.3 Environment Variables
 
 You can also control backend selection and AutoTune via environment variables:
@@ -667,4 +682,16 @@ export PRIMUS_TURBO_AUTO_TUNE=1
 export PRIMUS_TURBO_GEMM_BACKEND=HIPBLASLT
 export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=CK
 export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=DEEP_EP
+```
+
+`PRIMUS_TURBO_*_BACKEND` also accepts `autotune` as a backend name, which enables
+AutoTune for that operator alone instead of the whole library. It composes with
+the per-precision syntax:
+
+```bash
+# AutoTune GEMM at every precision.
+export PRIMUS_TURBO_GEMM_BACKEND=autotune
+
+# AutoTune FP8 Grouped GEMM only; every other precision uses CK.
+export PRIMUS_TURBO_GROUPED_GEMM_BACKEND=fp8:autotune,other:ck
 ```

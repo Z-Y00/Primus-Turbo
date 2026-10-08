@@ -60,6 +60,30 @@ _grouped_blockwise_warmed: set = set()
 _grouped_blockwise_vk_warmed: set = set()
 
 
+def _resolve_variable_k_out(
+    out: torch.Tensor | None,
+    beta: float,
+    shape: tuple[int, int, int],
+    device: torch.device,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Validate a variable-K wrapper's optional ``out`` buffer, or allocate one.
+
+    ``beta=0.0`` overwrites the output and is the default; ``beta=1.0`` accumulates
+    (``out += lhs^T @ rhs``) inside the GEMM epilogue and therefore needs the caller
+    to supply the buffer to accumulate into. Strides are read off ``out`` at launch,
+    so non-contiguous views are fine.
+    """
+    assert beta in (0.0, 1.0), f"Only beta=0 (overwrite) or beta=1 (accumulate) supported, got {beta}"
+    if out is None:
+        assert beta == 0.0, "beta=1.0 requires an explicit `out` buffer to accumulate into"
+        return torch.empty(shape, device=device, dtype=out_dtype)
+
+    assert tuple(out.shape) == shape, f"out shape {tuple(out.shape)} must equal (G, OUT_M, OUT_N) = {shape}"
+    assert out.device == device, "out must be on same device as lhs"
+    return out
+
+
 def offline_select_gg_fp8(M_total, G, N, K, s_ak, s_bk):
     """FP8 grouped GEMM config from MI300X bench (out_gg_fp8_persistent_full.yaml).
 
@@ -173,9 +197,14 @@ def _get_gg_fp8_tw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 tensorwise grouped GEMM variable-K backward."""
+    # Mixed fp8 operands (HYBRID) need BLOCK_K=128. Below it Triton selects an MFMA whose
+    # opcode bakes one fp8 format for both operands, so the e4m3 side is decoded as e5m2 and
+    # its large codes read back as Inf/NaN. The forward config is pinned at 128 already,
+    # which is why only the variable-K (wgrad) pass ever hit this.
+    hybrid = a_dtype != b_dtype
     if is_gfx950():
         blk_m, blk_n = 256, 256
-        blk_k, num_stages_val = 64, 3
+        blk_k, num_stages_val = (128, 2) if hybrid else (64, 3)
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
@@ -193,11 +222,12 @@ def _get_gg_fp8_tw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
             tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
-            if min(om, on) >= 128 and ok in (64, 128):
+            ok_ks = (128,) if hybrid else (64, 128)
+            if min(om, on) >= 128 and ok in ok_ks:
                 blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
                 num_stages_val = 3 if ok <= 64 else 2
                 cache_a, cache_b = oc_a, oc_b
-            elif tiles_default < num_sms and min(om, on) >= 64:
+            elif tiles_default < num_sms and min(om, on) >= 64 and ok in ok_ks:
                 proposed_stages = 2 if ok >= 128 else 3
                 lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
                 if lds <= origama_hardware_info().lds_capacity:
@@ -280,9 +310,14 @@ def _get_gg_fp8_rw_fwd_config(
 @functools.lru_cache(maxsize=256)
 def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
     """Cached kernel config for FP8 rowwise grouped GEMM variable-K backward."""
+    # Mixed fp8 operands (HYBRID) need BLOCK_K=128. Below it Triton selects an MFMA whose
+    # opcode bakes one fp8 format for both operands, so the e4m3 side is decoded as e5m2 and
+    # its large codes read back as Inf/NaN. The forward config is pinned at 128 already,
+    # which is why only the variable-K (wgrad) pass ever hit this.
+    hybrid = a_dtype != b_dtype
     if is_gfx950():
         blk_m, blk_n = 256, 256
-        blk_k, num_stages_val = 64, 3
+        blk_k, num_stages_val = (128, 2) if hybrid else (64, 3)
         group_m = 4
         cache_a, cache_b = ".ca", ".ca"
         chunk_size = 32
@@ -300,11 +335,12 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
         if origami_params is not None:
             om, on, ok, ogm, oc_a, oc_b = origami_params
             tiles_default = G * ((OUT_M + 255) // 256) * ((OUT_N + 255) // 256)
-            if min(om, on) >= 128 and ok in (64, 128):
+            ok_ks = (128,) if hybrid else (64, 128)
+            if min(om, on) >= 128 and ok in ok_ks:
                 blk_m, blk_n, blk_k, group_m = om, on, ok, ogm
                 num_stages_val = 3 if ok <= 64 else 2
                 cache_a, cache_b = oc_a, oc_b
-            elif tiles_default < num_sms and min(om, on) >= 64:
+            elif tiles_default < num_sms and min(om, on) >= 64 and ok in ok_ks:
                 proposed_stages = 2 if ok >= 128 else 3
                 lds = origama_calculate_lds_usage(om, on, ok, 1, 1, proposed_stages)
                 if lds <= origama_hardware_info().lds_capacity:
@@ -329,6 +365,32 @@ def _get_gg_fp8_rw_vk_config(OUT_M, OUT_N, avg_k, a_dtype, b_dtype, G, num_sms):
 # ###########################################################################
 
 
+@triton.jit()
+def _compute_tile_cumsum_kernel(
+    group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (output)
+    G,  # runtime number of groups
+    num_pid_n,  # runtime int = cdiv(N, BLOCK_SIZE_N)
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    """Single-program kernel; precomputes per-group cumulative tile counts."""
+    cumsum: tl.int32 = 0
+    tl.store(tile_cumsum_ptr, 0)
+    for g in range(G):
+        m_g = (tl.load(group_offs_ptr + g + 1) - tl.load(group_offs_ptr + g)).to(tl.int32)
+        tiles_g = tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+        cumsum += tiles_g
+        tl.store(tile_cumsum_ptr + g + 1, cumsum)
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power-of-two >= max(n, 1) (Triton tl.arange requires power-of-two)."""
+    p = 1
+    while p < max(n, 1):
+        p <<= 1
+    return p
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tensorwise FP8 Forward Kernel (persistent, CPU-sync-free)
 #
@@ -345,6 +407,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     A_scale_ptr,  # per-tensor scale for A (scalar, fp32)
     B_scale_ptr,  # per-tensor scale for B (scalar, fp32)
     group_offs_ptr,  # [G+1] int64
+    tile_cumsum_ptr,  # [G+1] int32 (precomputed cumulative tile counts)
     # Dimensions
     G,  # number of groups (runtime)
     N,
@@ -369,6 +432,7 @@ def _grouped_fp8_persistent_gemm_kernel(
     EVEN_K: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    MAX_G_NEXT_POW2: tl.constexpr,  # smallest pow2 >= G+1 (for tl.arange load)
 ):
     """Persistent grouped FP8 GEMM kernel (CPU-sync-free, per-tensor scaling)."""
     pid = tl.program_id(0)
@@ -377,11 +441,17 @@ def _grouped_fp8_persistent_gemm_kernel(
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    # ── Compute total tiles across all groups ──
-    total_tiles: tl.int32 = 0
-    for _g in range(G):
-        m_g = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-        total_tiles += tl.cdiv(m_g, BLOCK_SIZE_M) * num_pid_n
+    # ── Load precomputed tile cumulative sums into registers (G is small) ──
+    g_idx_arr = tl.arange(0, MAX_G_NEXT_POW2)
+    g_valid_mask = g_idx_arr <= G  # valid range is [0..G]
+    # Out-of-range entries are loaded as MAX_INT so that subsequent "<= global_tile_id"
+    # comparisons never select them.
+    tile_cumsum_arr = tl.load(
+        tile_cumsum_ptr + g_idx_arr,
+        mask=g_valid_mask,
+        other=2147483647,
+    ).to(tl.int32)
+    total_tiles = tl.load(tile_cumsum_ptr + G).to(tl.int32)
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -398,18 +468,13 @@ def _grouped_fp8_persistent_gemm_kernel(
     acc_dtype = tl.float32
 
     for global_tile_id in range(pid, total_tiles, NUM_SMS):
-        # ── Find group via linear scan (O(G)) ──
-        group_idx: tl.int32 = 0
-        tile_start: tl.int32 = 0
-        cumsum: tl.int32 = 0
-        for _g in range(G):
-            m_g_i = (tl.load(group_offs_ptr + _g + 1) - tl.load(group_offs_ptr + _g)).to(tl.int32)
-            tiles_g = tl.cdiv(m_g_i, BLOCK_SIZE_M) * num_pid_n
-            new_cumsum = cumsum + tiles_g
-            if global_tile_id >= new_cumsum:
-                group_idx = _g + 1
-                tile_start = new_cumsum
-            cumsum = new_cumsum
+        # ── Find group via register-resident lookup (was O(G) scan with 2*G loads) ──
+        # group_idx = number of g in [1..G] where tile_cumsum[g] <= global_tile_id;
+        # equivalently, the unique g such that tile_cumsum[g] <= global_tile_id < tile_cumsum[g+1].
+        le_mask = (tile_cumsum_arr <= global_tile_id) & (g_idx_arr >= 1) & (g_idx_arr <= G)
+        group_idx = tl.sum(le_mask.to(tl.int32))
+        # tile_start = tile_cumsum[group_idx]
+        tile_start = tl.sum(tl.where(g_idx_arr == group_idx, tile_cumsum_arr, 0))
 
         # ── Group-local tile → (pid_m, pid_n) with GROUP_SIZE_M swizzle ──
         local_tile = global_tile_id - tile_start
@@ -496,6 +561,8 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     group_offs: torch.Tensor,
     trans_b: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
+    epilogue: str | None = None,
+    n_real: "int | None" = None,
 ) -> torch.Tensor:
     """Persistent grouped FP8 GEMM (CPU-sync-free, per-tensor scaling) using Triton.
 
@@ -512,6 +579,9 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         group_offs: [G+1] int64 prefix sum of group lengths.
         trans_b: If True, b[g] is [N, K] (transposed).
         out_dtype: Output dtype (default bfloat16).
+        epilogue: Optional fused activation epilogue. Routed here by
+            ``GroupedGEMMFP8TritonBackend`` for TENSORWISE only; the kernel
+            validates the epilogue type.
 
     Returns:
         [M_total, N] output in out_dtype.
@@ -533,6 +603,11 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
 
     assert K_a == K_b, f"K mismatch: a has K={K_a}, b has K={K_b}"
     K = K_a
+
+    # Operand pitch stays padded, so the kernel reads padded rows but stores the real N.
+    if n_real is not None:
+        assert 0 < n_real <= N, f"n_real={n_real} must be in (0, N={N}]"
+        N = n_real
 
     stride_bg = b.stride(0)
     stride_ak = a.stride(1)  # =1 for contiguous a
@@ -561,6 +636,20 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
     )
     even_k = K % blk_k == 0
 
+    # Precompute per-group tile cumulative sums on the device (single-program kernel,
+    # same CUDA stream → no host sync). The main kernel then loads this tiny array once
+    # into registers and skips the per-tile O(G) scan over group_offs.
+    num_pid_n_int = (N + blk_n - 1) // blk_n
+    tile_cumsum = torch.empty(G + 1, device=a.device, dtype=torch.int32)
+    _compute_tile_cumsum_kernel[(1,)](
+        group_offs,
+        tile_cumsum,
+        G,
+        num_pid_n_int,
+        BLOCK_SIZE_M=blk_m,
+    )
+    max_g_next_pow2 = _next_pow2(G + 1)
+
     _grouped_fp8_persistent_gemm_kernel[(num_sms,)](
         a,
         b,
@@ -568,6 +657,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         a_scale,
         b_scale,
         group_offs,
+        tile_cumsum,
         G,
         N,
         K,
@@ -588,6 +678,7 @@ def grouped_gemm_fp8_tensorwise_triton_kernel(
         EVEN_K=even_k,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        MAX_G_NEXT_POW2=max_g_next_pow2,
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -608,10 +699,14 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     rhs_scale: torch.Tensor,
     group_offs: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
+    m_real: "int | None" = None,
+    n_real: "int | None" = None,
 ) -> torch.Tensor:
     """Variable-K grouped FP8 GEMM (backward, per-tensor scaling) using Triton.
 
-    Computes C[g] = lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]] * lhs_scale * rhs_scale
+    Computes C[g] = beta * C[g] + lhs[offs[g]:offs[g+1]]^T @ rhs[offs[g]:offs[g+1]] * lhs_scale * rhs_scale
     Output: [G, OUT_M, OUT_N].
 
     Args:
@@ -620,10 +715,24 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         lhs_scale: Per-tensor scale for LHS, scalar fp32.
         rhs_scale: Per-tensor scale for RHS, scalar fp32.
         group_offs: [G+1] int64 prefix sum.
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default bfloat16). Ignored when ``out`` is given,
+            since the kernel then writes in whatever dtype ``out`` has.
+        beta: Either ``0.0`` (overwrite, the default) or ``1.0`` (accumulate:
+            ``out += lhs^T @ rhs``); no other value is supported. ``beta=1.0``
+            requires ``out`` and folds the accumulation into the GEMM epilogue,
+            removing the separate elementwise add the caller would otherwise run
+            over the whole output.
+        out: Optional pre-allocated output buffer of shape ``(G, OUT_M, OUT_N)``.
+            When given, the kernel writes (or accumulates, see ``beta``) into it
+            instead of allocating. Strides are read off the tensor, so
+            non-contiguous views are fine.
+        m_real/n_real: N/K-pad tight output widths for the OUT_M (=N) / OUT_N (=K)
+            dims. Operands keep their padded free-dim pitch; only the real block is
+            computed and stored tight. ``None`` (or ==full dim) is a no-op.
 
     Returns:
-        [G, OUT_M, OUT_N] output.
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given),
+        where OUT_M/OUT_N are the real widths when ``m_real``/``n_real`` are set.
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
@@ -631,7 +740,15 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    # Operand pitches stay padded; compute/store only the real (m_real, n_real) block.
+    if m_real is not None:
+        assert 0 < m_real <= OUT_M, f"m_real={m_real} must be in (0, OUT_M={OUT_M}]"
+        OUT_M = m_real
+    if n_real is not None:
+        assert 0 < n_real <= OUT_N, f"n_real={n_real} must be in (0, OUT_N={OUT_N}]"
+        OUT_N = n_real
+
+    out = _resolve_variable_k_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
     num_sms = get_num_cus()
 
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
@@ -666,6 +783,7 @@ def grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
         IS_FP8=True,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -989,8 +1107,13 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER_A: tl.constexpr,
     CACHE_MODIFIER_B: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
-    """Persistent grouped variable-K FP8 GEMM kernel (backward, per-row/per-col vector scaling)."""
+    """Persistent grouped variable-K FP8 GEMM kernel (backward, per-row/per-col vector scaling).
+
+    With ``BETA_IS_ONE=True`` the kernel computes ``C = C + LHS_g^T @ RHS_g``, folding a
+    gradient accumulation into the epilogue instead of leaving it to the caller.
+    """
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -1087,13 +1210,15 @@ def _grouped_fp8_rowwise_variable_k_gemm_kernel(
         lhs_scale = tl.load(LHS_scale_ptr + rm)
         rhs_scale = tl.load(RHS_scale_ptr + rn)
         acc *= lhs_scale[:, None] * rhs_scale[None, :]
-        c = acc.to(C.type.element_ty)
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         # Cast group_idx to int64 to prevent overflow in C group offset
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if BETA_IS_ONE:
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
 
@@ -1105,6 +1230,8 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     rhs_scale: torch.Tensor,
     group_offs: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Variable-K grouped FP8 GEMM (backward, per-row/per-col scaling) using Triton.
 
@@ -1121,10 +1248,13 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
         lhs_scale: (OUT_M,) per-row scale for LHS, fp32.
         rhs_scale: (OUT_N,) per-col scale for RHS, fp32.
         group_offs: [G+1] int64 prefix sum.
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default bfloat16). Ignored when ``out`` is given.
+        beta: ``0.0`` (overwrite) or ``1.0`` (accumulate into ``out``).
+        out: Optional pre-allocated ``(G, OUT_M, OUT_N)`` output buffer. See
+            ``grouped_gemm_fp8_tensorwise_variable_k_triton_kernel``.
 
     Returns:
-        [G, OUT_M, OUT_N] output.
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     assert lhs.shape[0] == rhs.shape[0]
@@ -1132,7 +1262,7 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
     OUT_N = rhs.shape[1]
     G = group_offs.shape[0] - 1
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    out = _resolve_variable_k_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
     num_sms = get_num_cus()
 
     avg_m_g = max(lhs.shape[0] // max(G, 1), 256)
@@ -1166,6 +1296,7 @@ def grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
         CHUNK_SIZE=chunk_size,
         CACHE_MODIFIER_A=cache_a,
         CACHE_MODIFIER_B=cache_b,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=num_stages_val,
         waves_per_eu=0,
@@ -1582,9 +1713,13 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
     NUM_XCDS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     CACHE_MODIFIER: tl.constexpr,
+    BETA_IS_ONE: tl.constexpr = False,
 ):
     """Variable-K BWD: C[g] = LHS_g^T @ RHS_g. M_g is segment-padded to BLOCK_SIZE_K
-    by quant_fp8_blockwise_segment_m_row_col_impl, so no K-loop masking is needed."""
+    by quant_fp8_blockwise_segment_m_row_col_impl, so no K-loop masking is needed.
+
+    With ``BETA_IS_ONE=True`` the kernel computes ``C = C + LHS_g^T @ RHS_g``, folding a
+    gradient accumulation into the epilogue instead of leaving it to the caller."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -1680,12 +1815,14 @@ def _grouped_blockwise_fp8_variable_k_gemm_kernel(
                 RHS_BASE += BLOCK_SIZE_K * stride_rhs_m
 
         # ── Store output ──
-        c = acc.to(C.type.element_ty)
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         rn_s = tl.max_contiguous(tl.multiple_of(rn_s % OUT_N, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_mask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if BETA_IS_ONE:
+            acc += tl.load(C_, mask=c_mask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, c_mask)
 
 
@@ -1846,6 +1983,8 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     b_k_contig: bool = False,
     out_M: int = -1,
     out_N: int = -1,
+    beta: float = 0.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Variable-K grouped block-wise FP8 GEMM (backward, 1D+1D scaling) using Triton.
 
@@ -1869,9 +2008,12 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         b_k_contig: Same for rhs.
         out_M, out_N: Required when *_k_contig=True (cannot infer from transposed
                       shape because it equals OUT_M/N).
+        beta: ``0.0`` (overwrite) or ``1.0`` (accumulate into ``out``).
+        out: Optional pre-allocated ``(G, OUT_M, OUT_N)`` output buffer. See
+            ``grouped_gemm_fp8_tensorwise_variable_k_triton_kernel``.
 
     Returns:
-        [G, OUT_M, OUT_N] output.
+        [G, OUT_M, OUT_N] output (the same tensor as ``out`` when it was given).
     """
     assert lhs.ndim == 2 and rhs.ndim == 2
     G = group_offs.shape[0] - 1
@@ -1885,7 +2027,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     else:
         OUT_N = rhs.shape[1]
 
-    out = torch.empty((G, OUT_M, OUT_N), device=lhs.device, dtype=out_dtype)
+    out = _resolve_variable_k_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
     num_sms = get_num_cus()
 
     # K-axis stride: for K-contig, dim 1 of [OUT_M, M_padded_max] = 1.
@@ -1900,7 +2042,14 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
     # (G, OUT_M, OUT_N, A_K_CONTIGUOUS, B_K_CONTIGUOUS) — group_offs is not part
     # of the key, so prime the cache once with a balanced distribution so the
     # chosen config generalizes across MoE per-step routing variation.
-    warm_key = (G, OUT_M, OUT_N, a_k_contig, b_k_contig)
+    #
+    # The output dtype and BETA_IS_ONE belong in the warm key too. Triton's autotuner
+    # folds tensor dtypes into its own cache key and benchmarks every candidate config
+    # by launching the kernel on the arguments it was given, so a beta=1 launch that
+    # still has to tune would accumulate into the caller's buffer once per benchmark
+    # iteration. Priming on a scratch buffer first keeps the real launch a cache hit.
+    beta_is_one = beta == 1.0
+    warm_key = (G, OUT_M, OUT_N, a_k_contig, b_k_contig, out.dtype, beta_is_one)
     if warm_key not in _grouped_blockwise_vk_warmed:
         _grouped_blockwise_vk_warmed.add(warm_key)
         # Padded segment lens for variable-K need to respect BLOCK_K alignment;
@@ -1909,7 +2058,9 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         per = max((M_padded // G) // 128 * 128, 128)
         bal_offs = torch.arange(G + 1, device=group_offs.device, dtype=group_offs.dtype) * per
         bal_offs[-1] = M_padded
-        out_warm = torch.empty_like(out)
+        # Zeroed, not empty: with beta=1 the kernel reads this buffer back, and
+        # uninitialized NaNs would skew the benchmark.
+        out_warm = torch.zeros_like(out)
         _grouped_blockwise_fp8_variable_k_gemm_kernel[(num_sms,)](
             lhs,
             rhs,
@@ -1936,6 +2087,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
             NUM_SMS=num_sms,
             NUM_XCDS=NUM_XCDS,
             CACHE_MODIFIER=".ca",
+            BETA_IS_ONE=beta_is_one,
             waves_per_eu=2,
             matrix_instr_nonkdim=16,
             kpack=2,
@@ -1967,6 +2119,7 @@ def grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
         NUM_SMS=num_sms,
         NUM_XCDS=NUM_XCDS,
         CACHE_MODIFIER=".ca",
+        BETA_IS_ONE=beta_is_one,
         waves_per_eu=2,
         matrix_instr_nonkdim=16,
         kpack=2,
@@ -2265,7 +2418,10 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
     VEC: tl.constexpr,
     LHS_FMT: tl.constexpr,  # "e4m3"/"e5m2" — independent (HYBRID wgrad is
     RHS_FMT: tl.constexpr,  # e5m2 grad_out x e4m3 activation)
+    BETA_IS_ONE: tl.constexpr = False,
 ):
+    """With ``BETA_IS_ONE=True`` the kernel computes ``C = C + LHS[g] @ RHS[g]^T``,
+    folding a gradient accumulation into the epilogue."""
     pid = tl.program_id(0)
     if NUM_XCDS != 1:
         pid = _chiplet_transform_chunked(pid, NUM_SMS, NUM_XCDS, CHUNK_SIZE)
@@ -2313,7 +2469,8 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
         LS_BASE = LHS_scale + (sk0 + rks[:, None]) * stride_lsk + rm[None, :] * stride_lsm
         RS_BASE = RHS_scale + (sk0 + rks[:, None]) * stride_rsk + rn[None, :] * stride_rsm
 
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc_dtype = tl.float32
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         loop_k = M_g // BLOCK_SIZE_K  # padded → no mask
         for _ in range(loop_k):
             l = tl.load(tl.multiple_of(L_BASE, (1, 16)), cache_modifier=CACHE_MODIFIER)  # (BM, BK)
@@ -2326,20 +2483,37 @@ def _grouped_mxfp8_variable_k_gemm_kernel(
             LS_BASE += (BLOCK_SIZE_K // VEC) * stride_lsk
             RS_BASE += (BLOCK_SIZE_K // VEC) * stride_rsk
 
-        c = acc.to(C.type.element_ty)
         rm_s = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         rn_s = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         cmask = (rm_s[:, None] < OUT_M) & (rn_s[None, :] < OUT_N)
         C_ = C + group_idx.to(tl.int64) * stride_cg + rm_s[:, None] * stride_cm + rn_s[None, :] * stride_cn
+        if BETA_IS_ONE:
+            acc += tl.load(C_, mask=cmask, other=0.0).to(acc_dtype)
+        c = acc.to(C.type.element_ty)
         tl.store(C_, c, cmask)
 
 
 @scoped_amd_knobs
 def grouped_gemm_mxfp8_variable_k_triton_kernel(
-    lhs, lhs_scale, rhs, rhs_scale, go_pad, OUT_M, OUT_N, G, out_dtype=torch.bfloat16, num_cu=None
+    lhs,
+    lhs_scale,
+    rhs,
+    rhs_scale,
+    go_pad,
+    OUT_M,
+    OUT_N,
+    G,
+    out_dtype=torch.bfloat16,
+    num_cu=None,
+    beta: float = 0.0,
+    out=None,
 ):
-    """C[g] (OUT_M,OUT_N) = lhs[:,g] @ rhs[:,g]^T. lhs (OUT_M,M_total), rhs (OUT_N,M_total)."""
-    c = torch.empty((G, OUT_M, OUT_N), dtype=out_dtype, device=lhs.device)
+    """C[g] (OUT_M,OUT_N) = beta * C[g] + lhs[:,g] @ rhs[:,g]^T.
+
+    lhs (OUT_M,M_total), rhs (OUT_N,M_total). ``out`` / ``beta`` behave as in
+    ``grouped_gemm_fp8_tensorwise_variable_k_triton_kernel``.
+    """
+    c = _resolve_variable_k_out(out, beta, (G, OUT_M, OUT_N), lhs.device, out_dtype)
     ls = lhs_scale.view(torch.uint8)
     rs = rhs_scale.view(torch.uint8)
     # Per-operand format (independent) — HYBRID wgrad pairs e5m2 grad_out with
@@ -2389,6 +2563,7 @@ def grouped_gemm_mxfp8_variable_k_triton_kernel(
         VEC=VEC_SIZE,
         LHS_FMT=lhs_fmt,
         RHS_FMT=rhs_fmt,
+        BETA_IS_ONE=(beta == 1.0),
         num_warps=8,
         num_stages=3,
         waves_per_eu=2,

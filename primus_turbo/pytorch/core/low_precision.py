@@ -9,8 +9,16 @@ from enum import Enum, auto
 from typing import NamedTuple, Optional, Tuple
 
 import torch
+from torch._library.opaque_object import register_opaque_type
 
 from primus_turbo.pytorch.core.utils import get_device_compute_capability
+
+try:
+    # torch >= 2.11 requires an opaque type to carry this metaclass; older torch has
+    # neither the module nor the requirement, where `type` changes nothing.
+    from torch._opaque_base import OpaqueBaseMeta as _OpaqueMeta
+except ImportError:  # pragma: no cover - depends on the installed torch
+    _OpaqueMeta = type
 
 __all__ = ["float8_e4m3", "float8_e5m2"]
 
@@ -142,7 +150,7 @@ class ScalingStrategy(Enum):
     # DELAYED_SCALING = auto() # TODO: undetermined
 
 
-class ScalingRecipe(NamedTuple):
+class _ScalingRecipeFields(NamedTuple):
     """
     Supported MXFP8/MXFP4 scaling recipe.
 
@@ -162,13 +170,47 @@ class ScalingRecipe(NamedTuple):
     shuffle_out: bool = False
 
 
-@dataclass
-class Float8QuantConfig:
+class ScalingRecipe(_ScalingRecipeFields, metaclass=_OpaqueMeta):
+    """See :class:`_ScalingRecipeFields` for the fields.
+
+    Split so the metaclass can be attached: ``class X(NamedTuple, metaclass=...)``
+    is a metaclass conflict at class creation.
+    """
+
+    def __fx_repr__(self) -> Tuple[str, dict]:
+        return _quant_config_fx_repr(self)
+
+
+def _quant_config_fx_repr(config) -> Tuple[str, dict]:
+    """An evaluable repr plus its globals, for FX codegen of an opaque argument.
+
+    Required by ``register_opaque_type(typ="value")``: torch.compile bakes the config
+    into the graph as a constant, guarded on ``__eq__``, and regenerates it from this
+    string. Enum fields have no evaluable ``repr``, so they are spelled out by name.
+
+    Takes dataclasses and NamedTuples alike; the latter carry their fields in
+    ``_asdict`` rather than ``__dict__``.
+    """
+    values = config._asdict() if hasattr(config, "_asdict") else config.__dict__
+    fields = ", ".join(
+        f"{name}={type(value).__name__}.{value.name}" if isinstance(value, Enum) else f"{name}={value!r}"
+        for name, value in values.items()
+    )
+    globals_ = {type(config).__name__: type(config)}
+    globals_.update({type(v).__name__: type(v) for v in values.values() if isinstance(v, Enum)})
+    return f"{type(config).__name__}({fields})", globals_
+
+
+@dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
+class Float8QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E4M3
     granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
     scale_dtype: ScaleDtype = ScaleDtype.FP32
     block_size: Optional[int] = None  # Default: not used for tensorwise/rowwise
+
+    def __fx_repr__(self) -> Tuple[str, dict]:
+        return _quant_config_fx_repr(self)
 
     def __post_init__(self):
         if self.granularity == ScalingGranularity.BLOCKWISE:
@@ -185,9 +227,25 @@ class Float8QuantConfig:
                 f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
             )
 
+    def tensorwise_scaling(self) -> bool:
+        return (
+            self.granularity == ScalingGranularity.TENSORWISE
+            and self.strategy == ScalingStrategy.DYNAMIC
+            and self.scale_dtype == ScaleDtype.FP32
+        )
 
-@dataclass
-class Float4QuantConfig:
+    def rowwise_scaling(self) -> bool:
+        return self.granularity == ScalingGranularity.ROWWISE and self.scale_dtype == ScaleDtype.FP32
+
+    def blockwise_scaling(self) -> bool:
+        return self.granularity == ScalingGranularity.BLOCKWISE and self.scale_dtype == ScaleDtype.FP32
+
+    def mxfp8_scaling(self) -> bool:
+        return self.granularity == ScalingGranularity.MX_BLOCKWISE and self.scale_dtype == ScaleDtype.E8M0
+
+
+@dataclass(unsafe_hash=True)  # hashable so it can be an opaque custom-op argument
+class Float4QuantConfig(metaclass=_OpaqueMeta):
     format: Format = Format.E2M1_X2
     granularity: ScalingGranularity = ScalingGranularity.MX_BLOCKWISE
     strategy: ScalingStrategy = ScalingStrategy.DYNAMIC
@@ -195,6 +253,13 @@ class Float4QuantConfig:
     block_size: int = 32
     use_gradient_sr: bool = False
     use_preshuffle: bool = False
+    # E8M0 scale exponent bias: 0=half ULP, 1=one ULP, 2=three-eighths ULP.
+    # Reference: Jianlin Yu et al., "MXAttention", arXiv:2607.24377.
+    # https://arxiv.org/abs/2607.24377
+    scale_rounding_mode: int = 0
+
+    def __fx_repr__(self) -> Tuple[str, dict]:
+        return _quant_config_fx_repr(self)
 
     def __post_init__(self):
         assert self.granularity == ScalingGranularity.MX_BLOCKWISE, (
@@ -206,8 +271,21 @@ class Float4QuantConfig:
             f"block_size should be {mx_support_block_size} when granularity is MX_BLOCKWISE"
         )
         assert self.format == Format.E2M1_X2, "Format must be E2M1_X2 for Float4QuantConfig"
+        assert self.scale_rounding_mode in (0, 1, 2), "scale_rounding_mode must be 0, 1, or 2"
 
         mx_support_scale_dtype = ScaleDtype.E8M0
         assert self.scale_dtype == mx_support_scale_dtype, (
             f"scale_dtype should be {mx_support_scale_dtype} when granularity is MX_BLOCKWISE"
         )
+
+    def mxfp4_scaling(self) -> bool:
+        return self.granularity == ScalingGranularity.MX_BLOCKWISE and self.scale_dtype == ScaleDtype.E8M0
+
+
+# Lets a config travel through a torch.library custom op as a single argument rather
+# than being flattened into scalars. A "value" type is specialized into the compiled
+# graph and guarded on equality, which is what a static recipe wants. Note the schema
+# admits these only as required parameters: neither a default nor an Optional of an
+# opaque type is inferrable.
+for _opaque_cls in (Float8QuantConfig, Float4QuantConfig, ScalingRecipe):
+    register_opaque_type(_opaque_cls, typ="value")

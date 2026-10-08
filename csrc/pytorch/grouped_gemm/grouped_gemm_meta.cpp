@@ -1,6 +1,8 @@
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-//
-// See LICENSE for license information.
+/***************************************************************************************************
+ * Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE for license information.
+ **************************************************************************************************/
 
 #include <torch/extension.h>
 
@@ -14,10 +16,9 @@ namespace primus_turbo::pytorch {
 
 at::Tensor ck_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                 at::Tensor &group_offs, const bool transA, const bool transB,
-                                c10::optional<int64_t>    num_cu,
-                                const bool                /*work_steal*/,
+                                c10::optional<int64_t> num_cu, const bool /*work_steal*/,
                                 c10::optional<at::Tensor> /*ws_counter*/,
-                                int64_t                   /*ws_local_per_xcd*/) {
+                                int64_t /*ws_local_per_xcd*/) {
     // TODO: out-datatype
     const int64_t m = transA ? a.size(1) : a.size(0);
     const int64_t n = transB ? b.size(1) : b.size(2);
@@ -26,11 +27,10 @@ at::Tensor ck_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_
 
 at::Tensor ck_grouped_gemm_variable_k_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
-                                           const bool                transB,
-                                           c10::optional<int64_t>    num_cu,
-                                           const bool                /*work_steal*/,
+                                           const bool transB, c10::optional<int64_t> num_cu,
+                                           const bool /*work_steal*/,
                                            c10::optional<at::Tensor> /*ws_counter*/,
-                                           int64_t                   /*ws_local_per_xcd*/) {
+                                           int64_t /*ws_local_per_xcd*/) {
     const int64_t bs = group_lens.numel();
     const int64_t m  = transA ? a.size(1) : a.size(0);
     const int64_t n  = transB ? b.size(0) : b.size(1);
@@ -66,7 +66,11 @@ at::Tensor ck_grouped_gemm_fp8_variable_k_meta(at::Tensor &a, at::Tensor &b, at:
 //==================================================================
 at::Tensor hipblaslt_grouped_gemm_meta(at::Tensor &a, at::Tensor &b, at::Tensor &group_lens,
                                        at::Tensor &group_offs, const bool transA, const bool transB,
-                                       const bool pre_sync) {
+                                       const bool pre_sync, const double beta,
+                                       c10::optional<at::Tensor> out) {
+    if (out.has_value()) {
+        return out.value();
+    }
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = transA ? a.size(1) : a.size(0);
@@ -83,7 +87,11 @@ at::Tensor hipblaslt_grouped_gemm_fp8_meta(at::Tensor &a, at::Tensor &b, at::Ten
                                            at::Tensor &b_scales, at::Tensor &group_lens,
                                            at::Tensor &group_offs, const bool transA,
                                            const bool transB, at::ScalarType out_dtype,
-                                           const std::string &granularity, const bool pre_sync) {
+                                           const std::string &granularity, const bool pre_sync,
+                                           const double beta, c10::optional<at::Tensor> out) {
+    if (out.has_value()) {
+        return out.value();
+    }
     if (transA) {
         const int64_t bs = group_lens.numel();
         const int64_t m  = a.size(1);

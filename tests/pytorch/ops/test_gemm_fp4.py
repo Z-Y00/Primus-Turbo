@@ -6,6 +6,7 @@
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from primus_turbo.pytorch.core.backend import BackendType, GlobalBackendManager
 from primus_turbo.pytorch.core.low_precision import (
@@ -14,48 +15,72 @@ from primus_turbo.pytorch.core.low_precision import (
     ScaleDtype,
     ScalingGranularity,
     ScalingRecipe,
+    float4_e2m1fn_x2,
 )
 from primus_turbo.pytorch.core.quantized_tensor import (
     QuantizedTensor,
     QuantizedTensorPair,
 )
 from primus_turbo.pytorch.ops.gemm_fp4 import FP4GemmMXFunction, gemm_fp4
+from tests.pytorch.ops.gemm_shapes_helper import GEMM_MX_SHAPES, GEMM_MX_SHAPES_SMALL
 from tests.pytorch.test_utils import compute_snr
 
 torch.manual_seed(42)
 
 
-@pytest.mark.parametrize("m", [256, 512, 1024])
-@pytest.mark.parametrize("n", [256, 352, 1024, 2048])
-@pytest.mark.parametrize("k", [128, 160, 512, 1024])
+def test_gemm_fp4_dense_quant_tail_regression():
+    """Eligible dense shapes must not feed unwritten FlyDSL quant rows to GEMM."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if (props.major, props.minor) != (9, 5):
+        pytest.skip("FlyDSL MXFP4 GEMM requires gfx950")
+
+    torch.manual_seed(20260908)
+    a = torch.randn((128, 256), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
+    reference = a @ b.T
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_preshuffle=False,
+    )
+
+    GlobalBackendManager.set_gemm_backend(BackendType.FLYDSL)
+    GlobalBackendManager.set_auto_tune(False)
+    try:
+        actual = gemm_fp4(a, b, trans_a=False, trans_b=True, out_dtype=torch.bfloat16, config=config)
+        torch.cuda.synchronize()
+    finally:
+        GlobalBackendManager.reset()
+
+    assert torch.isfinite(actual).all()
+    assert compute_snr(reference, actual) > 10
+
+
+# (backend, dtype, preshuffle): AITER is bf16-only and the only backend with preshuffle.
+MX_BACKEND_CONFIGS = [
+    (BackendType.AITER, torch.bfloat16, False),
+    (BackendType.AITER, torch.bfloat16, True),
+    (BackendType.FLYDSL, torch.bfloat16, False),
+    (BackendType.FLYDSL, torch.float16, False),
+]
+
+
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES)
 @pytest.mark.parametrize("layout", ["NT"])
-@pytest.mark.parametrize(
-    "format",
-    [
-        Format.E2M1_X2,
-    ],
-)
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.bfloat16,
-        torch.float16,
-    ],
-)
+@pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("granularity", [ScalingGranularity.MX_BLOCKWISE])
-@pytest.mark.parametrize("backend", [BackendType.AITER])
-@pytest.mark.parametrize("auto_tune", [False, True])
-@pytest.mark.parametrize("preshuffle", [False, True])
-def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, backend, auto_tune, preshuffle):
-    if backend != BackendType.AITER and preshuffle:
-        pytest.skip("Preshuffle is only supported for AITER backend")
-
-    if backend == BackendType.AITER and dtype != torch.bfloat16:
-        pytest.skip("AITER backend only supports bfloat16 dtype")
-
-    # Skip redundant test: auto_tune is ignored when backend is explicitly specified
-    if backend is not None and auto_tune:
-        pytest.skip("auto_tune is ignored when backend is explicitly specified")
+@pytest.mark.parametrize("backend, dtype, preshuffle", MX_BACKEND_CONFIGS)
+def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, granularity, backend, dtype, preshuffle):
+    if backend == BackendType.FLYDSL:
+        if not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+            pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
     from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
 
@@ -64,13 +89,13 @@ def test_gemm_fp4_mx_blockwise(m, n, k, layout, format, dtype, granularity, back
     if not mxfp4_supported:
         pytest.skip(reason)
 
-    # Set backend and auto_tune config
+    # Set backend config
     GlobalBackendManager.set_gemm_backend(backend)
-    GlobalBackendManager.set_auto_tune(auto_tune)
+    GlobalBackendManager.set_auto_tune(False)
 
     print(
         f"\nM={m}, N={n}, K={k}, layout={layout}, dtype={dtype}, format={format}, "
-        f"backend={backend}, auto_tune={auto_tune}, preshuffle={preshuffle}"
+        f"backend={backend}, preshuffle={preshuffle}"
     )
 
     device = "cuda:0"
@@ -253,26 +278,21 @@ def _run_gemm_fp4_mx_quantized_tensor_test(
     GlobalBackendManager.reset()
 
 
-@pytest.mark.parametrize("m", [256, 1024])
-@pytest.mark.parametrize("n", [256, 1024])
-@pytest.mark.parametrize("k", [128, 512])
+@pytest.mark.parametrize("m, n, k", GEMM_MX_SHAPES_SMALL)
 @pytest.mark.parametrize("layout", ["NT"])
 @pytest.mark.parametrize("format", [Format.E2M1_X2])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT])
-@pytest.mark.parametrize("preshuffle", [False, True])
-def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend, preshuffle):
+@pytest.mark.parametrize("backend", [None, BackendType.HIPBLASLT, BackendType.FLYDSL])
+def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, backend):
     """MX_BLOCKWISE gemm_fp4 with pre-quantized QuantizedTensor inputs.
 
-    HipBLASLt / default-dispatch coverage. AITER QT coverage is in
+    HipBLASLt / default-dispatch / FlyDSL coverage. AITER QT coverage is in
     :func:`test_gemm_fp4_mx_blockwise_quantized_tensor_aiter_preshuffled`
     below because AITER lacks tuned GEMM configs for these small shapes
     (default config produces near-zero SNR).
     """
-    if backend != BackendType.AITER and preshuffle:
-        pytest.skip("Preshuffle is only supported for AITER backend")
-    if backend == BackendType.AITER and dtype != torch.bfloat16:
-        pytest.skip("AITER backend only supports bfloat16 dtype")
+    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
 
     _run_gemm_fp4_mx_quantized_tensor_test(
         m=m,
@@ -282,8 +302,87 @@ def test_gemm_fp4_mx_blockwise_quantized_tensor(m, n, k, layout, format, dtype, 
         format=format,
         dtype=dtype,
         backend=backend,
-        preshuffle=preshuffle,
+        preshuffle=False,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", [None, BackendType.FLYDSL])
+def test_gemm_fp4_mx_fused_grad_accum(dtype, backend):
+    """``fuse_bgrad_accum_pattern`` must leave ``main_grad`` holding previous + wgrad.
+
+    FlyDSL is the only FP4 backend with the accumulate epilogue and its store is 16-bit,
+    so ``main_grad`` is allocated in the weight's own dtype rather than Megatron's fp32.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    device = "cuda:0"
+    m, n, k = 256, 512, 256  # FlyDSL MXFP4 needs M/N/K all multiples of 256
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+        use_gradient_sr=False,  # the two runs must quantize grad_out identically
+    )
+
+    a = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    b = torch.randn((n, k), dtype=dtype, device=device, requires_grad=True)
+    grad_out = torch.randn((m, n), dtype=dtype, device=device)
+    a_fused = a.detach().clone().requires_grad_(True)
+    b_fused = b.detach().clone().requires_grad_(True)
+    torch.cuda.synchronize()
+
+    # Baseline: ordinary autograd, b.grad holds the weight gradient.
+    out = gemm_fp4(a, b, trans_b=True, out_dtype=dtype, config=config)
+    out.backward(grad_out)
+    torch.cuda.synchronize()
+
+    # Fused: the wgrad is accumulated into a pre-seeded main_grad buffer.
+    previous = torch.randn(b_fused.shape, dtype=dtype, device=device)
+    b_fused.main_grad = previous.clone()
+    b_fused.grad_added_to_main_grad = False
+
+    out_fused = gemm_fp4(
+        a_fused,
+        b_fused,
+        trans_b=True,
+        out_dtype=dtype,
+        config=config,
+        fuse_bgrad_accum_pattern="megatron",
+    )
+    out_fused.backward(grad_out)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_fused, out)
+    assert b_fused.grad_added_to_main_grad is True, "weight must be flagged during forward"
+    assert b_fused.grad.shape == b_fused.shape, "dummy wgrad must keep the weight's shape"
+    assert b_fused.grad.dtype == b_fused.dtype, "dummy wgrad must keep the weight's dtype"
+
+    snr_threshold = 10
+
+    a_grad_snr = compute_snr(a.grad, a_fused.grad)
+    print(f"AGrad-SNR: {a_grad_snr:.2f} dB")
+    assert a_grad_snr > snr_threshold, "a_grad_snr too low"
+
+    accumulated = b_fused.main_grad.float() - previous.float()
+    b_grad_snr = compute_snr(b.grad.float(), accumulated)
+    print(f"BGrad-SNR: {b_grad_snr:.2f} dB")
+    assert b_grad_snr > snr_threshold, "b_grad_snr too low"
+
+    GlobalBackendManager.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -392,6 +491,101 @@ def test_gemm_fp4_mx_blockwise_torch_compile_backward(m, n, k, dtype):
     assert compute_snr(b_ref.grad, b.grad) > snr_threshold, "compiled b_grad_snr too low"
 
     GlobalBackendManager.reset()
+
+
+# ----------------------------------------------------------------------------
+# Determinism suite (run with --deterministic-only): bit-exact across repeats.
+# ----------------------------------------------------------------------------
+_DET_GEMM_FP4_MNK = [(256, 256, 256), (512, 512, 256), (1024, 1024, 512)]
+# AITER is bf16-only.
+_DET_GEMM_FP4_BACKEND_DTYPES = [
+    pytest.param(BackendType.AITER, torch.bfloat16, id="AITER-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.bfloat16, id="HIPBLASLT-bf16"),
+    pytest.param(BackendType.HIPBLASLT, torch.float16, id="HIPBLASLT-fp16"),
+    pytest.param(BackendType.FLYDSL, torch.bfloat16, id="FLYDSL-bf16"),
+    pytest.param(BackendType.FLYDSL, torch.float16, id="FLYDSL-fp16"),
+]
+
+
+@pytest.mark.parametrize("mnk", _DET_GEMM_FP4_MNK)
+@pytest.mark.parametrize("backend, dtype", _DET_GEMM_FP4_BACKEND_DTYPES)
+@pytest.mark.deterministic
+def test_gemm_fp4_deterministic(mnk, backend, dtype):
+    """Dense MXFP4 GEMM fwd + bwd are bit-exact across 3 repeats (SR off), and
+    match a high-precision reference (SNR)."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    supported, reason = check_mxfp4_support()
+    if not supported:
+        pytest.skip(reason)
+
+    m, n, k = mnk
+    if backend == BackendType.FLYDSL and not (m % 64 == 0 and n % 64 == 0 and k % 64 == 0):
+        pytest.skip("FlyDSL MXFP4 backend requires M/N/K all multiples of 64")
+
+    GlobalBackendManager.set_gemm_backend(backend)
+    GlobalBackendManager.set_auto_tune(False)
+
+    device = "cuda:0"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    # NT layout (a: [m, k], b: [n, k]) -- the production FP4 GEMM usage.
+    trans_a, trans_b = False, True
+    config = Float4QuantConfig(
+        granularity=ScalingGranularity.MX_BLOCKWISE,
+        format=Format.E2M1_X2,
+        block_size=32,
+        scale_dtype=ScaleDtype.E8M0,
+    )
+    print(f"\n[deterministic] M={m}, N={n}, K={k}, dtype={dtype}, backend={backend}")
+
+    a0 = torch.randn((m, k), dtype=dtype, device=device)
+    b0 = torch.randn((n, k), dtype=dtype, device=device)
+    a0 = a0 / a0.abs().max()
+    b0 = b0 / b0.abs().max()
+
+    # Reference (high precision)
+    a_ref = a0.detach().clone().requires_grad_()
+    b_ref = b0.detach().clone().requires_grad_()
+    c_ref = a_ref @ b_ref.T
+    grad_c = torch.randn_like(c_ref)
+    c_ref.backward(grad_c)
+    torch.cuda.synchronize()
+
+    def _run_once():
+        # Clean memory each iter so the caching allocator can't alias a buffer
+        # still being written by a pending op from a prior case.
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        a = a0.detach().clone().requires_grad_()
+        b = b0.detach().clone().requires_grad_()
+        c = gemm_fp4(a, b, trans_a, trans_b, dtype, config)
+        c.backward(grad_c)
+        return c.detach(), a.grad.detach(), b.grad.detach()
+
+    try:
+        repeats = 3
+        outs = []
+        for _ in range(repeats):
+            outs.append(_run_once())
+            torch.cuda.synchronize()
+
+        c0, da0, db0 = outs[0]
+        # Determinism (bitwise identical across runs)
+        for i in range(1, repeats):
+            ci, dai, dbi = outs[i]
+            torch.testing.assert_close(c0, ci, rtol=0, atol=0)
+            torch.testing.assert_close(da0, dai, rtol=0, atol=0)
+            torch.testing.assert_close(db0, dbi, rtol=0, atol=0)
+
+        # Correctness (close to reference)
+        snr_threshold = 10
+        assert compute_snr(c_ref.detach(), c0) > snr_threshold, "c_snr too low"
+        assert compute_snr(a_ref.grad.detach(), da0) > snr_threshold, "a_grad_snr too low"
+        assert compute_snr(b_ref.grad.detach(), db0) > snr_threshold, "b_grad_snr too low"
+    finally:
+        GlobalBackendManager.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -522,3 +716,179 @@ def test_gemm_fp4_impl_aiter_preshuffle_parity(m, n, k):
         )
     finally:
         GlobalBackendManager.reset()
+
+
+# (M, K, I): the smallest that clear dense_glu_epi_quant_supported (M % 256, I % 64,
+# K // 256 >= 4) and the FlyDSL GEMM's 64-multiple requirement.
+_MLP_MKI = (512, 1024, 1024)
+# Llama-3.1-8B's own MLP, one case: it is far more work than the small one.
+_MLP_MKI_LLAMA = (8192, 4096, 14336)
+
+_MLP_GATES = {"silu": F.silu, "gelu": lambda t: F.gelu(t, approximate="tanh")}
+# Sized against these leaves rather than borrowed: a limit small enough to saturate
+# most of l1 leaves dx with no signal, and the test then measures nothing.
+_MLP_CLAMP_LIMIT = 1.0
+_MLP_SNR_THRESHOLD = 6.0
+# The clamp's dead band costs the gradients a little.
+_MLP_CLAMP_SNR_THRESHOLD = 7.0
+
+
+def _mlp_fp4_leaves(dtype, seed=42, mki=None):
+    m, k, i = mki or _MLP_MKI
+    torch.manual_seed(seed)
+    device = "cuda:0"
+    x = torch.randn((m, k), dtype=dtype, device=device, requires_grad=True)
+    w1 = (torch.randn((2 * i, k), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    w2 = (torch.randn((k, i), dtype=dtype, device=device) * 0.02).requires_grad_(True)
+    grad_out = torch.randn((m, k), dtype=dtype, device=device) * 0.1
+    return x, w1, w2, grad_out
+
+
+def _mlp_fp4_run(dtype, prequantize_x=False, activation="silu", clamp_limit=None, mki=None):
+    from primus_turbo.pytorch.core.quantized_tensor import (
+        QuantizedTensor,
+        QuantizedTensorPair,
+    )
+    from primus_turbo.pytorch.ops import mlp_fp4
+
+    x, w1, w2, grad_out = _mlp_fp4_leaves(dtype, mki=mki)
+    x_in = x
+    if prequantize_x:
+        # data is the row-wise operand, data_t the col-wise (RHT) wgrad one.
+        from primus_turbo.pytorch.ops.quantization import quantize_fp4_with_trans
+
+        row_recipe, col_recipe = ScalingRecipe(), ScalingRecipe(use_rht=True)
+        row, row_scale, col, col_scale = quantize_fp4_with_trans(
+            x.detach(),
+            float4_e2m1fn_x2,
+            ScalingGranularity.MX_BLOCKWISE,
+            block_size=32,
+            scaling_recipe=row_recipe,
+            scaling_recipe_for_trans=col_recipe,
+        )
+
+        def _wrap(data, scale_inv, shape, recipe, axis):
+            return QuantizedTensor(
+                data,
+                scale_inv,
+                shape=shape,
+                orig_dtype=x.dtype,
+                dest_dtype=float4_e2m1fn_x2,
+                granularity=ScalingGranularity.MX_BLOCKWISE,
+                block_size=32,
+                scaling_recipe=recipe,
+                quantized_axis=axis,
+            )
+
+        m, k, _ = mki or _MLP_MKI
+        x_in = QuantizedTensorPair(
+            _wrap(row, row_scale, torch.Size((m, k)), row_recipe, -1),
+            _wrap(col, col_scale, torch.Size((k, m)), col_recipe, -2),
+        )
+    out = mlp_fp4(x_in, w1, w2, activation=activation, clamp_limit=clamp_limit)
+    out.backward(grad_out)
+    return out.detach(), (None if prequantize_x else x.grad), w1.grad, w2.grad
+
+
+def _mlp_fp4_reference(dtype, activation="silu", clamp_limit=None, mki=None):
+    i = (mki or _MLP_MKI)[2]
+    x, w1, w2, grad_out = _mlp_fp4_leaves(dtype, mki=mki)
+    l1 = x.float() @ w1.float().t()
+    gate, up = l1[:, :i], l1[:, i:]
+    if clamp_limit is not None:
+        # The gate saturates from above only; the linear half from both sides.
+        gate = gate.clamp(max=clamp_limit)
+        up = up.clamp(min=-clamp_limit, max=clamp_limit)
+    act = _MLP_GATES[activation](gate) * up
+    out = act @ w2.float().t()
+    out.backward(grad_out.float())
+    return out.detach(), x.grad, w1.grad, w2.grad
+
+
+_MLP_FP4_TENSORS = ("out", "dx", "dw1", "dw2")
+
+
+@pytest.mark.parametrize(
+    "mki, activation, clamp_limit",
+    [
+        (_MLP_MKI, "silu", None),
+        (_MLP_MKI, "gelu", None),
+        (_MLP_MKI, "silu", _MLP_CLAMP_LIMIT),
+        (_MLP_MKI, "gelu", _MLP_CLAMP_LIMIT),
+        pytest.param(_MLP_MKI_LLAMA, "silu", None, id="llama3.1-8b"),
+    ],
+)
+def test_mlp_fp4_mx_blockwise(mki, activation, clamp_limit):
+    """``mlp_fp4`` end to end against an eager fp32 reference.
+
+    The floor is low for the same reason the grouped MLP's is: MXFP4 carries ~2 mantissa
+    bits and this stacks four quantizations plus the wgrad operands' RHT, so it catches a
+    wrong answer rather than the quantization.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    floor = _MLP_SNR_THRESHOLD if clamp_limit is None else _MLP_CLAMP_SNR_THRESHOLD
+    ref = _mlp_fp4_reference(torch.bfloat16, activation, clamp_limit, mki)
+    got = _mlp_fp4_run(torch.bfloat16, activation=activation, clamp_limit=clamp_limit, mki=mki)
+    for name, r, g in zip(_MLP_FP4_TENSORS, ref, got):
+        snr = compute_snr(r.float(), g.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > floor, f"{name} snr too low"
+
+
+def test_mlp_fp4_accepts_a_prequantized_x():
+    """A caller that already has x quantized must get the same numbers.
+
+    This is the only way to hand the op a pre-quantized activation, so it is also
+    what the fused RMSNorm entry point feeds it.
+    """
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    plain = _mlp_fp4_run(torch.bfloat16)
+    pre = _mlp_fp4_run(torch.bfloat16, prequantize_x=True)
+    for name, a, b in zip(_MLP_FP4_TENSORS, plain, pre):
+        if a is None or b is None:  # dx: a QuantizedTensor x is not a leaf
+            continue
+        snr = compute_snr(a.float(), b.float())
+        print(f"{name}-SNR: {snr:.2f} dB")
+        assert snr > 100, f"{name} must be reproduced, got {snr:.2f} dB"
+
+
+def test_rmsnorm_residual_fp4_feeds_mlp_fp4():
+    """The fused norm's pair feeds the MLP directly and still carries the gradient."""
+    from primus_turbo.pytorch.core.low_precision import check_mxfp4_support
+    from primus_turbo.pytorch.ops import mlp_fp4
+    from primus_turbo.pytorch.ops.normalization import rmsnorm_residual_fp4
+
+    mxfp4_supported, reason = check_mxfp4_support()
+    if not mxfp4_supported:
+        pytest.skip(reason)
+
+    m, k, i = _MLP_MKI
+    torch.manual_seed(42)
+    device = "cuda:0"
+    x = torch.randn((m, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    residual = torch.randn((m, k), dtype=torch.bfloat16, device=device, requires_grad=True)
+    gamma = torch.randn((k,), dtype=torch.bfloat16, device=device, requires_grad=True)
+    w1 = (torch.randn((2 * i, k), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
+    w2 = (torch.randn((k, i), dtype=torch.bfloat16, device=device) * 0.02).requires_grad_(True)
+
+    y, x_plus_r, y_fp4 = rmsnorm_residual_fp4(x, residual, gamma)
+    out = mlp_fp4(y_fp4, w1, w2)
+    out.backward(torch.randn_like(out) * 0.1)
+
+    assert out.shape == (m, k)
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(y).all() and torch.isfinite(x_plus_r).all()
+    # The pair is a straight-through estimator for y, so the dgrad has to land here.
+    for name, t in (("x", x), ("residual", residual), ("gamma", gamma)):
+        assert t.grad is not None, f"{name} got no gradient through the quantized pair"
+        assert torch.isfinite(t.grad).all(), f"{name} gradient is not finite"

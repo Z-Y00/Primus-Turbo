@@ -7,6 +7,7 @@
 import torch
 
 from primus_turbo.pytorch.core.backend import (
+    BackendChoice,
     BackendEntry,
     BackendType,
     GlobalBackendManager,
@@ -15,11 +16,19 @@ from primus_turbo.pytorch.core.backend import (
     TuneCache,
 )
 from primus_turbo.pytorch.core.low_precision import (
+    MXFP8_BLOCK_SIZE,
+    Float8QuantConfig,
     ScalingGranularity,
+    ScalingRecipe,
     float8_e4m3,
     float8_e5m2,
 )
-from primus_turbo.pytorch.core.utils import get_device_compute_capability
+from primus_turbo.pytorch.core.utils import (
+    build_ck,
+    is_gfx942,
+    is_gfx950,
+    is_gfx1250,
+)
 from primus_turbo.pytorch.kernels.grouped_gemm.grouped_gemm_utils import (
     BaseGroupedGEMMKernelDispatcher,
     BaseGroupedGEMMVariableKKernelDispatcher,
@@ -34,7 +43,7 @@ from primus_turbo.triton.grouped_gemm.grouped_gemm_fp8_kernel import (
     grouped_gemm_mxfp8_triton_kernel,
     grouped_gemm_mxfp8_variable_k_triton_kernel,
 )
-from primus_turbo.triton.grouped_gemm.grouped_gemm_kernel import (
+from primus_turbo.triton.grouped_gemm.grouped_gemm_helper import (
     grouped_gemm_output_tail_kernel,
 )
 
@@ -79,10 +88,18 @@ class GroupedGEMMFP8CKBackend(KernelBackend):
         **kwargs,
     ) -> bool:
         supported = True
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 3
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8CKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8CKBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        # Writes the full operand pitch, so it can't shrink to a tight output; decline only when asked.
+        n_real = kwargs.get("n_real", None)
+        if n_real is not None:
+            n_operand = b.shape[-2] if trans_b else b.shape[-1]
+            supported &= n_real == n_operand
         return supported
 
     @staticmethod
@@ -138,9 +155,23 @@ class GroupedGEMMFP8VariableKCKBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
+        # This backend has no beta=1 accumulate epilogue.
+        supported &= not inplace_add_to_out
+        mr = kwargs.get("m_real", None)
+        nr = kwargs.get("n_real", None)
+        if mr is not None or nr is not None:
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            if trans_c:
+                m, n = n, m
+            supported &= (mr is None or mr == m) and (nr is None or nr == n)
+        # check the CK backend was compiled into this build
+        supported &= build_ck()
+        supported &= not is_gfx1250()
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKCKBackend.SUPPORTED_GRANULARITIES
@@ -213,6 +244,10 @@ class GroupedGEMMFP8HipblasltBackend(KernelBackend):
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8HipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8HipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
+        n_real = kwargs.get("n_real", None)
+        if n_real is not None:
+            n_operand = b.shape[-2] if trans_b else b.shape[-1]
+            supported &= n_real == n_operand
         return supported
 
     @staticmethod
@@ -267,13 +302,32 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
+        mr = kwargs.get("m_real", None)
+        nr = kwargs.get("n_real", None)
+        if mr is not None or nr is not None:
+            m = a.shape[1] if trans_a else a.shape[0]
+            n = b.shape[-2] if trans_b else b.shape[-1]
+            if trans_c:
+                m, n = n, m
+            supported &= (mr is None or mr == m) and (nr is None or nr == n)
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKHipblasltBackend.SUPPORTED_GRANULARITIES
         supported &= trans_a and not trans_b
+
+        if inplace_add_to_out:
+            supported &= out is not None and out.is_contiguous()
+            supported &= out is not None and out.dtype in (
+                torch.float32,
+                torch.bfloat16,
+                torch.float16,
+            )
+
         return supported
 
     @staticmethod
@@ -291,6 +345,8 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
         granularity: ScalingGranularity,
         num_cu: int | None,
         maybe_pre_sync: bool = False,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         if trans_c:
@@ -301,6 +357,7 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
             trans_lhs, trans_rhs = trans_a, trans_b
+        beta = 1.0 if inplace_add_to_out else 0.0
         return torch.ops.primus_turbo_cpp_extension.hipblaslt_grouped_gemm_fp8(
             lhs,
             rhs,
@@ -313,6 +370,8 @@ class GroupedGEMMFP8VariableKHipblasltBackend(KernelBackend):
             out_dtype,
             granularity.name,
             maybe_pre_sync,
+            beta,
+            out,
         )
 
 
@@ -358,6 +417,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
         else:
             # MXFP8: both operands must be fp8 (e4m3/e5m2) — the kernel infers the
             # format from a.dtype — and the layout is NT only (trans_b=True).
+            supported &= not is_gfx942()
             supported &= a.dtype in (float8_e4m3, float8_e5m2)
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
@@ -426,6 +486,7 @@ class GroupedGEMMFP8TritonBackend(KernelBackend):
             group_offs,
             trans_b=trans_b,
             out_dtype=out_dtype,
+            n_real=kwargs.get("n_real", None),
         )
 
 
@@ -462,7 +523,7 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         supported &= granularity in GroupedGEMMFP8FlyDSLBackend.SUPPORTED_GRANULARITIES
         supported &= not trans_a
         # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # NT only; per-1x32 raw E8M0 scales; K % 128 == 0 and K >= 256.
@@ -490,12 +551,12 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
         num_cu: int | None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
             grouped_gemm_fp8_tensorwise_flydsl_kernel,
         )
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
                 grouped_gemm_mxfp8_flydsl_kernel,
             )
 
@@ -516,7 +577,15 @@ class GroupedGEMMFP8FlyDSLBackend(KernelBackend):
             )
 
         return grouped_gemm_fp8_tensorwise_flydsl_kernel(
-            a, b, a_scales, b_scales, group_offs, trans_b=trans_b, out_dtype=out_dtype, num_cu=num_cu
+            a,
+            b,
+            a_scales,
+            b_scales,
+            group_offs,
+            trans_b=trans_b,
+            out_dtype=out_dtype,
+            num_cu=num_cu,
+            n_real=kwargs.get("n_real", None),
         )
 
 
@@ -585,11 +654,17 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
         **kwargs,
     ) -> bool:
         supported = True
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= granularity in GroupedGEMMFP8VariableKTritonBackend.SUPPORTED_GRANULARITIES
+        if inplace_add_to_out:
+            supported &= granularity in (
+                ScalingGranularity.TENSORWISE,
+                ScalingGranularity.MX_BLOCKWISE,
+            )
         if granularity != ScalingGranularity.MX_BLOCKWISE:
             supported &= (
                 a.dtype,
@@ -600,6 +675,7 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         else:
             # MXFP8 variable-K wgrad: both operands fp8 (e4m3/e5m2), and the kernel
             # expects the non-transposed (OUT_M, M_total) / (OUT_N, M_total) layout.
+            supported &= not is_gfx942()
             supported &= a.dtype in (float8_e4m3, float8_e5m2)
             supported &= b.dtype in (float8_e4m3, float8_e5m2)
             supported &= out_dtype in (torch.float16, torch.bfloat16)
@@ -620,6 +696,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
         if trans_c:
@@ -628,6 +706,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
         else:
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
+
+        beta = 1.0 if inplace_add_to_out else 0.0
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # wgrad: C[g](OUT_M,OUT_N) = lhs[:,g](OUT_M,M_g) @ rhs[:,g](OUT_N,M_g)^T
@@ -647,6 +727,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                out=out,
+                beta=beta,
             )
         if granularity == ScalingGranularity.BLOCKWISE:
             return grouped_gemm_fp8_blockwise_variable_k_triton_kernel(
@@ -656,6 +738,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         elif granularity == ScalingGranularity.ROWWISE:
             return grouped_gemm_fp8_rowwise_variable_k_triton_kernel(
@@ -665,6 +749,8 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
                 rhs_scales,
                 group_offs,
                 out_dtype=out_dtype,
+                out=out,
+                beta=beta,
             )
         return grouped_gemm_fp8_tensorwise_variable_k_triton_kernel(
             lhs,
@@ -673,6 +759,10 @@ class GroupedGEMMFP8VariableKTritonBackend(KernelBackend):
             rhs_scales,
             group_offs,
             out_dtype=out_dtype,
+            out=out,
+            beta=beta,
+            m_real=kwargs.get("m_real", None),
+            n_real=kwargs.get("n_real", None),
         )
 
 
@@ -702,14 +792,23 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ) -> bool:
         supported = True
+        if inplace_add_to_out:
+            _out_allowed = (
+                (torch.bfloat16, torch.float16)
+                if granularity == ScalingGranularity.MX_BLOCKWISE
+                else (torch.bfloat16, torch.float16, torch.float32)
+            )
+            supported &= out is not None and out.dtype in _out_allowed
         supported &= a.dim() == 2 and b.dim() == 2
         supported &= (a.dtype, b.dtype, out_dtype) in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_DTYPES
         supported &= granularity in GroupedGEMMFP8VariableKFlyDSLBackend.SUPPORTED_GRANULARITIES
         # gfx950 (CDNA4) only: kernel uses mfma[_scale]_f32_16x16x128_f8f6f4.
-        supported &= get_device_compute_capability() >= (9, 5)
+        supported &= is_gfx950()
 
         if granularity == ScalingGranularity.MX_BLOCKWISE:
             # MXFP8 wgrad: non-transposed operands (TN), contraction M_total % 128 == 0.
@@ -736,9 +835,11 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
         out_dtype: torch.dtype,
         granularity: ScalingGranularity,
         num_cu: int | None,
+        inplace_add_to_out: bool = False,
+        out: torch.Tensor | None = None,
         **kwargs,
     ):
-        from primus_turbo.flydsl.grouped_gemm.gemm_fp8_grouped_kernel import (
+        from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_kernel import (
             grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel,
         )
 
@@ -750,8 +851,16 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
             lhs, rhs = a, b
             lhs_scales, rhs_scales = a_scales, b_scales
 
+        beta = 1.0 if inplace_add_to_out else 0.0
+        accum_out = out if inplace_add_to_out else None
+
+        # m_real/n_real shrink the C extents from the padded operand pitch to the tight output.
+        m_real = kwargs.get("m_real", None)
+        n_real = kwargs.get("n_real", None)
+        c_tight = m_real is not None or n_real is not None
+
         if granularity == ScalingGranularity.MX_BLOCKWISE:
-            from primus_turbo.flydsl.grouped_gemm.mxfp8_grouped_kernel import (
+            from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_kernel import (
                 grouped_gemm_mxfp8_variable_k_flydsl_kernel,
             )
 
@@ -769,10 +878,24 @@ class GroupedGEMMFP8VariableKFlyDSLBackend(KernelBackend):
                 G,
                 out_dtype=out_dtype,
                 num_cu=num_cu,
+                beta=beta,
+                out=accum_out,
             )
 
+        store_dtype = accum_out.dtype if accum_out is not None else out_dtype
         return grouped_gemm_fp8_variable_k_tensorwise_flydsl_kernel(
-            lhs, rhs, lhs_scales, rhs_scales, group_offs, out_dtype=out_dtype, num_cu=num_cu
+            lhs,
+            rhs,
+            lhs_scales,
+            rhs_scales,
+            group_offs,
+            out_dtype=store_dtype,
+            num_cu=num_cu,
+            beta=beta,
+            out=accum_out,
+            m_real=m_real,
+            n_real=n_real,
+            c_tight=c_tight,
         )
 
 
@@ -830,9 +953,10 @@ def grouped_gemm_fp8_impl(
     default_backend: int,
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
+    n_real: int | None = None,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -849,9 +973,10 @@ def grouped_gemm_fp8_impl(
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
         group_offs_out=group_offs_out,
+        n_real=n_real,
     )
 
-    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    out = GroupedGEMMFP8KernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
     # Over-allocated output: zero the unwritten tail past the tight write bound
     # (group_offs_out for MX; group_offs otherwise) so the caller's [:total_m]
     # slice never exposes uninitialized rows.
@@ -877,9 +1002,11 @@ def grouped_gemm_fp8_variable_k_impl(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    m_real: int | None = None,
+    n_real: int | None = None,
 ) -> torch.Tensor:
-    default_backend_enum = BackendType(default_backend)
-    user_backend_enum = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
     granularity_enum = ScalingGranularity(granularity)
 
     kwargs = dict(
@@ -896,9 +1023,99 @@ def grouped_gemm_fp8_variable_k_impl(
         granularity=granularity_enum,
         num_cu=num_cu,
         maybe_pre_sync=maybe_pre_sync,
+        m_real=m_real,
+        n_real=n_real,
     )
 
-    return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_enum, user_backend_enum, **kwargs)
+    return GroupedGEMMFP8VariableKKernelDispatcher.dispatch(
+        default_backend_choice, user_backend_choice, **kwargs
+    )
+
+
+@_torch_custom_op_wrapper(
+    "primus_turbo::grouped_gemm_fp8_variable_k_accum_impl", mutates_args={"out"}, device_types="cuda"
+)
+def grouped_gemm_fp8_variable_k_accum_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    m_real: int | None = None,
+    n_real: int | None = None,
+) -> None:
+    """Variable-K grouped FP8 GEMM that accumulates into ``out`` instead of returning.
+
+    Computes ``out += A^T @ B`` per group, folding the accumulation into the GEMM
+    epilogue (beta=1)
+    """
+    default_backend_choice = BackendChoice(backend=BackendType(default_backend))
+    user_backend_choice = GlobalBackendManager.get_grouped_gemm_backend(PrecisionType.FP8)
+    granularity_enum = ScalingGranularity(granularity)
+
+    kwargs = dict(
+        a=a,
+        b=b,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        group_lens=group_lens,
+        group_offs=group_offs,
+        trans_a=trans_a,
+        trans_b=trans_b,
+        trans_c=trans_c,
+        out_dtype=out_dtype,
+        granularity=granularity_enum,
+        num_cu=num_cu,
+        maybe_pre_sync=maybe_pre_sync,
+        inplace_add_to_out=True,
+        out=out,
+        m_real=m_real,
+        n_real=n_real,
+    )
+
+    if (
+        GlobalBackendManager.auto_tune_enabled()
+        and not GroupedGEMMFP8VariableKKernelDispatcher._is_graph_capturing()
+    ):
+        GroupedGEMMFP8VariableKKernelDispatcher.tune(**{**kwargs, "out": torch.zeros_like(out)})
+
+    GroupedGEMMFP8VariableKKernelDispatcher.dispatch(default_backend_choice, user_backend_choice, **kwargs)
+
+
+@grouped_gemm_fp8_variable_k_accum_impl.register_fake
+def grouped_gemm_fp8_variable_k_accum_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    trans_c: bool,
+    out_dtype: torch.dtype,
+    granularity: int,
+    num_cu: int | None,
+    default_backend: int,
+    out: torch.Tensor,
+    maybe_pre_sync: bool = False,
+    m_real: int | None = None,
+    n_real: int | None = None,
+) -> None:
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 2, f"b must be 2D, got {b.shape}"
+    assert out.dim() == 3, f"out must be 3D, got {out.shape}"
+    return None
 
 
 @grouped_gemm_fp8_impl.register_fake
@@ -917,6 +1134,7 @@ def grouped_gemm_fp8_impl_meta(
     default_backend: int,
     maybe_pre_sync: bool = False,
     group_offs_out: torch.Tensor | None = None,
+    n_real: int | None = None,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 3, f"b must be 3D, got {b.shape}"
@@ -928,10 +1146,8 @@ def grouped_gemm_fp8_impl_meta(
     ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
     assert trans_a == False, "Only trans_a=False is supported."
 
-    # MX over-allocates to the padded input rows; group_offs_out maps each group
-    # into the tight layout and the caller slices [:total_m].
     m = a.shape[1] if trans_a else a.shape[0]
-    n = b.shape[-2] if trans_b else b.shape[-1]
+    n = n_real if n_real is not None else (b.shape[-2] if trans_b else b.shape[-1])
     return torch.empty((m, n), device=a.device, dtype=out_dtype)
 
 
@@ -951,6 +1167,8 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     num_cu: int | None,
     default_backend: int,
     maybe_pre_sync: bool = False,
+    m_real: int | None = None,
+    n_real: int | None = None,
 ) -> torch.Tensor:
     assert a.dim() == 2, f"a must be 2D, got {a.shape}"
     assert b.dim() == 2, f"b must be 2D, got {b.shape}"
@@ -973,4 +1191,656 @@ def grouped_gemm_fp8_variable_k_impl_meta(
     n = b.shape[-2] if trans_b else b.shape[-1]
     if trans_c:
         m, n = n, m
+    if m_real is not None:
+        m = m_real
+    if n_real is not None:
+        n = n_real
     return torch.empty((bs, m, n), device=a.device, dtype=out_dtype)
+
+
+def _check_glu_dispatch(config: Float8QuantConfig, trans_a: bool) -> None:
+    """The fused GLU epilogue has one scaling mode and one A layout.
+
+    The whole config is held against ``tensorwise_scaling``, not just its granularity:
+    the epilogue rescales off one fp32 scalar per operand, so an E8M0 scale or a
+    non-dynamic strategy would be a different kernel even at the same granularity.
+    """
+    assert config.tensorwise_scaling(), f"Fused GLU grouped GEMM is tensorwise-only, got {config}"
+    assert not trans_a, "Fused GLU grouped GEMM does not support trans_a"
+
+
+def _check_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
+    """Hold the caller's recipes against what the fused quantisation can express.
+
+    Every ``ScalingRecipe`` field -- 2-D blocks, stochastic rounding, the RHT, the
+    shuffled layouts -- describes a block-scaled quantiser. A tensorwise scale is one
+    scalar over the whole tensor, so none of them have anywhere to apply and the recipes
+    are a contract check until this path grows a block-scaled granularity.
+
+    They are taken per operand, and both must be the default, because that is the shape
+    MXFP8 needs: a block-scaled epilogue emits the row-wise operand the next GEMM
+    contracts and a col-wise one for the wgrad, each quantised on its own terms -- as
+    the MXFP4 twin already does. Tensorwise emits one operand against one scalar, so
+    the col recipe has nothing to describe yet and only the signature is in place.
+    """
+    for name, recipe in (("row", row), ("col", col)):
+        assert recipe == ScalingRecipe(), (
+            f"the fused tensorwise quantisation takes no recipe, got {name}={recipe}"
+        )
+
+
+def _check_mx_glu_dispatch(config: Float8QuantConfig, trans_a: bool, trans_b: bool) -> None:
+    """The fused MXFP8 GLU epilogue rides the FlyDSL NT kernel, so it has one layout.
+
+    The whole config is held against ``mxfp8_scaling``, not just its granularity: the
+    epilogue emits per-1x32 E8M0 block scales, so anything else would be a different
+    kernel even at the same granularity.
+    """
+    assert config.mxfp8_scaling(), f"Fused GLU grouped MXFP8 GEMM is MX_BLOCKWISE-only, got {config}"
+    assert is_gfx950(), "Fused GLU grouped MXFP8 GEMM is only supported on gfx950"
+    assert not trans_a and trans_b, "Fused GLU grouped MXFP8 GEMM is NT only"
+
+
+def _check_mx_out_recipes(row: ScalingRecipe, col: ScalingRecipe) -> None:
+    """Hold the caller's recipes against the geometry the fused MXFP8 epilogue is built on.
+
+    The epilogue is not a general quantiser. It has no RHT, no stochastic rounding and no
+    shuffled layouts -- MXFP8's recipe surface for this path is ``use_2d_block`` alone, so
+    the other four are contract checks rather than knobs, and shapes wanting them belong
+    on the standalone quantiser.
+
+    ``use_2d_block`` is the one field the epilogue's band *could* express -- a 32x32 chunk
+    is exactly one col-wise half-band by the whole row span, so the 2-D amax is a reduction
+    over amaxes it already computes -- but it is not implemented:
+    ``MXFP8DualQuantStore.store_band`` still asserts against it, and there is no grouped
+    reference to be byte-exact against either, since ``compile_grouped_qdual`` has no 2-D
+    path. Rejecting it here is what keeps that assert honest; the alternative is an op that
+    accepts the flag and silently emits 1-D scales.
+
+    Net effect today: both recipes must be the default. The signature carries them per
+    operand because the epilogue does quantise the two on their own terms, and that is
+    where 2-D block scaling will land when it is wired up.
+    """
+    for name, recipe in (("row", row), ("col", col)):
+        assert not recipe.use_sr, f"the fused MXFP8 epilogue has no stochastic rounding, got {name}={recipe}"
+        assert not recipe.use_rht, f"the fused MXFP8 epilogue has no RHT, got {name}={recipe}"
+        assert not recipe.shuffle_scale and not recipe.shuffle_out, (
+            f"the fused MXFP8 epilogue writes unshuffled operands, got {name}={recipe}"
+        )
+        assert not recipe.use_2d_block, (
+            f"2-D block scaling is the only recipe field this epilogue could express, but it is "
+            f"not wired up yet; got {name}={recipe}"
+        )
+
+
+_MX_COL_ALIGN = 128  # the col-wise operand's per-group M alignment, as the quantiser pads it
+_MX_ROW_ALIGN = 128  # and the row-wise operand's N alignment
+
+
+def _alloc_mx_act_buffers(I: int, M_pad_row: int, M_pad_col: int, quant_dtype: torch.dtype, device):
+    """The four MXFP8 operands ``grouped_quant_mxfp8_raw`` would have made.
+
+    Byte-identical geometry to the standalone quantiser, because the wgrad and fc2 consume
+    them under the same group tables it builds: the row-wise pair is laid out over the
+    per-group 64-aligned rows and padded to :data:`_MX_ROW_ALIGN` columns, the col-wise
+    pair is feature-major over an M rounded up per group to :data:`_MX_COL_ALIGN`.
+
+    Only the row-wise pad columns are filled, and the scale side with **127**, not zero:
+    the quantiser's zero fill there is a zero block, and a zero block's E8M0 is 1.0 by its
+    zero-amax safe path. The epilogue writes every real column and every padded col-wise
+    row (a group's ragged tail included, as zeros), but the columns past ``I`` belong to no
+    tile and fc2 contracts over them.
+    """
+    I_pad = -(-I // _MX_ROW_ALIGN) * _MX_ROW_ALIGN
+    e8 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    row_out = torch.empty((M_pad_row, I_pad), dtype=quant_dtype, device=device)
+    row_sc = torch.empty((M_pad_row, I_pad // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    if I_pad != I:
+        row_out.view(torch.uint8)[:, I:].zero_()
+        row_sc[:, I // MXFP8_BLOCK_SIZE :].fill_(127)
+    col_out = torch.empty((I, M_pad_col), dtype=quant_dtype, device=device)
+    col_sc = torch.empty((I, M_pad_col // MXFP8_BLOCK_SIZE), dtype=torch.uint8, device=device)
+    return row_out, row_sc.view(e8), col_out, col_sc.view(e8)
+
+
+def _alloc_grad_probs_partial(spec, device: torch.device) -> torch.Tensor:
+    """The grad_probs partial buffer a fused dgrad asked for.
+
+    The kernels allocate nothing, and both the shape and ``needs_zero`` follow
+    from a tiling only they know, so the spec is asked for rather than
+    reconstructed here.
+    """
+    fill = torch.zeros if spec.needs_zero else torch.empty
+    return fill(spec.shape, device=device, dtype=torch.float32)
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,  # not used
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_quant_dtype: torch.dtype,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    k_align: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc1 grouped GEMM with the GLU activation and its quantisation fused in.
+
+    Returns ``(intermediate, act, act_scale_inv)``: the pre-activation [M, N] the
+    backward needs, still in ``out_dtype``, then the activation [M, N // 2] already
+    quantised to ``out_quant_dtype`` for fc2, with its scale. ``probs`` is folded into
+    the activation only -- ``intermediate`` is always the unscaled GEMM output.
+
+    The activation's own ``out_dtype`` staging buffer stays inside this op. That is the
+    point of quantising here rather than in the caller: it leaves the conversion where
+    a later kernel can fold it into the epilogue and drop the round trip entirely. The
+    quantisation is byte-for-byte the ``QuantizedTensor.quantize`` the caller used to
+    run -- a tensorwise scale is one scalar over the whole tensor, so the grouping never
+    enters it and ``group_lens`` stays out.
+
+    ``config`` rides through as an opaque value argument, so torch.compile bakes it into
+    the graph and guards on its equality rather than tracing into it; that is also why
+    it and the recipes carry no defaults, since the schema admits an opaque type only as
+    a required parameter. Which fp8 dtype the activation lands in stays an explicit
+    argument, because it follows from the caller's forward/backward stage rather than
+    from anything visible here. The recipes are per operand against MXFP8's dual output;
+    see :func:`_check_out_recipes`.
+    """
+    _check_glu_dispatch(config, trans_a)
+    _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert is_gfx950(), "grouped_gemm_fp8_glu_impl is only supported on gfx950"
+    assert trans_b == True, "trans_b must be True for grouped_gemm_fp8_glu_impl"
+    assert a.shape[1] >= 129, "a.shape[1] must be >= 129 for grouped_gemm_fp8_glu_impl"
+
+    M = a.shape[0]
+    N = b.shape[1] if trans_b else b.shape[2]
+
+    act = torch.empty((M, N // 2), device=a.device, dtype=out_dtype)
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
+        grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel,
+    )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quantize_fp8_tensorwise_pad_impl,
+    )
+
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
+    grouped_gemm_fp8_tensorwise_epi_glu_flydsl_kernel(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        probs,
+        group_offs,
+        act,
+        intermediate,
+        trans_b=trans_b,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        out_dtype=out_dtype,
+        num_cu=num_cu,
+        amax_partial=amax_partial,
+    )
+
+    # k_align pads the activation's I -> Ip (fc2's contraction K), copy-free: the
+    # quantiser writes the padded buffer directly and zeroes the tail, so w2's own
+    # padded-K contraction reads zeros there and fc2 stays bitwise-identical.
+    act_fp8, act_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        act, out_quant_dtype, k_align=k_align, amax_partials=amax_partial
+    )
+    return intermediate, act_fp8, act_scale_inv
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_fp8_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_fp8_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,  # not used
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_quant_dtype: torch.dtype,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    i_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
+
+    ``a`` is the fc2 output gradient and ``b`` the fc2 weight oriented for the
+    dgrad, so ``a @ b`` is the gradient wrt the activation; the epilogue consumes
+    it in registers against ``intermediate`` (the pre-activation the forward
+    wrote).
+
+    Returns ``(grad_probs, grad_intermediate, grad_intermediate_scale_inv)``: [M] fp32
+    wrt the routing probabilities -- the gradient wrt the activation, taken before the
+    probs scaling, times the activation, summed over the hidden dimension, which the
+    kernels leave as per-tile partials and this function folds -- then the
+    pre-activation gradient [M, 2 * N] already quantised to ``out_quant_dtype``, with
+    its scale.
+
+    Its ``out_dtype`` staging buffer stays inside this op; see the forward's note on why
+    the quantisation lives here, and on the opaque ``config``, the explicit
+    ``out_quant_dtype`` and the per-operand recipes.
+    """
+    _check_glu_dispatch(config, trans_a)
+    _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert is_gfx950(), "grouped_gemm_fp8_dglu_impl is only supported on gfx950"
+    assert trans_b == False, "trans_b must be False for grouped_gemm_fp8_dglu_impl"
+    assert a.shape[1] >= 129, "a.shape[1] must be >= 129 for grouped_gemm_fp8_dglu_impl"
+
+    M = a.shape[0]
+    # b is w2 padded to Ip on its I axis; i_real recovers the tight I so out/grad
+    # stay [M, 2I] and the entry feeds the padded Ip as an N storage pitch (n_stride).
+    N = i_real if i_real is not None else (b.shape[1] if trans_b else b.shape[2])
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_fp8_glu_kernel import (
+        grouped_gemm_fp8_dglu_grad_probs_partial_spec,
+        grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel,
+    )
+    from primus_turbo.flydsl.utils.gemm_epilogue_helper import AMAX_PARTIAL_SLOTS
+    from primus_turbo.pytorch.kernels.quantization.quantization_impl import (
+        quantize_fp8_tensorwise_pad_impl,
+    )
+
+    out = torch.empty((M, N * 2), device=a.device, dtype=out_dtype)
+    grad_probs_partial = _alloc_grad_probs_partial(
+        grouped_gemm_fp8_dglu_grad_probs_partial_spec(a, b, i_real=N), a.device
+    )
+    amax_partial = torch.zeros(AMAX_PARTIAL_SLOTS, device=a.device, dtype=torch.float32)
+    grouped_gemm_fp8_tensorwise_epi_dglu_flydsl_kernel(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        intermediate,
+        group_offs,
+        probs,
+        out,
+        grad_probs_partial,
+        trans_b=trans_b,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        num_cu=num_cu,
+        i_real=i_real,
+        amax_partial=amax_partial,
+    )
+
+    out_fp8, out_scale_inv = quantize_fp8_tensorwise_pad_impl(
+        out, out_quant_dtype, k_align=1, amax_partials=amax_partial
+    )
+    return torch.sum(grad_probs_partial, dim=0), out_fp8, out_scale_inv
+
+
+@grouped_gemm_fp8_glu_impl.register_fake
+def grouped_gemm_fp8_glu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_quant_dtype: torch.dtype,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    k_align: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_glu_dispatch(config, trans_a)
+    _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+
+    # b holds gate||up, so its N is twice the activation's width. The activation is
+    # padded to Ip = ceil(I, k_align) for fc2's contraction.
+    m = a.shape[0]
+    n = b.shape[1] if trans_b else b.shape[2]
+    ni = n // 2
+    ni = ((ni + k_align - 1) // k_align) * k_align
+    intermediate = torch.empty((m, n), device=a.device, dtype=out_dtype)
+    act = torch.empty((m, ni), device=a.device, dtype=out_quant_dtype)
+    # Tensorwise: one scalar scale over the whole activation.
+    act_scale_inv = torch.empty((), device=a.device, dtype=torch.float32)
+    return intermediate, act, act_scale_inv
+
+
+@grouped_gemm_fp8_dglu_impl.register_fake
+def grouped_gemm_fp8_dglu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_quant_dtype: torch.dtype,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+    i_real: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_glu_dispatch(config, trans_a)
+    _check_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype in [
+        torch.float16,
+        torch.bfloat16,
+    ], f"out_dtype must be float16 or bfloat16, got {out_dtype}"
+
+    # This is the dgrad wrt the activation, so the gate||up gradient it writes
+    # is twice as wide. grad_probs is per-row and always fp32, whatever out_dtype is.
+    # i_real recovers the tight I when b is padded on its I axis.
+    m = a.shape[0]
+    n = i_real if i_real is not None else (b.shape[1] if trans_b else b.shape[2])
+    grad_probs = torch.empty((m,), device=a.device, dtype=torch.float32)
+    grad_intermediate = torch.empty((m, n * 2), device=a.device, dtype=out_quant_dtype)
+    # Tensorwise: one scalar scale over the whole gradient.
+    grad_scale_inv = torch.empty((), device=a.device, dtype=torch.float32)
+    return grad_probs, grad_intermediate, grad_scale_inv
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_glu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_glu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc1 grouped MXFP8 GEMM with the GLU activation and its quantisation fused in.
+
+    The activation is quantised from the accumulators instead of being written and read
+    back: what comes out is the row-wise pair fc2 contracts against and the col-wise pair
+    the wgrad does, byte-for-byte what ``grouped_quant_mxfp8_raw`` would have produced
+    from the bf16 activation.
+
+    Returns ``(intermediate, act_row, act_row_scale, act_col, act_col_scale)``, where
+    ``intermediate`` is the [M, N] pre-activation backward needs, still in ``out_dtype``.
+    The row-wise pair is laid out over the per-group 64-aligned rows, so its group table
+    is ``group_offs``; the col-wise pair's is the per-group 128-aligned one the wgrad
+    builds from the same ``group_lens``.
+
+    Unlike the MXFP4 twin, ``group_lens`` is *used*: the MXFP8 quantiser pads a group's
+    rows to 64 for the row-wise operand, so ``group_offs`` is the padded read table the
+    GEMM addresses ``a`` with, and the tight table that ``probs`` and ``intermediate`` are
+    indexed by has to be rebuilt from the lengths.
+
+    ``config`` and the recipes ride through as opaque value arguments, so torch.compile
+    bakes them into the graph and guards on their equality rather than tracing into them.
+    That is also why they carry no defaults: the schema admits an opaque type only as a
+    required parameter.
+    """
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
+        glu_epi_quant_supported,
+        grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel,
+    )
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    N, K = int(b.shape[1]), int(b.shape[2])
+    I, G = N // 2, int(group_lens.shape[0])
+    assert N % 2 == 0, f"fc1 width must be even (gate||up), got {N}"
+    assert glu_epi_quant_supported(K, I, out_dtype), (
+        f"the fused MXFP8 GLU quant epilogue does not cover K={K} I={I} out_dtype={out_dtype}"
+    )
+    M = int(probs.shape[0])
+
+    # The tight token table. group_offs is the quantiser's 64-aligned offs_row, which the
+    # GEMM reads a with; probs and intermediate live in the tight space.
+    group_offs_out = torch.zeros(G + 1, device=a.device, dtype=torch.int64)
+    torch.cumsum(group_lens, 0, out=group_offs_out[1:])
+
+    M_pad_row = int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    quant_dtype = _get_fp8_dtype(config.format, True)
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(I, M_pad_row, M_pad_col, quant_dtype, a.device)
+    grouped_gemm_mxfp8_epi_glu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        probs,
+        group_offs,
+        intermediate,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        N,
+        K,
+        group_offs_out=group_offs_out,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        out_dtype=out_dtype,
+    )
+    return intermediate, row_out, row_sc, col_out, col_sc
+
+
+@grouped_gemm_mxfp8_glu_impl.register_fake
+def grouped_gemm_mxfp8_glu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype == torch.bfloat16, f"out_dtype must be bfloat16, got {out_dtype}"
+
+    N, G = int(b.shape[1]), int(group_lens.shape[0])
+    I = N // 2
+    M, M_pad_row = int(probs.shape[0]), int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    intermediate = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, True), a.device
+    )
+    return intermediate, row_out, row_sc, col_out, col_sc
+
+
+@_torch_custom_op_wrapper("primus_turbo::grouped_gemm_mxfp8_dglu_impl", mutates_args=(), device_types="cuda")
+def grouped_gemm_mxfp8_dglu_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fc2 dgrad with the GLU activation gradient and its quantisation fused in.
+
+    ``a @ b^T`` is the gradient wrt the activation; the epilogue consumes it against
+    ``intermediate`` in registers, so the [M, 2I] ``grad_l1`` is quantised from those
+    values instead of being written and read back.
+
+    Returns ``(grad_probs, row, row_scale, col, col_scale)``: [M] fp32 folded here from
+    the kernel's per-tile partials, then the four operands. As in the forward, the
+    row-wise pair sits on the padded rows ``group_offs`` addresses and the col-wise pair
+    on the 128-aligned table the wgrad builds from ``group_lens``.
+    """
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    from primus_turbo.flydsl.grouped_gemm.grouped_gemm_mxfp8_glu_kernel import (
+        dglu_epi_quant_supported,
+        grouped_gemm_mxfp8_dglu_grad_probs_partial_spec,
+        grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel,
+    )
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    I, K = int(b.shape[1]), int(b.shape[2])
+    G = int(group_lens.shape[0])
+    assert dglu_epi_quant_supported(K, I, out_dtype), (
+        f"the fused MXFP8 dGLU quant epilogue does not cover K={K} I={I} out_dtype={out_dtype}"
+    )
+    M = int(probs.shape[0])
+
+    # group_offs is the quantiser's 64-aligned offs_row, which the GEMM reads a with;
+    # probs, intermediate and the grad_probs partials live in the tight space.
+    group_offs_out = torch.zeros(G + 1, device=a.device, dtype=torch.int64)
+    torch.cumsum(group_lens, 0, out=group_offs_out[1:])
+
+    M_pad_row = int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    quant_dtype = _get_fp8_dtype(config.format, False)
+    grad_probs_partial = _alloc_grad_probs_partial(
+        grouped_gemm_mxfp8_dglu_grad_probs_partial_spec(a, b), a.device
+    )
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        2 * I, M_pad_row, M_pad_col, quant_dtype, a.device
+    )
+    grouped_gemm_mxfp8_epi_dglu_quant_flydsl_kernel(
+        a,
+        a_scales,
+        b,
+        b_scales,
+        intermediate,
+        group_offs,
+        probs,
+        grad_probs_partial,
+        row_out,
+        row_sc,
+        col_out,
+        col_sc,
+        I,
+        K,
+        group_offs_out=group_offs_out,
+        activation=activation,
+        clamp_limit=clamp_limit,
+        out_dtype=out_dtype,
+    )
+    # The partials are over-allocated to the padded rows but written in the tight space.
+    return torch.sum(grad_probs_partial[:, :M], dim=0), row_out, row_sc, col_out, col_sc
+
+
+@grouped_gemm_mxfp8_dglu_impl.register_fake
+def grouped_gemm_mxfp8_dglu_impl_meta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_scales: torch.Tensor,
+    group_lens: torch.Tensor,
+    group_offs: torch.Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    out_dtype: torch.dtype,
+    num_cu: int | None,
+    probs: torch.Tensor,
+    intermediate: torch.Tensor,
+    config: Float8QuantConfig,
+    out_row_scaling_recipe: ScalingRecipe,
+    out_col_scaling_recipe: ScalingRecipe,
+    activation: str = "silu",
+    clamp_limit: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from primus_turbo.pytorch.ops.utils import _get_fp8_dtype
+
+    _check_mx_glu_dispatch(config, trans_a, trans_b)
+    _check_mx_out_recipes(out_row_scaling_recipe, out_col_scaling_recipe)
+
+    assert a.dim() == 2, f"a must be 2D, got {a.shape}"
+    assert b.dim() == 3, f"b must be 3D, got {b.shape}"
+    assert a.dtype in [float8_e4m3, float8_e5m2], f"a must be fp8, got {a.dtype}"
+    assert b.dtype in [float8_e4m3, float8_e5m2], f"b must be fp8, got {b.dtype}"
+    assert out_dtype == torch.bfloat16, f"out_dtype must be bfloat16, got {out_dtype}"
+
+    I, G = int(b.shape[1]), int(group_lens.shape[0])
+    M, M_pad_row = int(probs.shape[0]), int(a.shape[0])
+    M_pad_col = -(-(M + G * _MX_COL_ALIGN) // _MX_COL_ALIGN) * _MX_COL_ALIGN
+    grad_probs = torch.empty((M,), device=a.device, dtype=torch.float32)
+    row_out, row_sc, col_out, col_sc = _alloc_mx_act_buffers(
+        2 * I, M_pad_row, M_pad_col, _get_fp8_dtype(config.format, False), a.device
+    )
+    return grad_probs, row_out, row_sc, col_out, col_sc
