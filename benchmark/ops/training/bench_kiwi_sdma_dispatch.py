@@ -89,9 +89,9 @@ def _run(rank: int, args, store_path: str) -> None:
     if rank == 0:
         hidden_bytes = args.hidden * x.element_size()
         record_bytes = 4 + hidden_bytes + scale_bytes
-        rows_per_chunk = max(1, (64 * 1024 - 16) // ((record_bytes + 15) // 16 * 16))
-        chunks = args.num_processes * args.num_processes * args.num_sms // 2 * math.ceil(
-            math.ceil(args.num_tokens / (args.num_sms // 2)) / rows_per_chunk
+        rows_per_chunk = max(1, (256 * 1024 - 16) // ((record_bytes + 15) // 16 * 16))
+        chunks = args.num_processes * args.num_processes * math.ceil(
+            args.num_tokens / rows_per_chunk
         )
         payload = (
             args.num_tokens
@@ -103,8 +103,8 @@ def _run(rank: int, args, store_path: str) -> None:
             f"KIWI SDMA {args.dtype.upper()} EP={args.num_processes} "
             f"M={args.num_tokens} H={args.hidden}: {latency.item():.2f} us, "
             f"{payload / (latency.item() * 1e3):.2f} GB/s cross-rank payload, "
-            f"target_chunk=65536 B rows_per_chunk={rows_per_chunk} "
-            f"estimated_chunks={chunks} proxy_cpu="
+            f"target_chunk=262144 B rows_per_chunk={rows_per_chunk} "
+            f"worst_case_chunks={chunks} proxy_cpu="
             f"{os.environ.get('KIWI_SDMA_PROXY_CPU', 'unbound')}"
         )
     buffer.destroy()

@@ -12,8 +12,10 @@
 
 namespace primus_turbo::deep_ep::intranode {
 
-constexpr int kKiwiSdmaRingDepth = 2;
-constexpr size_t kKiwiSdmaTargetChunkBytes = 64 * 1024;
+// Per-destination rings aggregate rows across channels. Eight 256 KiB slots
+// keep SDMA work in flight without the per-channel fragmentation cliff.
+constexpr int kKiwiSdmaRingDepth = 8;
+constexpr size_t kKiwiSdmaTargetChunkBytes = 256 * 1024;
 constexpr uint32_t kKiwiSdmaHeaderMagic = 0x4b53444d; // "KSDM"
 constexpr uint32_t kKiwiSdmaSentinelWord = 0x7f817f81;
 constexpr uint32_t kKiwiSdmaFp8SentinelWord = 0x7f7f7f7f;
@@ -33,6 +35,7 @@ struct KiwiSdmaLayout {
     size_t hidden_offset;
     size_t scale_offset;
     size_t record_stride;
+    size_t record_offset;
     int rows_per_chunk;
     size_t chunk_stride;
     size_t slot_count;
@@ -55,14 +58,18 @@ inline KiwiSdmaLayout make_kiwi_sdma_layout(int num_channels, int num_ranks,
     l.hidden_offset = kiwi_sdma_align_up(l.metadata_bytes, 16);
     l.scale_offset = kiwi_sdma_align_up(l.hidden_offset + hidden_bytes, 16);
     l.record_stride = kiwi_sdma_align_up(l.scale_offset + scale_bytes, 16);
+    l.record_offset = kiwi_sdma_align_up(
+        sizeof(KiwiSdmaChunkHeader) +
+            static_cast<size_t>(num_channels) * sizeof(int32_t),
+        16);
     l.rows_per_chunk = static_cast<int>(
-        (kKiwiSdmaTargetChunkBytes - sizeof(KiwiSdmaChunkHeader)) / l.record_stride);
+        (kKiwiSdmaTargetChunkBytes - l.record_offset) / l.record_stride);
     if (l.rows_per_chunk < 1) l.rows_per_chunk = 1;
     l.chunk_stride = kiwi_sdma_align_up(
-        sizeof(KiwiSdmaChunkHeader) +
+        l.record_offset +
             static_cast<size_t>(l.rows_per_chunk) * l.record_stride,
         256);
-    l.slot_count = static_cast<size_t>(num_channels) * num_ranks * kKiwiSdmaRingDepth;
+    l.slot_count = static_cast<size_t>(num_ranks) * kKiwiSdmaRingDepth;
     l.send_offset = 0;
     l.recv_offset = l.slot_count * l.chunk_stride;
     l.ack_offset = l.recv_offset + l.slot_count * l.chunk_stride;

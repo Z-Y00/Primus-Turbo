@@ -37,9 +37,11 @@ See [DeepEP example](../../../docs/examples.md#4-deepep)
 ### KIWI SDMA dispatch backend
 
 `KIWI_SDMA` is an experimental intranode dispatch transport for 2–8 ranks.
-GPU sender workgroups compact routed BF16/FP16 or FP8+scale rows into approximately 64 KiB
-chunks and invoke a vendored KIWI device-to-host queue. A CPU proxy combines
-the descriptors observed in one progress pass into `hipMemcpyBatchAsync`.
+GPU sender workgroups compact routed BF16/FP16 or FP8+scale rows across all
+channels for each destination into approximately 256 KiB chunks in an
+eight-slot ring, then invoke a vendored KIWI device-to-host queue. A CPU proxy
+combines mixed-destination descriptors observed in one progress pass into
+`hipMemcpyBatchAsync`.
 Receivers poll an exact signaling-NaN bit pattern and load ready hidden rows
 directly into LDS before publishing the normal DeepEP receive tensors.
 

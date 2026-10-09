@@ -75,7 +75,7 @@ __global__ void prepare_kiwi_sdma(void* local_buffer, KiwiSdmaLayout layout,
         const size_t slot_row = row % layout.rows_per_chunk;
         auto* ptr = reinterpret_cast<uint32_t*>(
             base + layout.recv_offset + slot * layout.chunk_stride +
-            sizeof(KiwiSdmaChunkHeader) + slot_row * layout.record_stride +
+            layout.record_offset + slot_row * layout.record_stride +
             layout.hidden_offset);
         ptr[word] = is_fp8 ? kKiwiSdmaFp8SentinelWord : kKiwiSdmaSentinelWord;
     }
@@ -89,7 +89,7 @@ __global__ void prepare_kiwi_sdma(void* local_buffer, KiwiSdmaLayout layout,
         const size_t slot_row = row % layout.rows_per_chunk;
         auto* ptr = reinterpret_cast<uint32_t*>(
             base + layout.recv_offset + slot * layout.chunk_stride +
-            sizeof(KiwiSdmaChunkHeader) + slot_row * layout.record_stride +
+            layout.record_offset + slot_row * layout.record_stride +
             layout.scale_offset);
         ptr[word] = kKiwiSdmaScaleSentinelWord;
     }
@@ -113,7 +113,6 @@ dispatch_kiwi_sdma(
     KiwiSdmaLayout layout, KiwiDeviceContext* kiwi_context, uint8_t callback_id) {
     const int task = static_cast<int>(blockIdx.x) >> 1;
     const bool sender = (blockIdx.x & 1) == 0;
-    const int channel = task / num_ranks;
     const int peer = task % num_ranks;
     const int tid = static_cast<int>(threadIdx.x);
     const int hidden_int4 = hidden_bytes / sizeof(int4);
@@ -125,40 +124,32 @@ dispatch_kiwi_sdma(
 
     const size_t send_peer_base =
         layout.send_offset +
-        (static_cast<size_t>(channel) * num_ranks + peer) *
-            kKiwiSdmaRingDepth * layout.chunk_stride;
+        static_cast<size_t>(peer) * kKiwiSdmaRingDepth * layout.chunk_stride;
     const size_t recv_peer_base =
         layout.recv_offset +
-        (static_cast<size_t>(channel) * num_ranks + peer) *
-            kKiwiSdmaRingDepth * layout.chunk_stride;
+        static_cast<size_t>(peer) * kKiwiSdmaRingDepth * layout.chunk_stride;
 
     if (sender) {
-        const int endpoint = channel * num_ranks + peer;
+        const int endpoint = peer;
         auto handle = kiwi_context->get_device_handle(endpoint);
-        int token_begin = 0, token_end = 0;
-        get_channel_task_range(num_tokens, num_channels, channel, token_begin, token_end);
-        const int channel_end = channel_prefix_matrix[peer * num_channels + channel];
-        const int channel_start =
-            channel == 0 ? 0 : channel_prefix_matrix[peer * num_channels + channel - 1];
-        const int expected_rows = channel_end - channel_start;
-        int cursor = token_begin;
+        const int expected_rows =
+            channel_prefix_matrix[peer * num_channels + num_channels - 1];
+        int cursor = 0;
         int produced = 0;
         uint32_t sequence = 0;
 
         do {
             const int slot = sequence % kKiwiSdmaRingDepth;
             const size_t ack_index =
-                (static_cast<size_t>(channel) * num_ranks + peer) *
-                    kKiwiSdmaRingDepth +
-                slot;
+                static_cast<size_t>(peer) * kKiwiSdmaRingDepth + slot;
             auto* ack = reinterpret_cast<uint64_t*>(local_base + layout.ack_offset) + ack_index;
             if (sequence >= kKiwiSdmaRingDepth && tid == 0) {
                 const uint64_t expected_ack = sequence - kKiwiSdmaRingDepth + 1;
                 const auto start = wall_clock64();
                 while (static_cast<uint64_t>(ld_volatile_global(ack)) < expected_ack) {
                     if (wall_clock64() - start > NUM_TIMEOUT_CYCLES) {
-                        printf("KIWI SDMA sender timeout rank=%d dst=%d channel=%d slot=%d\n",
-                               rank, peer, channel, slot);
+                        printf("KIWI SDMA sender timeout rank=%d dst=%d slot=%d\n",
+                               rank, peer, slot);
                         trap();
                     }
                 }
@@ -168,12 +159,20 @@ dispatch_kiwi_sdma(
             auto* chunk = local_base + send_peer_base +
                           static_cast<size_t>(slot) * layout.chunk_stride;
             auto* header = reinterpret_cast<KiwiSdmaChunkHeader*>(chunk);
+            auto* channel_prefix = reinterpret_cast<int32_t*>(
+                chunk + sizeof(KiwiSdmaChunkHeader));
+            for (int channel = tid; channel < num_channels; channel += blockDim.x)
+                channel_prefix[channel] =
+                    channel == 0
+                        ? 0
+                        : channel_prefix_matrix[
+                              peer * num_channels + channel - 1];
             int rows = 0;
             while (rows < layout.rows_per_chunk && produced + rows < expected_rows) {
                 __shared__ int selected_token;
                 if (tid == 0) {
                     selected_token = -1;
-                    while (cursor < token_end) {
+                    while (cursor < num_tokens) {
                         const int candidate = cursor++;
                         if (is_token_in_rank[candidate * num_ranks + peer]) {
                             selected_token = candidate;
@@ -185,7 +184,7 @@ dispatch_kiwi_sdma(
                 const int token = selected_token;
                 if (token < 0) break;
 
-                auto* record = chunk + sizeof(KiwiSdmaChunkHeader) +
+                auto* record = chunk + layout.record_offset +
                                static_cast<size_t>(rows) * layout.record_stride;
                 auto* hidden_dst = reinterpret_cast<int4*>(record + layout.hidden_offset);
                 const auto* hidden_src =
@@ -216,7 +215,17 @@ dispatch_kiwi_sdma(
                 }
                 if (tid == 0) {
                     *reinterpret_cast<int32_t*>(record) = token;
-                    send_head[token * num_ranks + peer] = produced + rows;
+                    const int tokens_per_channel =
+                        (num_tokens + num_channels - 1) / num_channels;
+                    const int token_channel =
+                        min(token / tokens_per_channel, num_channels - 1);
+                    const int channel_base =
+                        token_channel == 0
+                            ? 0
+                            : channel_prefix_matrix[
+                                  peer * num_channels + token_channel - 1];
+                    send_head[token * num_ranks + peer] =
+                        produced + rows - channel_base;
                 }
                 for (int k = tid; k < num_topk; k += blockDim.x) {
                     const int64_t expert = topk_idx[token * num_topk + k];
@@ -238,19 +247,19 @@ dispatch_kiwi_sdma(
                 header->rows = static_cast<uint16_t>(rows);
                 header->final = final ? 1 : 0;
                 header->sequence = sequence;
-                header->channel_start = channel_start;
+                header->channel_start = 0;
                 header->magic = kKiwiSdmaHeaderMagic;
             }
             __syncthreads();
             __threadfence_system();
             __syncthreads();
 
-            const size_t bytes = sizeof(KiwiSdmaChunkHeader) +
+            const size_t bytes = layout.record_offset +
                                  static_cast<size_t>(rows) * layout.record_stride;
             auto* remote_chunk =
                 static_cast<uint8_t*>(buffer_ptrs[peer]) + layout.recv_offset +
-                (static_cast<size_t>(channel) * num_ranks + rank) *
-                    kKiwiSdmaRingDepth * layout.chunk_stride +
+                static_cast<size_t>(rank) * kKiwiSdmaRingDepth *
+                    layout.chunk_stride +
                 static_cast<size_t>(slot) * layout.chunk_stride;
             if (tid < kWarpSize) {
                 while (!handle.invoke(callback_id,
@@ -265,7 +274,7 @@ dispatch_kiwi_sdma(
             if (final) break;
         } while (true);
         if (tid < kWarpSize)
-            kiwi_context->save_device_handle(channel * num_ranks + peer, handle);
+            kiwi_context->save_device_handle(peer, handle);
         return;
     }
 
@@ -283,7 +292,6 @@ dispatch_kiwi_sdma(
         auto* header = reinterpret_cast<KiwiSdmaChunkHeader*>(chunk);
         __shared__ int shared_rows;
         __shared__ int shared_final;
-        __shared__ int shared_channel_start;
         __shared__ int shared_ready;
 
         if (tid == 0) {
@@ -295,21 +303,36 @@ dispatch_kiwi_sdma(
                     ld_volatile_global(reinterpret_cast<volatile int*>(&header->sequence)));
                 if (magic == kKiwiSdmaHeaderMagic && seq == sequence) break;
                 if (wall_clock64() - start > NUM_TIMEOUT_CYCLES) {
-                    printf("KIWI SDMA receiver timeout rank=%d src=%d channel=%d slot=%d\n",
-                           rank, source, channel, slot);
+                    printf("KIWI SDMA receiver timeout rank=%d src=%d slot=%d\n",
+                           rank, source, slot);
                     trap();
                 }
             }
             shared_rows = header->rows;
             shared_final = header->final;
-            shared_channel_start = header->channel_start;
-            recv_channel_prefix_matrix[source * num_channels + channel] =
-                shared_channel_start;
         }
         __syncthreads();
+        if (sequence == 0) {
+            const auto* channel_prefix = reinterpret_cast<const int32_t*>(
+                chunk + sizeof(KiwiSdmaChunkHeader));
+            for (int channel = tid; channel < num_channels; channel += blockDim.x) {
+                const auto start = wall_clock64();
+                int value;
+                do {
+                    value = ld_nc_global(channel_prefix + channel);
+                    if (wall_clock64() - start > NUM_TIMEOUT_CYCLES) {
+                        printf("KIWI SDMA prefix timeout rank=%d src=%d channel=%d\n",
+                               rank, source, channel);
+                        trap();
+                    }
+                } while (static_cast<uint32_t>(value) == kKiwiSdmaSentinelWord);
+                recv_channel_prefix_matrix[source * num_channels + channel] = value;
+            }
+            __syncthreads();
+        }
 
         for (int row = 0; row < shared_rows; ++row) {
-            auto* record = chunk + sizeof(KiwiSdmaChunkHeader) +
+            auto* record = chunk + layout.record_offset +
                            static_cast<size_t>(row) * layout.record_stride;
             auto* hidden_src = reinterpret_cast<const int4*>(record + layout.hidden_offset);
             auto* scale_src =
@@ -332,15 +355,14 @@ dispatch_kiwi_sdma(
                 __syncthreads();
                 if (shared_ready) break;
                 if (tid == 0 && wall_clock64() - start > NUM_TIMEOUT_CYCLES) {
-                    printf("KIWI SDMA payload timeout rank=%d src=%d channel=%d seq=%u row=%d\n",
-                           rank, source, channel, sequence, row);
+                    printf("KIWI SDMA payload timeout rank=%d src=%d seq=%u row=%d\n",
+                           rank, source, sequence, row);
                     trap();
                 }
                 __syncthreads();
             }
 
-            const int output_row =
-                rank_offset + shared_channel_start + received + row;
+            const int output_row = rank_offset + received + row;
             auto* hidden_dst =
                 reinterpret_cast<int4*>(static_cast<uint8_t*>(recv_x_raw) +
                                          static_cast<size_t>(output_row) * hidden_bytes);
@@ -380,9 +402,7 @@ dispatch_kiwi_sdma(
             header->magic = kKiwiSdmaSentinelWord;
             __threadfence_system();
             const size_t ack_index =
-                (static_cast<size_t>(channel) * num_ranks + rank) *
-                    kKiwiSdmaRingDepth +
-                slot;
+                static_cast<size_t>(rank) * kKiwiSdmaRingDepth + slot;
             auto* remote_ack = reinterpret_cast<uint64_t*>(
                 static_cast<uint8_t*>(buffer_ptrs[source]) + layout.ack_offset) + ack_index;
             __hip_atomic_store(remote_ack, static_cast<uint64_t>(sequence + 1),
@@ -426,7 +446,7 @@ void kiwi_sdma_dispatch(
     PRIMUS_TURBO_CHECK_HIP(
         hipMemsetAsync(send_head, 0xff,
                        static_cast<size_t>(num_tokens) * num_ranks * sizeof(int), stream));
-    const dim3 grid(2 * num_channels * num_ranks);
+    const dim3 grid(2 * num_ranks);
     dispatch_kiwi_sdma<<<grid, 256, hidden_bytes + scale_bytes, stream>>>(
         recv_x, recv_x_scales, recv_src_idx, recv_topk_idx, recv_topk_weights,
         recv_channel_prefix_matrix, send_head, x, x_scales, topk_idx, topk_weights,
