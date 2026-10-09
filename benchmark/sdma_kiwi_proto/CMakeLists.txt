@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.21)
+
+if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+    set(CMAKE_HIP_ARCHITECTURES gfx942)
+endif()
+set(HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+project(sdma_kiwi_proto LANGUAGES CXX HIP)
+
+set(KIWI_SOURCE_DIR "" CACHE PATH "KIWI source checkout (github.com/AMD-RAD/kiwi)")
+if(NOT EXISTS "${KIWI_SOURCE_DIR}/include/kiwi/invoke/invoke.hpp")
+    message(FATAL_ERROR "Set -DKIWI_SOURCE_DIR to a KIWI checkout")
+endif()
+set(KIWI_BUILD_INVOKE ON CACHE BOOL "" FORCE)
+add_subdirectory("${KIWI_SOURCE_DIR}" kiwi EXCLUDE_FROM_ALL)
+
+find_package(Threads REQUIRED)
+set_source_files_properties(sdma_proto.hip.cpp PROPERTIES LANGUAGE HIP)
+add_executable(sdma_proto sdma_proto.hip.cpp)
+target_compile_options(sdma_proto PRIVATE -O3)
+target_link_libraries(sdma_proto PRIVATE kiwi_invoke Threads::Threads)
