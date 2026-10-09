@@ -17,7 +17,7 @@ from typing import Optional, Tuple, Union
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
-from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.buffer_ops import (
@@ -41,6 +41,14 @@ LOG2E = host_math.log2(host_math.e)  # folds a natural exp into exp2
 
 # Watchdog budget for cross-rank / grid spin loops (realtime clock cycles).
 SPIN_TIMEOUT_CYCLES = 3_000_000_000
+
+
+def device_trap_if(predicate: fx.ArithValue) -> None:
+    """Emit a device trap when a scalar i1 predicate is true."""
+    branch = scf.IfOp(_raw(predicate), [], has_else=False)
+    with ir.InsertionPoint(branch.regions[0].blocks[0]):
+        llvm.Trap()
+        scf.YieldOp([])
 
 
 def read_clock() -> fx.ArithValue:

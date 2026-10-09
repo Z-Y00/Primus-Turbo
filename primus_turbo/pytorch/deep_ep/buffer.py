@@ -530,6 +530,140 @@ class Buffer:
                 EventOverlap(event),
             )
 
+    def dispatch_sdma(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        handle: Optional[Tuple] = None,
+        num_tokens_per_rank: Optional[torch.Tensor] = None,
+        num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
+        is_token_in_rank: Optional[torch.Tensor] = None,
+        num_tokens_per_expert: Optional[torch.Tensor] = None,
+        topk_idx: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        expert_alignment: int = 1,
+        num_worst_tokens: int = 0,
+        config: Optional[Config] = None,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        """Intranode BF16/FP16/FP8 dispatch through KIWI and batched SDMA.
+
+        The returned handle is intentionally identical to :meth:`dispatch`, so
+        the existing CU-based :meth:`combine` consumes it unchanged.
+        """
+        x, x_scales = x if isinstance(x, tuple) else (x, None)
+        if x_scales is None:
+            assert x.dtype in (torch.bfloat16, torch.float16)
+        else:
+            assert x.dtype == torch.float8_e4m3fn
+            assert x_scales.dtype == torch.float32
+        assert self.runtime.get_num_rdma_ranks() == 1, "KIWI_SDMA is intranode-only"
+        config = self.get_dispatch_config(self.group_size) if config is None else config
+
+        if handle is not None:
+            assert topk_idx is None and topk_weights is None
+            (
+                rank_prefix_matrix,
+                channel_prefix_matrix,
+                _,
+                recv_src_idx,
+                is_token_in_rank,
+                _,
+            ) = handle
+            (
+                recv_x,
+                recv_x_scales,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                _,
+                event,
+            ) = self.runtime.intranode_dispatch_sdma(
+                x,
+                x_scales,
+                None,
+                None,
+                None,
+                is_token_in_rank,
+                None,
+                recv_src_idx.size(0),
+                rank_prefix_matrix,
+                channel_prefix_matrix,
+                expert_alignment,
+                num_worst_tokens,
+                config,
+                getattr(previous_event, "event", None),
+                async_finish,
+                allocate_on_comm_stream,
+            )
+            return (
+                (recv_x, recv_x_scales) if x_scales is not None else recv_x,
+                None,
+                None,
+                None,
+                None,
+                EventOverlap(event),
+            )
+
+        assert (
+            num_tokens_per_rank is not None
+            and is_token_in_rank is not None
+            and num_tokens_per_expert is not None
+            and topk_idx is not None
+            and topk_weights is not None
+        )
+        (
+            recv_x,
+            recv_x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert,
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            recv_channel_prefix_matrix,
+            recv_src_idx,
+            send_head,
+            event,
+        ) = self.runtime.intranode_dispatch_sdma(
+            x,
+            x_scales,
+            topk_idx,
+            topk_weights,
+            num_tokens_per_rank,
+            is_token_in_rank,
+            num_tokens_per_expert,
+            0,
+            None,
+            None,
+            expert_alignment,
+            num_worst_tokens,
+            config,
+            getattr(previous_event, "event", None),
+            async_finish,
+            allocate_on_comm_stream,
+        )
+        handle = (
+            rank_prefix_matrix,
+            channel_prefix_matrix,
+            recv_channel_prefix_matrix,
+            recv_src_idx,
+            is_token_in_rank,
+            send_head,
+        )
+        return (
+            (recv_x, recv_x_scales) if x_scales is not None else recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            num_recv_tokens_per_expert,
+            handle,
+            EventOverlap(event),
+        )
+
     # noinspection PyTypeChecker
     def combine(
         self,

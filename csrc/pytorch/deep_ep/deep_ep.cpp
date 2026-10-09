@@ -17,6 +17,7 @@
 #include "primus_turbo/deep_ep/api.h"
 
 #include "deep_ep.hpp"
+#include "kiwi_sdma_state.hpp"
 
 namespace primus_turbo::pytorch::deep_ep {
 
@@ -208,8 +209,12 @@ void Buffer::maybe_join_stream(const c10::cuda::CUDAStream &compute_stream) cons
 void Buffer::destroy() {
     PRIMUS_TURBO_CHECK(not destroyed);
 
-    // Synchronize
+    // Keep the KIWI proxy alive while outstanding dispatch kernels drain.
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+    if (kiwi_sdma_state) {
+        kiwi_sdma_state->stop();
+        kiwi_sdma_state.reset();
+    }
 
     if (num_nvl_bytes > 0) {
         // Barrier

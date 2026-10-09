@@ -61,12 +61,17 @@ from primus_turbo.flydsl.mega.fp8.gemm_helper import (
     build_preshuffle_ab_kernel,
     run_compiled,
 )
-from primus_turbo.flydsl.utils.prims import ceildiv
+from primus_turbo.flydsl.utils.prims import ceildiv, device_trap_if
 
 MXFP8_BLOCK = 32  # mxfp8 block (elements per E8M0 scale)
 MXFP8_VEC = 8  # sub-vector width for the bf16 load / f32 compute
 # Match grouped GEMM / gemm_mxfp8_nt_tile (its local _SCALE_PACK).
 MXFP8_SCALE_PACK = 4
+
+
+def _assert_finite_f32(value):
+    bits = fx.arith.ArithValue(value).bitcast(fx.T.i32())
+    device_trap_if((bits & fx.Int32(0x7F800000)) == fx.Int32(0x7F800000))
 
 
 # ── shared MXFP8 block math ───────────────────────────────────────────────────────────────
@@ -85,6 +90,8 @@ def mxfp8_words_from_f32_subvecs(fvs):
     sub_amax = []
     for s in range_constexpr(subs):
         fv = fvs[s]
+        for i in range_constexpr(MXFP8_VEC):
+            _assert_finite_f32(fv[i])
         av = fx.arith.maximumf(fv, fx.arith.mulf(fv, neg1))  # |fv|
         sub_amax.append(
             fx.arith.ArithValue(_vector.reduction(fx.T.f32(), _vector.CombiningKind.MAXIMUMF, av))
@@ -100,6 +107,7 @@ def mxfp8_words_from_f32_subvecs(fvs):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
+    device_trap_if(biased == fx.Int32(0xFF))
     # Build 1/scale from the exponent bits rather than dividing by `bits(biased << 23)`: an
     # all-zero block clamps biased to 0, where the divide form gives 1.0/0.0 = inf and every
     # element quantizes to 0*inf = NaN. Loss-masked tokens have exactly-zero gradient rows, so
@@ -143,6 +151,7 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     takes vectors; the colwise kernels gather their 32 values stride-wise, one scalar at a time."""
     amax = None
     for fv in vals:
+        _assert_finite_f32(fv)
         a = fmath.absf(fv)
         amax = a if amax is None else fx.arith.maximumf(amax, a)
     amax_bits = fx.arith.ArithValue(amax).bitcast(fx.T.i32())
@@ -151,6 +160,7 @@ def _e8m0_quant_pack(vals, round_add, target_pow2, lo, hi, cvt, zero_i32):
     exp = fx.arith.select(exp < fx.Int32(-127), fx.Int32(-127), exp)
     exp = fx.arith.select(exp > fx.Int32(128), fx.Int32(128), exp)
     biased = fx.arith.ArithValue(exp) + fx.Int32(127)
+    device_trap_if(biased == fx.Int32(0xFF))
     # scale is an exact power of two, so 1/scale = 2^(127-biased) = float bits ((254-biased) << 23):
     # bit-identical to 1.0/scale but a sub+shift instead of an fdiv. See the all-zero-block trap in
     # mxfp8_words_from_f32_subvecs.

@@ -12,6 +12,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -21,6 +22,8 @@
 #include "event.hpp"
 #include <c10/cuda/CUDAStream.h>
 namespace primus_turbo::pytorch::deep_ep {
+
+class KiwiSdmaState;
 
 struct Buffer {
 
@@ -79,6 +82,9 @@ private:
     // When true, all dispatch/combine kernels run on the caller's current CUDA
     // stream instead of ``comm_stream``.
     bool force_current_stream = true;
+
+    // Lazily constructed only when the KIWI_SDMA backend is selected.
+    std::unique_ptr<KiwiSdmaState> kiwi_sdma_state;
 
     // Pick the launch stream for this dispatch/combine call.  Returns the
     // caller's current stream when ``force_current_stream`` is set; otherwise
@@ -147,6 +153,24 @@ public:
                        const primus_turbo::deep_ep::Config &config,
                        std::optional<EventHandle> &previous_event, bool async,
                        bool allocate_on_comm_stream);
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::vector<int>, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
+    intranode_dispatch_sdma(
+        const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales,
+        const std::optional<torch::Tensor> &topk_idx,
+        const std::optional<torch::Tensor> &topk_weights,
+        const std::optional<torch::Tensor> &num_tokens_per_rank,
+        const torch::Tensor &is_token_in_rank,
+        const std::optional<torch::Tensor> &num_tokens_per_expert,
+        int cached_num_recv_tokens,
+        const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
+        const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
+        int expert_alignment, int num_worst_tokens,
+        const primus_turbo::deep_ep::Config &config,
+        std::optional<EventHandle> &previous_event, bool async,
+        bool allocate_on_comm_stream);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,

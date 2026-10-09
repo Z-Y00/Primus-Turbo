@@ -400,6 +400,7 @@ def build_kernels_extension():
     include_dirs = [
         Path(PROJECT_ROOT / "csrc"),
         Path(PROJECT_ROOT / "csrc" / "include"),
+        Path(PROJECT_ROOT / "3rdparty" / "kiwi" / "include"),
         Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
         Path(PROJECT_ROOT / "3rdparty" / "hipkittens" / "include"),
     ]
@@ -451,6 +452,12 @@ def build_torch_extension():
     # CPP
     pytorch_csrc_source_files = Path(PROJECT_ROOT / "csrc" / "pytorch")
     sources = all_files_in_dir(pytorch_csrc_source_files, name_extensions=["cpp", "cc", "cu"])
+    # KIWI's invoke layer is header-only; these two host-side sources provide
+    # the SPSC device-to-host queue storage and fine-grained HSA allocation.
+    sources += [
+        str(PROJECT_ROOT / "3rdparty" / "kiwi" / "src" / "queue" / "device_to_host_queue.cpp"),
+        str(PROJECT_ROOT / "3rdparty" / "kiwi" / "src" / "queue" / "host_memory.cpp"),
+    ]
 
     return CUDAExtension(
         name="primus_turbo.pytorch._C",
@@ -458,9 +465,11 @@ def build_torch_extension():
         include_dirs=[
             Path(PROJECT_ROOT / "csrc"),
             Path(PROJECT_ROOT / "csrc" / "include"),
+            Path(PROJECT_ROOT / "3rdparty" / "kiwi" / "include"),
             Path(PROJECT_ROOT / "3rdparty" / "composable_kernel" / "include"),
             Path(PROJECT_ROOT / "3rdparty" / "hipkittens" / "include"),
         ],
+        libraries=["hsa-runtime64"],
         **extra_flags,
     )
 

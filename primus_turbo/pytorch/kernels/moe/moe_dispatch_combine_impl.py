@@ -216,6 +216,10 @@ class _DeepEPLikeBackend:
         """Extra keyword arguments forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
         return {}
 
+    def _dispatch_buffer(self, buffer, *args, **kwargs):
+        """Call the transport-specific Buffer dispatch entry point."""
+        return buffer.dispatch(*args, **kwargs)
+
     # ------------------------------------------------------------------
     # EPBackend interface
     # ------------------------------------------------------------------
@@ -310,7 +314,8 @@ class _DeepEPLikeBackend:
                 tokens_per_expert,
                 handle,
                 after_event,
-            ) = buffer.dispatch(
+            ) = self._dispatch_buffer(
+                buffer,
                 x,
                 topk_idx=topk_idx,
                 topk_weights=token_weights,
@@ -325,7 +330,8 @@ class _DeepEPLikeBackend:
             )
         else:
             recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, after_event = (
-                buffer.dispatch(
+                self._dispatch_buffer(
+                    buffer,
                     x,
                     handle=handle,
                     previous_event=previous_event,
@@ -417,6 +423,36 @@ class DeepEPBackend(_DeepEPLikeBackend):
         return {}
 
 
+class KiwiSdmaEPBackend(TurboEPBackend):
+    """KIWI GPU→CPU invoke plus host-issued batched SDMA dispatch.
+
+    Combine deliberately remains on Turbo DeepEP's existing CU path.
+    """
+
+    def init_buffer(
+        self,
+        group: dist.ProcessGroup,
+        hidden_bytes: int,
+        config: EPBufferConfig,
+    ) -> None:
+        required = {
+            "ROC_P2P_SDMA_SIZE": "0",
+            "GPU_FORCE_BLIT_COPY_SIZE": "0",
+        }
+        missing = [f"{key}=0" for key, value in required.items() if os.environ.get(key) != value]
+        if missing:
+            raise RuntimeError(
+                "KIWI_SDMA requires these variables before process launch: "
+                + " ".join(missing)
+            )
+        if group.size() > 8:
+            raise RuntimeError("KIWI_SDMA currently supports intranode EP groups of at most 8 ranks")
+        super().init_buffer(group, hidden_bytes, config)
+
+    def _dispatch_buffer(self, buffer, *args, **kwargs):
+        return buffer.dispatch_sdma(*args, **kwargs)
+
+
 # =========================================================================
 # Backend registry
 # =========================================================================
@@ -424,6 +460,7 @@ class DeepEPBackend(_DeepEPLikeBackend):
 _BACKEND_REGISTRY: Dict[str, Type[EPBackend]] = {
     "TURBO": TurboEPBackend,
     "DEEP_EP": DeepEPBackend,
+    "KIWI_SDMA": KiwiSdmaEPBackend,
 }
 
 _backend_instances: Dict[str, EPBackend] = {}
