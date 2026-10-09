@@ -84,7 +84,7 @@ private:
     bool force_current_stream = true;
 
     // Lazily constructed only when the KIWI_SDMA backend is selected.
-    std::unique_ptr<KiwiSdmaState> kiwi_sdma_state;
+    std::shared_ptr<KiwiSdmaState> kiwi_sdma_state;
 
     // Pick the launch stream for this dispatch/combine call.  Returns the
     // caller's current stream when ``force_current_stream`` is set; otherwise

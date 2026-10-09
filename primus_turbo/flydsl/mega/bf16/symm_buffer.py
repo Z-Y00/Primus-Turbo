@@ -339,6 +339,20 @@ class SymmBuffer:
             self.combine_flag,
             self.reduce_flag,
         ) = slice_input_buffers(heap)
+        pool_offset = Workspace(
+            0,
+            self.world,
+            self.num_experts,
+            self.num_max_tokens_per_rank,
+            self.num_topk,
+            self.hidden,
+            token_dtype,
+        ).get_dispatch_token_pool_ptr()
+        self.dispatch_pool_ptrs = torch.tensor(
+            [ptr + pool_offset for ptr in self.symm_mem.buffer_ptrs],
+            dtype=torch.int64,
+            device="cuda",
+        )
 
         self.num_tokens_per_rank = torch.full(
             (self.world,), self.num_tokens, dtype=torch.int32, device="cuda"

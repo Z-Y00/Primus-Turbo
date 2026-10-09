@@ -22,6 +22,7 @@ from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource,
+    create_buffer_resource_from_addr,
     extract_base_index,
 )
 from flydsl.expr.typing import AddressSpace, PointerType
@@ -51,11 +52,19 @@ from primus_turbo.flydsl.mega.bf16.symm_buffer import (
     Workspace,
     get_symm_buffer_for_mega_moe,
 )
+from primus_turbo.flydsl.mega.sdma import dispatch_bf16 as dispatch_bf16_sdma
+from primus_turbo.flydsl.mega.sdma import enabled as sdma_enabled
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
 )
-from primus_turbo.flydsl.utils.prims import cast, ld, read_clock, spin_timed_out
+from primus_turbo.flydsl.utils.prims import (
+    cast,
+    device_trap_if,
+    ld,
+    read_clock,
+    spin_timed_out,
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -83,6 +92,7 @@ def _make_kernel(
     num_experts=0,
     num_max_tokens_per_rank=0,
     num_topk=0,
+    sdma=False,
 ):
     K = hidden_size
     is_tn = layout == "tn"
@@ -122,6 +132,8 @@ def _make_kernel(
         out_n_rt: fx.Int32,
         DISP_PARITY: fx.Tensor,
         DISP_EXPECTED: fx.Tensor,
+        REAL_COUNTS: fx.Tensor,
+        EXPERT_PREFIX: fx.Tensor,
     ):
         thread_index = fx.thread_idx.x
         block_index, _b, _c = fx.block_idx
@@ -155,6 +167,64 @@ def _make_kernel(
         expert_send_count_resource = create_buffer_resource(EXPERT_SEND_COUNT, max_size=True)
         expert_send_offset_resource = create_buffer_resource(EXPERT_SEND_OFFSET, max_size=True)
         dispatched_token_idx_resource = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
+        real_counts_resource = create_buffer_resource(REAL_COUNTS, max_size=True)
+        expert_prefix_resource = create_buffer_resource(EXPERT_PREFIX, max_size=True)
+        pool_resource = create_buffer_resource_from_addr(
+            dispatch_token_pool_base,
+            num_records_bytes=num_max_pool_tokens * hidden_size * 2,
+        )
+
+        def wait_sdma_rows(group_idx, pool_block, whole_expert=False):
+            expert_start = cast(
+                buffer_load(expert_prefix_resource, group_idx, vec_width=1, dtype=fx.T.i64()),
+                fx.T.i32(),
+            )
+            real_count = cast(
+                buffer_load(real_counts_resource, group_idx, vec_width=1, dtype=fx.T.i64()),
+                fx.T.i32(),
+            )
+            if const_expr(whole_expert):
+                first = expert_start
+                valid_rows = real_count
+            else:
+                first = pool_block * fx.Int32(BLOCK_M)
+                remaining = expert_start + real_count - first
+                valid_rows = arith.select(
+                    remaining < fx.Int32(BLOCK_M), remaining, fx.Int32(BLOCK_M)
+                )
+                valid_rows = arith.select(valid_rows > fx.Int32(0), valid_rows, fx.Int32(0))
+            word = thread_index
+            total_words = valid_rows * fx.Int32(hidden_size // 2)
+            while word < total_words:
+                absolute_word = first * fx.Int32(hidden_size // 2) + word
+                value = buffer_load(
+                    pool_resource,
+                    absolute_word,
+                    vec_width=1,
+                    dtype=fx.T.i32(),
+                    cache_modifier=19,
+                )
+                spin_start = read_clock()
+                while ((value & fx.Int32(0xFFFF)) == fx.Int32(0x7F81)) | (
+                    ((value >> fx.Int32(16)) & fx.Int32(0xFFFF)) == fx.Int32(0x7F81)
+                ):
+                    timed_out = spin_timed_out(spin_start)
+                    if timed_out:
+                        fx.printf(
+                            "MegaMoE KIWI SDMA BF16 sentinel timeout expert={} row_word={}\n",
+                            group_idx,
+                            absolute_word,
+                        )
+                    device_trap_if(timed_out)
+                    value = buffer_load(
+                        pool_resource,
+                        absolute_word,
+                        vec_width=1,
+                        dtype=fx.T.i32(),
+                        cache_modifier=19,
+                    )
+                word = word + fx.Int32(_BLOCK_THREADS)
+            fx.gpu.barrier()
         if const_expr(is_tn):
             go_base = fx.arith.ArithValue(
                 arith.index_cast(fx.T.i64(), extract_base_index(GROUP_OFFS)), signed=True
@@ -166,26 +236,27 @@ def _make_kernel(
             num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
 
         if block_index < comm_block_count:
-            local_task_count = (
-                fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
-            ) // comm_block_count
-            for task_iteration in range(local_task_count):
-                dispatch_bf16_tile(
-                    sym_buffer,
-                    workspace,
-                    thread_index=thread_index,
-                    hidden_size=hidden_size,
-                    input_res=input_resource,
-                    expert_send_dst_rank_res=expert_send_dst_rank_resource,
-                    expert_send_dst_row_res=expert_send_dst_row_resource,
-                    expert_send_count_res=expert_send_count_resource,
-                    expert_send_offset_res=expert_send_offset_resource,
-                    dispatched_token_idx_res=dispatched_token_idx_resource,
-                    task_index=block_index + task_iteration * comm_block_count,
-                    signal=True,
-                    disp_parity=disp_parity,
-                    num_ranks=num_ranks,
-                )
+            if not const_expr(sdma):
+                local_task_count = (
+                    fx.Int32(num_comm) - block_index + comm_block_count - fx.Int32(1)
+                ) // comm_block_count
+                for task_iteration in range(local_task_count):
+                    dispatch_bf16_tile(
+                        sym_buffer,
+                        workspace,
+                        thread_index=thread_index,
+                        hidden_size=hidden_size,
+                        input_res=input_resource,
+                        expert_send_dst_rank_res=expert_send_dst_rank_resource,
+                        expert_send_dst_row_res=expert_send_dst_row_resource,
+                        expert_send_count_res=expert_send_count_resource,
+                        expert_send_offset_res=expert_send_offset_resource,
+                        dispatched_token_idx_res=dispatched_token_idx_resource,
+                        task_index=block_index + task_iteration * comm_block_count,
+                        signal=True,
+                        disp_parity=disp_parity,
+                        num_ranks=num_ranks,
+                    )
         elif const_expr(is_tn):
             tile_index = block_index - comm_block_count
             if tile_index < fx.Int32(TOTAL):
@@ -203,7 +274,11 @@ def _make_kernel(
                 real_count = buffer_load(real_count_resource, group_idx, vec_width=1, dtype=fx.T.i32())
                 m_end = m_start + real_count
                 ge_blk = bank_offset + group_idx
-                if thread_index == fx.Int32(0):
+                if const_expr(sdma):
+                    # In TN, block_m tiles the output feature dimension, not
+                    # pool rows; each tile contracts over the whole expert.
+                    wait_sdma_rows(group_idx, block_m, whole_expert=True)
+                elif thread_index == fx.Int32(0):
                     spin_start = read_clock()
                     fx.rocdl.s_waitcnt(0)
                     sig = ld(dispatch_flag_base, ge_blk, scope="sys", dtype=fx.T.i64())
@@ -265,7 +340,9 @@ def _make_kernel(
                 block_n = pid_in_group // group_size_m
                 g_idx = buffer_load(group_resource, block_m, vec_width=1, dtype=fx.T.i32())
                 blk = bank_offset + g_idx
-                if thread_index == fx.Int32(0):
+                if const_expr(sdma):
+                    wait_sdma_rows(g_idx, block_m)
+                elif thread_index == fx.Int32(0):
                     spin_start = read_clock()
                     fx.rocdl.s_waitcnt(0)
                     signal = ld(dispatch_flag_base, blk, scope="sys", dtype=fx.T.i64())
@@ -371,6 +448,8 @@ def _compiled_dispatch_grouped_gemm(
     out_n_rt: int,
     DISP_PARITY,
     DISP_EXPECTED,
+    REAL_COUNTS,
+    EXPERT_PREFIX,
     out_features: fx.Constexpr[int],
     hidden_size: fx.Constexpr[int],
     num_max_pool_tokens: fx.Constexpr[int],
@@ -388,6 +467,7 @@ def _compiled_dispatch_grouped_gemm(
     num_experts: fx.Constexpr[int],
     num_max_tokens_per_rank: fx.Constexpr[int],
     num_topk: fx.Constexpr[int],
+    sdma: fx.Constexpr[bool],
     stream: fx.Stream,
 ):
     # layout_code: 0=nt, 1=nn, 2=tn; tn uses 2 XCDs, nt/nn use 8
@@ -416,6 +496,7 @@ def _compiled_dispatch_grouped_gemm(
         num_experts=int(num_experts),
         num_max_tokens_per_rank=int(num_max_tokens_per_rank),
         num_topk=int(num_topk),
+        sdma=bool(sdma),
     )
     kernel(
         INPUT_TOKENS,
@@ -435,6 +516,8 @@ def _compiled_dispatch_grouped_gemm(
         out_n_rt,
         DISP_PARITY,
         DISP_EXPECTED,
+        REAL_COUNTS,
+        EXPERT_PREFIX,
         value_attrs=make_value_attrs(2, 0, "512,512"),
     ).launch(grid=(grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
 
@@ -499,7 +582,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         expert_send_offset,
         dispatched_token_idx,
         tile_to_expert,
-        _,
+        real_counts,
         num_tokens_per_expert_prefix,
         num_tile_blocks,
         *_combine_recv_and_pool_src,
@@ -557,6 +640,10 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         out_features_ce, hidden_size_ce = N, hidden_size
         G, trans_c = 0, False  # nt/nn grid uses worst_case_tiles; C never transposed
 
+    use_sdma = sdma_enabled()
+    if use_sdma:
+        dispatch_bf16_sdma(x, handle, symm, group)
+
     # epoch tensors are bumped by _make_epoch_bump inside _compiled; just pass them through
     _compiled_dispatch_grouped_gemm(
         x_i32,
@@ -576,6 +663,8 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         out_n_rt,
         DISP_PARITY=symm._disp_parity,
         DISP_EXPECTED=symm._disp_expected,
+        REAL_COUNTS=real_counts,
+        EXPERT_PREFIX=num_tokens_per_expert_prefix,
         out_features=int(out_features_ce),
         hidden_size=int(hidden_size_ce),
         num_max_pool_tokens=int(num_max_pool_tokens),
@@ -591,6 +680,7 @@ def dispatch_grouped_gemm_bf16_flydsl_kernel(
         num_experts=int(symm.num_experts),
         num_max_tokens_per_rank=int(symm.num_max_tokens_per_rank),
         num_topk=int(symm.num_topk),
+        sdma=use_sdma,
         stream=torch.cuda.current_stream(),
     )
     return output, symm.dispatch_token_pool, symm.weight_recv_buf, handle

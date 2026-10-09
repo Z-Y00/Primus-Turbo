@@ -27,6 +27,7 @@ public:
     KiwiSdmaState& operator=(const KiwiSdmaState&) = delete;
 
     void ensure(size_t num_endpoints);
+    void* reserve_staging(size_t bytes);
     void stop();
     void check_error() const;
 
@@ -52,6 +53,12 @@ private:
     std::vector<void*> dsts_;
     std::vector<void*> srcs_;
     std::vector<size_t> sizes_;
+    void* staging_ = nullptr;
+    size_t staging_bytes_ = 0;
 };
+
+// Process-wide ownership prevents one application object from tearing down a
+// per-device proxy while another (for example MegaMoE) still uses it.
+std::shared_ptr<KiwiSdmaState> get_kiwi_sdma_state(int device_id);
 
 } // namespace primus_turbo::pytorch::deep_ep

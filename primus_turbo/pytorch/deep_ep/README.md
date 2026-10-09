@@ -69,6 +69,23 @@ Current limitations:
 - BF16/FP16 inputs must not contain the reserved signaling-NaN bit pattern
   `0x7f81`; FP8 E4M3 inputs must not contain `0x7f` or `0xff`, and FP8
   scales must be finite;
-- MXFP8 dispatch integration is still under development;
 - the backend is not CUDA-graph capturable because progress and copy
   submission run on a host proxy thread.
+
+MegaMoE keeps its fused CU-copy dispatch by default. To opt its BF16 and
+MXFP8 paths into the same KIWI proxy and batched-SDMA transport, additionally
+set:
+
+```bash
+export PRIMUS_TURBO_MEGA_MOE_DISPATCH=KIWI_SDMA
+```
+
+MegaMoE preserves its prologue/handle ABI and CU combine. Its sender packs
+each expert/source-rank segment into contiguous row chunks (64 KiB payloads
+where counts permit). Before each dispatch, ranks re-arm and rendezvous on
+the destination pool; the GEMM side uses system-coherent bitwise sentinel
+polling over every valid BF16 or FP8+scale word instead of the CU completion
+counter. `ROC_P2P_SDMA_SIZE=0` and `GPU_FORCE_BLIT_COPY_SIZE=0` are mandatory
+for this opt-in mode as well. MegaMoE MXFP8 uses the E4M3 FNUZ NaN encoding
+`0x80` as its data sentinel (`0x7f` is a valid finite maximum in this format)
+and `0xff` as its E8M0 scale sentinel.

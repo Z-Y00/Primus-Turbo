@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace primus_turbo::pytorch::deep_ep {
 namespace {
@@ -42,7 +43,7 @@ KiwiSdmaState::~KiwiSdmaState() {
 }
 
 void KiwiSdmaState::ensure(size_t num_endpoints) {
-    if (context_ && num_endpoints_ == num_endpoints) {
+    if (context_ && num_endpoints_ >= num_endpoints) {
         check_error();
         return;
     }
@@ -71,6 +72,18 @@ void KiwiSdmaState::ensure(size_t num_endpoints) {
            !failed_.load(std::memory_order_acquire))
         std::this_thread::yield();
     check_error();
+}
+
+void* KiwiSdmaState::reserve_staging(size_t bytes) {
+    check_error();
+    if (bytes <= staging_bytes_) return staging_;
+    // Resizing is rare (shape change). Drain the current copy stream before
+    // releasing storage that an outstanding batched copy may still reference.
+    if (copy_stream_) PRIMUS_TURBO_CHECK_HIP(hipStreamSynchronize(copy_stream_));
+    if (staging_) PRIMUS_TURBO_CHECK_HIP(hipFree(staging_));
+    PRIMUS_TURBO_CHECK_HIP(hipMalloc(&staging_, bytes));
+    staging_bytes_ = bytes;
+    return staging_;
 }
 
 void KiwiSdmaState::flush() {
@@ -146,6 +159,11 @@ void KiwiSdmaState::stop() {
         copy_stream_ = nullptr;
     }
     context_.reset();
+    if (staging_) {
+        (void)hipFree(staging_);
+        staging_ = nullptr;
+        staging_bytes_ = 0;
+    }
     num_endpoints_ = 0;
     dsts_.clear();
     srcs_.clear();
@@ -169,6 +187,15 @@ void KiwiSdmaState::check_error() const {
 
 void* KiwiSdmaState::device_context() const {
     return context_ ? context_->device_context() : nullptr;
+}
+
+std::shared_ptr<KiwiSdmaState> get_kiwi_sdma_state(int device_id) {
+    static std::mutex mutex;
+    static std::unordered_map<int, std::shared_ptr<KiwiSdmaState>> states;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& state = states[device_id];
+    if (!state) state = std::make_shared<KiwiSdmaState>(device_id);
+    return state;
 }
 
 } // namespace primus_turbo::pytorch::deep_ep

@@ -13,6 +13,11 @@ namespace primus_turbo::pytorch {
 /********************************************/
 
 TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
+    m.def("mega_moe_kiwi_sdma_dispatch(Tensor input, Tensor? scales, "
+          "Tensor expert_send_dst_rank, Tensor expert_send_dst_row, "
+          "Tensor expert_send_count, Tensor expert_send_offset, "
+          "Tensor dispatched_token_idx, Tensor pool_ptrs, Tensor? scale_ptrs) -> ()");
+
     // ********* Gemm *********
     m.def("hipblaslt_gemm(Tensor A, Tensor B, "
           "ScalarType out_dtype, bool transA, bool transB, bool transC,"
@@ -182,6 +187,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
 }
 
 TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
+    m.impl("mega_moe_kiwi_sdma_dispatch", mega_moe_kiwi_sdma_dispatch);
+
     // ********* Gemm *********
     m.impl("hipblaslt_gemm", hipblaslt_gemm);
     m.impl("hipblaslt_gemm_fp8", hipblaslt_gemm_fp8);

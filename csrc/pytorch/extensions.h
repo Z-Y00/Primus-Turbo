@@ -23,6 +23,16 @@
 
 namespace primus_turbo::pytorch {
 
+void mega_moe_kiwi_sdma_dispatch(
+    const at::Tensor& input, const c10::optional<at::Tensor>& scales,
+    const at::Tensor& expert_send_dst_rank,
+    const at::Tensor& expert_send_dst_row,
+    const at::Tensor& expert_send_count,
+    const at::Tensor& expert_send_offset,
+    const at::Tensor& dispatched_token_idx,
+    const at::Tensor& pool_ptrs,
+    const c10::optional<at::Tensor>& scale_ptrs);
+
 //==================================================================
 //  Quantization
 //==================================================================

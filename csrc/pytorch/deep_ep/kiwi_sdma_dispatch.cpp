@@ -101,7 +101,7 @@ Buffer::intranode_dispatch_sdma(
     }
 
     if (!kiwi_sdma_state)
-        kiwi_sdma_state = std::make_unique<KiwiSdmaState>(device_id);
+        kiwi_sdma_state = get_kiwi_sdma_state(device_id);
     kiwi_sdma_state->ensure(static_cast<size_t>(num_channels) * num_ranks);
 
     int num_recv_tokens = -1;

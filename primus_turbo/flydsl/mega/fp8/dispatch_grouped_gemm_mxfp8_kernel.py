@@ -35,7 +35,7 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith
+from flydsl.expr import arith, const_expr
 from flydsl.expr.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -68,9 +68,12 @@ from primus_turbo.flydsl.mega.fp8.prims import (
 )
 from primus_turbo.flydsl.mega.fp8.quant import quantize_rowwise_mxfp8_flydsl
 from primus_turbo.flydsl.mega.fp8.symm_buffer import SymLayout, get_symm_buffer_for_mega_moe
+from primus_turbo.flydsl.mega.sdma import dispatch_fp8 as dispatch_fp8_sdma
+from primus_turbo.flydsl.mega.sdma import enabled as sdma_enabled
 from primus_turbo.flydsl.utils.prims import (
     cast,
     ceildiv,
+    device_trap_if,
     read_clock,
     spin_timed_out,
 )
@@ -290,6 +293,7 @@ def _compile(
     out_fp16=False,
     GROUP_M=4,
     num_gemm_cu=None,
+    sdma=False,
 ):
     K = hidden_size
     N = out_features
@@ -347,6 +351,8 @@ def _compile(
         DISP_PARITY: fx.Tensor,
         DISP_EXPECTED: fx.Tensor,
         PS_EXPECTED: fx.Tensor,
+        REAL_COUNTS: fx.Tensor,
+        EXPERT_PREFIX: fx.Tensor,
         c_n: fx.Int32,
     ):
         thread_index = fx.thread_idx.x
@@ -377,6 +383,16 @@ def _compile(
         dti = create_buffer_resource(DISPATCHED_TOKEN_IDX, max_size=True)
         group_resource = create_buffer_resource(TILE_TO_GROUP, max_size=True)
         num_tile_blocks_resource = create_buffer_resource(NUM_TILE_BLOCKS, max_size=True)
+        real_counts_resource = create_buffer_resource(REAL_COUNTS, max_size=True)
+        expert_prefix_resource = create_buffer_resource(EXPERT_PREFIX, max_size=True)
+        pool_fp8_resource = create_buffer_resource_from_addr(
+            sym_layout.pool_fp8_ptr,
+            num_records_bytes=num_max_pool_tokens * hidden_size,
+        )
+        pool_scale_resource = create_buffer_resource_from_addr(
+            sym_layout.pool_scale_ptr,
+            num_records_bytes=pool_scale_bytes_raw,
+        )
 
         dispatch_tile = dispatch_fp8_copy_tile(
             thread_index=thread_index,
@@ -403,7 +419,7 @@ def _compile(
         )
 
         if block_index < comm_block_count:
-            if not _no_comm:
+            if (not _no_comm) and (not const_expr(sdma)):
                 # ---- COMM role: this block owns tasks {comm_idx, comm_idx+comm_cu, ...} ----
                 comm_idx = block_index
                 local_task_count = ceildiv(fx.Int32(num_comm) - comm_idx, comm_block_count)
@@ -422,7 +438,102 @@ def _compile(
                     block_m_ps = ps_index + fx.Int32(_r * num_preshuffle_cu)
                     if block_m_ps < real_tiles:
                         expert_ps = buffer_load(group_resource, block_m_ps, vec_width=1, dtype=fx.T.i32())
-                        if (not _no_comm) and thread_index == fx.Int32(0):
+                        if const_expr(sdma):
+                            expert_start = cast(
+                                buffer_load(
+                                    expert_prefix_resource,
+                                    expert_ps,
+                                    vec_width=1,
+                                    dtype=fx.T.i64(),
+                                ),
+                                fx.T.i32(),
+                            )
+                            real_count = cast(
+                                buffer_load(
+                                    real_counts_resource,
+                                    expert_ps,
+                                    vec_width=1,
+                                    dtype=fx.T.i64(),
+                                ),
+                                fx.T.i32(),
+                            )
+                            first = block_m_ps * fx.Int32(BLOCK_M)
+                            remaining = expert_start + real_count - first
+                            valid_rows = arith.select(
+                                remaining < fx.Int32(BLOCK_M),
+                                remaining,
+                                fx.Int32(BLOCK_M),
+                            )
+                            valid_rows = arith.select(
+                                valid_rows > fx.Int32(0), valid_rows, fx.Int32(0)
+                            )
+                            word = thread_index
+                            total_words = valid_rows * fx.Int32(hidden_size // 4)
+                            while word < total_words:
+                                absolute_word = first * fx.Int32(hidden_size // 4) + word
+                                value = buffer_load(
+                                    pool_fp8_resource,
+                                    absolute_word,
+                                    vec_width=1,
+                                    dtype=fx.T.i32(),
+                                    cache_modifier=19,
+                                )
+                                spin_start = read_clock()
+                                while (
+                                    ((value & fx.Int32(0xFF)) == fx.Int32(0x80))
+                                    | (((value >> fx.Int32(8)) & fx.Int32(0xFF)) == fx.Int32(0x80))
+                                    | (((value >> fx.Int32(16)) & fx.Int32(0xFF)) == fx.Int32(0x80))
+                                    | (((value >> fx.Int32(24)) & fx.Int32(0xFF)) == fx.Int32(0x80))
+                                ):
+                                    timed_out = spin_timed_out(spin_start)
+                                    if timed_out:
+                                        fx.printf(
+                                            "MegaMoE KIWI SDMA FP8 sentinel timeout expert={} word={}\n",
+                                            expert_ps,
+                                            absolute_word,
+                                        )
+                                    device_trap_if(timed_out)
+                                    value = buffer_load(
+                                        pool_fp8_resource,
+                                        absolute_word,
+                                        vec_width=1,
+                                        dtype=fx.T.i32(),
+                                        cache_modifier=19,
+                                    )
+                                word = word + fx.Int32(_BLOCK_THREADS)
+                            scale_word = thread_index
+                            total_scale_words = valid_rows * fx.Int32(hidden_size // 128)
+                            while scale_word < total_scale_words:
+                                absolute_scale = (
+                                    first * fx.Int32(hidden_size // 128) + scale_word
+                                )
+                                scale_value = buffer_load(
+                                    pool_scale_resource,
+                                    absolute_scale,
+                                    vec_width=1,
+                                    dtype=fx.T.i32(),
+                                    cache_modifier=19,
+                                )
+                                scale_start = read_clock()
+                                while scale_value == fx.Int32(-1):
+                                    timed_out = spin_timed_out(scale_start)
+                                    if timed_out:
+                                        fx.printf(
+                                            "MegaMoE KIWI SDMA scale sentinel timeout expert={} word={}\n",
+                                            expert_ps,
+                                            absolute_scale,
+                                        )
+                                    device_trap_if(timed_out)
+                                    scale_value = buffer_load(
+                                        pool_scale_resource,
+                                        absolute_scale,
+                                        vec_width=1,
+                                        dtype=fx.T.i32(),
+                                        cache_modifier=19,
+                                    )
+                                scale_word = scale_word + fx.Int32(_BLOCK_THREADS)
+                            fx.gpu.barrier()
+                        elif (not _no_comm) and thread_index == fx.Int32(0):
                             spin_start = read_clock()
                             sig = ld(
                                 dispatch_flag_local, bank_offset + expert_ps, scope="sys", dtype=fx.T.i64()
@@ -567,6 +678,8 @@ def _compile(
         DISP_PARITY,
         DISP_EXPECTED,
         PS_EXPECTED,
+        REAL_COUNTS,
+        EXPERT_PREFIX,
         c_n: int,
         stream: fx.Stream,
     ):
@@ -593,6 +706,8 @@ def _compile(
             DISP_PARITY,
             DISP_EXPECTED,
             PS_EXPECTED,
+            REAL_COUNTS,
+            EXPERT_PREFIX,
             fx.Int32(c_n),
             value_attrs=make_value_attrs(waves_per_eu, agpr_alloc, "512,512"),
         ).launch(grid=(_grid_size, 1, 1), block=(_BLOCK_THREADS, 1, 1), stream=stream)
@@ -641,6 +756,8 @@ def dispatch_grouped_gemm_mxfp8(
     ) = handle
     tile_to_expert = handle[7]
     expected_count = handle[8]
+    real_counts = handle[9]
+    expert_prefix = handle[10]
 
     G, N, K = w1q.shape
     T, Kx = x.shape
@@ -662,6 +779,9 @@ def dispatch_grouped_gemm_mxfp8(
     XQ = xq_c.view(torch.int32)
     XS = xs_c.view(torch.int32)
     pool_scale_ps = symm.pool_scale_ps  # local broadcast a_sp (preshuffle role writes it)
+    use_sdma = sdma_enabled()
+    if use_sdma:
+        dispatch_fp8_sdma(xq_c, xs_c, handle, symm)
 
     # The real-tile count must come off the handle, not the shared symm scratch the prologue wrote
     # it into: a call that reuses a handle (the backward) would otherwise pair its own tile table
@@ -690,6 +810,7 @@ def dispatch_grouped_gemm_mxfp8(
             out_fp16=out_fp16,
             GROUP_M=int(GROUP_M),
             num_gemm_cu=num_gemm_cu,
+            sdma=use_sdma,
         )
 
     args = (
@@ -711,6 +832,8 @@ def dispatch_grouped_gemm_mxfp8(
         symm._disp_parity,
         symm._disp_expected,
         symm._ps_expected,
+        real_counts,
+        expert_prefix,
         c_n,
         torch.cuda.current_stream(),
     )
@@ -731,6 +854,7 @@ def dispatch_grouped_gemm_mxfp8(
             out_fp16,
             int(GROUP_M),
             num_gemm_cu,
+            use_sdma,
         )
         run_compiled(_FUSED_COMPILED, ck, _make_raw(dc, pc), *args)
 
