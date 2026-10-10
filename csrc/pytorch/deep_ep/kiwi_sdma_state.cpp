@@ -88,6 +88,10 @@ void KiwiSdmaState::ensure(size_t num_endpoints) {
                 srcs_.push_back(reinterpret_cast<void*>(src));
                 sizes_.push_back(static_cast<size_t>(bytes));
             }));
+    flag_callback_id_ = context_->register_callback(
+        std::function<void(uint64_t, uint64_t)>([this](uint64_t dst, uint64_t value) {
+            new_flags_.emplace_back(reinterpret_cast<uint64_t*>(dst), value);
+        }));
     PRIMUS_TURBO_CHECK_HIP(
         hipStreamCreateWithFlags(&copy_stream_, hipStreamNonBlocking));
     num_endpoints_ = num_endpoints;
@@ -114,6 +118,22 @@ void* KiwiSdmaState::reserve_staging(size_t bytes) {
 }
 
 void KiwiSdmaState::flush() {
+    flush_copies();
+    // Flags from the previous sweep: every copy posted before them was drained
+    // by the sweep that just ran, so they follow those copies on the stream.
+    for (const auto& [dst, value] : ready_flags_) {
+        hipError_t status = hipStreamWriteValue64(copy_stream_, dst, value, 0);
+        if (status != hipSuccess) {
+            record_error(std::string("hipStreamWriteValue64 failed: ") +
+                         hipGetErrorString(status));
+            break;
+        }
+    }
+    ready_flags_.swap(new_flags_);
+    new_flags_.clear();
+}
+
+void KiwiSdmaState::flush_copies() {
     if (dsts_.empty()) return;
     for (size_t offset = 0; offset < dsts_.size(); offset += kMaxBatchCopies) {
         const size_t count = std::min(kMaxBatchCopies, dsts_.size() - offset);
@@ -188,6 +208,9 @@ void KiwiSdmaState::proxy_loop() {
             flush();
             if (progressed == 0) break;
         }
+        // Issue flags still waiting for their extra sweep.
+        flush();
+        flush();
         if (copy_stream_) {
             hipError_t status = hipStreamSynchronize(copy_stream_);
             if (status != hipSuccess)
@@ -208,15 +231,13 @@ void KiwiSdmaState::report_device_timeout() {
     if (kind <= 0) return;
     std::atomic_thread_fence(std::memory_order_acquire);
     diag_reported_ = true;
-    static const char* const kNames[] = {"none", "receiver channel-prefix wait",
-                                         "receiver payload wait", "sender KIWI invoke wait",
-                                         "input holds sentinel", "non-finite scale",
+    static const char* const kNames[] = {"none", "receiver flag wait", "sender KIWI invoke wait",
                                          "sender found fewer rows than promised"};
     const KiwiSdmaDiag d = *diag_host_;
     std::fprintf(stderr,
                  "[KIWI_SDMA_FAILURE] device=%d %s: rank=%d peer=%d row=%d observed=0x%x "
                  "value=%llu progress=%d/%d\n",
-                 device_id_, kind < 7 ? kNames[kind] : "unknown", d.rank, d.peer, d.row,
+                 device_id_, kind < 4 ? kNames[kind] : "unknown", d.rank, d.peer, d.row,
                  d.observed, static_cast<unsigned long long>(d.value), d.progress, d.total);
     std::fflush(stderr);
 }
@@ -272,6 +293,8 @@ void KiwiSdmaState::stop() {
     dsts_.clear();
     srcs_.clear();
     sizes_.clear();
+    new_flags_.clear();
+    ready_flags_.clear();
 }
 
 void KiwiSdmaState::record_error(const std::string& message) {

@@ -100,40 +100,51 @@ def _run(rank: int, args, store_path: str) -> None:
         deepep_allocate_on_comm_stream=False,
     )
 
-    def moe_forward(x_arg, w1_arg, w2_arg, gate_arg, stage_times=None):
+    # Communication stages; everything else is local compute.
+    comm_stages = ("dispatch", "combine")
+
+    def moe_forward(x_arg, w1_arg, w2_arg, gate_arg, stage_events=None):
+        # stage_events maps stage name -> list of (start, end) CUDA events
+        # recorded on the current stream, so stages are timed on the GPU
+        # without adding synchronization.
         def stage(name, function):
-            if stage_times is None:
+            if stage_events is None:
                 return function()
-            torch.cuda.synchronize()
-            stage_start = time.perf_counter()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             result = function()
-            torch.cuda.synchronize()
-            stage_times[name] = (time.perf_counter() - stage_start) * 1e3
+            end_event.record()
+            stage_events.setdefault(name, []).append((start_event, end_event))
             return result
 
+        hidden, probs_in = stage(
+            "route", lambda: dispatcher._pre_dispatch(x_arg, gate_arg, None, topk_idx)
+        )
+        tokens, token_probs = stage("dispatch", lambda: dispatcher._exec_dispatch(hidden, probs_in))
         dispatched, tokens_per_expert, probs = stage(
-            "dispatch",
-            lambda: dispatcher.token_dispatch(x_arg, gate_arg, indices=topk_idx),
+            "permute", lambda: dispatcher._post_dispatch(tokens, token_probs)
         )
         if args.stages == "dispatch":
             return dispatched
-        if args.stages == "dispatch,combine":
-            return stage("combine", lambda: dispatcher.token_combine(dispatched))
-        group_lens = tokens_per_expert.to(device=x_arg.device, dtype=torch.int64)
-        fc1 = stage(
-            "fc1",
-            lambda: grouped_gemm(dispatched, w1_arg, group_lens, trans_b=True),
-        )
-        gate_part, up_part = fc1.chunk(2, dim=-1)
-        activated = stage(
-            "activation",
-            lambda: (F.silu(gate_part) * up_part * probs.unsqueeze(-1)).to(x_arg.dtype),
-        )
-        fc2 = stage(
-            "fc2",
-            lambda: grouped_gemm(activated, w2_arg, group_lens, trans_b=True),
-        )
-        return stage("combine", lambda: dispatcher.token_combine(fc2))
+        if args.stages != "dispatch,combine":
+            group_lens = tokens_per_expert.to(device=x_arg.device, dtype=torch.int64)
+            fc1 = stage(
+                "fc1",
+                lambda: grouped_gemm(dispatched, w1_arg, group_lens, trans_b=True),
+            )
+            gate_part, up_part = fc1.chunk(2, dim=-1)
+            activated = stage(
+                "activation",
+                lambda: (F.silu(gate_part) * up_part * probs.unsqueeze(-1)).to(x_arg.dtype),
+            )
+            dispatched = stage(
+                "fc2",
+                lambda: grouped_gemm(activated, w2_arg, group_lens, trans_b=True),
+            )
+        unpermuted = stage("unpermute", lambda: dispatcher._pre_combine(dispatched))
+        combined = stage("combine", lambda: dispatcher._exec_combine(unpermuted))
+        return dispatcher._post_combine(combined)
 
     grad_out = torch.randn_like(x)
 
@@ -182,25 +193,38 @@ def _run(rank: int, args, store_path: str) -> None:
         )
 
     if args.breakdown:
-        stage_times = {}
+        # Warm iterations timed per stage with stream events. "idle" is the
+        # part of the iteration no stage covers: the GPU waiting on the host.
+        stage_events = {}
+        dist.barrier()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
         with torch.no_grad():
-            moe_forward(x, w1, w2, gate, stage_times)
-        names = ("dispatch", "fc1", "activation", "fc2", "combine")
+            for _ in range(args.iterations):
+                moe_forward(x, w1, w2, gate, stage_events)
+        torch.cuda.synchronize()
+        iteration_ms = (time.perf_counter() - start) * 1e3 / args.iterations
+        names = [name for name in ("route", "dispatch", "permute", "fc1", "activation",
+                                   "fc2", "unpermute", "combine") if name in stage_events]
+        per_stage = [
+            sum(s.elapsed_time(e) for s, e in stage_events[name]) / len(stage_events[name])
+            for name in names
+        ]
+        comm = sum(t for name, t in zip(names, per_stage) if name in comm_stages)
+        compute = sum(t for name, t in zip(names, per_stage) if name not in comm_stages)
         values = torch.tensor(
-            [stage_times[name] for name in names],
+            per_stage + [comm, compute, iteration_ms - comm - compute, iteration_ms],
             dtype=torch.float64,
             device="cuda",
         )
         dist.reduce(values, dst=0, op=dist.ReduceOp.MAX)
         if rank == 0:
+            v = values.tolist()
             print(
-                "MOE breakdown backend="
-                + args.backend
-                + " "
-                + " ".join(
-                    f"{name}={value:.3f}ms"
-                    for name, value in zip(names, values.tolist())
-                ),
+                f"MOE breakdown backend={args.backend} "
+                + " ".join(f"{n}={t:.3f}" for n, t in zip(names, v))
+                + f" | comm={v[-4]:.3f} compute={v[-3]:.3f} idle={v[-2]:.3f} "
+                f"iteration={v[-1]:.3f} ms (max over ranks)",
                 flush=True,
             )
 

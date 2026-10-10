@@ -85,6 +85,11 @@ private:
 
     // Lazily constructed only when the KIWI_SDMA backend is selected.
     std::shared_ptr<KiwiSdmaState> kiwi_sdma_state;
+    // KIWI dispatches on this buffer so far; every rank counts the same
+    // sequence, so a peer's flag equal to the epoch means its rows arrived.
+    uint64_t kiwi_sdma_epoch = 0;
+    // Flag offset of the last KIWI layout; flags are reset when it moves.
+    size_t kiwi_sdma_flag_offset = static_cast<size_t>(-1);
 
     // Pick the launch stream for this dispatch/combine call.  Returns the
     // caller's current stream when ``force_current_stream`` is set; otherwise

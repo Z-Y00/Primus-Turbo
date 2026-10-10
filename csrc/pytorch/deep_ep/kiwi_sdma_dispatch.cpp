@@ -197,26 +197,34 @@ Buffer::intranode_dispatch_sdma(
     void* staging = kiwi_sdma_state->reserve_staging(
         std::max<size_t>(1, static_cast<size_t>(num_ranks) * num_tokens) *
         layout.record_stride);
+    const uint64_t epoch = ++kiwi_sdma_epoch;
+    const bool reset_flags = layout.flag_offset != kiwi_sdma_flag_offset;
+    kiwi_sdma_flag_offset = layout.flag_offset;
     primus_turbo::deep_ep::intranode::kiwi_sdma_prepare(
-        buffer_ptrs_gpu, rank_prefix_matrix.data_ptr<int>(), rank, layout, num_recv_tokens,
-        num_channels, num_ranks, hidden_bytes, scale_bytes, is_fp8, launch_stream);
-    // Every receiver must be armed before any peer starts copying.
+        buffer_ptrs_gpu, rank_prefix_matrix.data_ptr<int>(), rank, layout, num_ranks,
+        reset_flags, launch_stream);
+    // Every rank must publish its row bases before any peer starts sending.
     primus_turbo::deep_ep::intranode::barrier(
         barrier_signal_ptrs_gpu, rank, num_ranks, launch_stream);
-    primus_turbo::deep_ep::intranode::kiwi_sdma_dispatch(
-        recv_x.data_ptr(),
-        recv_x_scales ? recv_x_scales->data_ptr<float>() : nullptr,
-        recv_src_idx.data_ptr<int>(),
-        recv_topk_idx ? recv_topk_idx->data_ptr<int64_t>() : nullptr,
-        recv_topk_weights ? recv_topk_weights->data_ptr<float>() : nullptr,
-        recv_channel_prefix_matrix.data_ptr<int>(), send_head.data_ptr<int>(),
-        x.data_ptr(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
-        is_token_in_rank.data_ptr<bool>(), rank_prefix_matrix.data_ptr<int>(),
-        channel_prefix_matrix.data_ptr<int>(), num_tokens, num_worst_tokens,
-        hidden_bytes, scale_bytes, num_topk, num_experts, is_fp8,
-        buffer_ptrs_gpu, staging, rank, num_ranks, num_channels, layout,
-        kiwi_sdma_state->device_context(),
-        kiwi_sdma_state->callback_id(), kiwi_sdma_state->diag(), launch_stream);
+    void* recv_scales_ptr = recv_x_scales ? recv_x_scales->data_ptr() : nullptr;
+    int64_t* recv_topk_idx_ptr = recv_topk_idx ? recv_topk_idx->data_ptr<int64_t>() : nullptr;
+    float* recv_topk_weights_ptr =
+        recv_topk_weights ? recv_topk_weights->data_ptr<float>() : nullptr;
+    primus_turbo::deep_ep::intranode::kiwi_sdma_send(
+        recv_x.data_ptr(), static_cast<float*>(recv_scales_ptr), recv_src_idx.data_ptr<int>(),
+        recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
+        send_head.data_ptr<int>(), x.data_ptr(), x_scales_ptr, topk_idx_ptr, topk_weights_ptr,
+        is_token_in_rank.data_ptr<bool>(), channel_prefix_matrix.data_ptr<int>(), num_tokens,
+        num_worst_tokens, hidden_bytes, scale_bytes, num_topk, num_experts, buffer_ptrs_gpu,
+        staging, rank, num_ranks, num_channels, layout, epoch,
+        kiwi_sdma_state->device_context(), kiwi_sdma_state->callback_id(),
+        kiwi_sdma_state->flag_callback_id(), kiwi_sdma_state->diag(), launch_stream);
+    primus_turbo::deep_ep::intranode::kiwi_sdma_receive(
+        recv_x.data_ptr(), static_cast<float*>(recv_scales_ptr), recv_src_idx.data_ptr<int>(),
+        recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
+        rank_prefix_matrix.data_ptr<int>(), hidden_bytes, scale_bytes, num_topk,
+        buffer_ptrs_gpu, rank, num_ranks, num_channels, layout, epoch,
+        kiwi_sdma_state->diag(), launch_stream);
 
     std::optional<EventHandle> event;
     if (async) {

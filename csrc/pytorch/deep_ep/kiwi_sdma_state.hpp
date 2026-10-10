@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace primus_turbo::pytorch::deep_ep {
@@ -35,6 +36,9 @@ public:
 
     void* device_context() const;
     uint8_t callback_id() const { return callback_id_; }
+    // flag(dst, value): writes value to dst on the copy stream after every copy
+    // posted before the flag.
+    uint8_t flag_callback_id() const { return flag_callback_id_; }
     primus_turbo::deep_ep::intranode::KiwiSdmaDiag* diag() const { return diag_device_; }
 
 private:
@@ -54,6 +58,7 @@ private:
 
     void proxy_loop();
     void flush();
+    void flush_copies();
     void report_profile(double now_ms, bool force);
     void report_device_timeout();
     void record_error(const std::string& message);
@@ -62,6 +67,7 @@ private:
     size_t num_endpoints_ = 0;
     std::unique_ptr<kiwi::invoke::Context<>> context_;
     uint8_t callback_id_ = 0;
+    uint8_t flag_callback_id_ = 0;
     hipStream_t copy_stream_ = nullptr;
     std::thread proxy_thread_;
     std::atomic<bool> stop_{false};
@@ -72,6 +78,11 @@ private:
     std::vector<void*> dsts_;
     std::vector<void*> srcs_;
     std::vector<size_t> sizes_;
+    // Flags seen in the current sweep, and flags ready to issue. A flag waits
+    // one full sweep so every copy posted before it on another endpoint has
+    // been drained and submitted first.
+    std::vector<std::pair<uint64_t*, uint64_t>> new_flags_;
+    std::vector<std::pair<uint64_t*, uint64_t>> ready_flags_;
     void* staging_ = nullptr;
     size_t staging_bytes_ = 0;
     ProxyProfile profile_;
