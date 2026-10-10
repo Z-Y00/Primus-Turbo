@@ -4,8 +4,11 @@
 // no KIWI queue, GPU sender, receiver, or ACK in the loop. Each rank is a
 // separate process (as in training), owns one GPU and one non-blocking copy
 // stream, and sends --bytes-per-peer to every other rank in --chunk-bytes
-// copies. Descriptors are interleaved across destination ranks, and each API
-// call carries --batch of them, matching one proxy progress sweep.
+// copies. Descriptors are interleaved across destination ranks (or grouped by
+// destination with --order grouped), and each API call carries --batch of
+// them, matching one proxy progress sweep. --streams spreads successive calls
+// over several copy streams; --uncached-dst allocates the receive buffer like
+// DeepEP's NVL buffer.
 //
 // Per rank it reports time spent inside the API calls (host stall), time to
 // issue everything, time to completion, and the slowest single call. If the
@@ -55,6 +58,9 @@ struct Args {
     int iters = 5;
     int warmup = 1;
     std::string api = "batch";  // batch | single
+    std::string order = "interleaved";  // interleaved | grouped
+    int streams = 1;  // batch call k goes to stream k % streams
+    bool uncached_dst = false;  // receive buffer like DeepEP's NVL buffer
 };
 
 struct RankStats {
@@ -108,16 +114,21 @@ Args parse(int argc, char** argv) {
         else if (key == "--iters") a.iters = std::atoi(next());
         else if (key == "--warmup") a.warmup = std::atoi(next());
         else if (key == "--api") a.api = next();
+        else if (key == "--order") a.order = next();
+        else if (key == "--streams") a.streams = std::atoi(next());
+        else if (key == "--uncached-dst") a.uncached_dst = true;
         else {
             std::fprintf(stderr,
                          "usage: %s [--ranks N] [--chunk-bytes B] [--bytes-per-peer B] "
-                         "[--batch N] [--iters N] [--warmup N] [--api batch|single]\n",
+                         "[--batch N] [--iters N] [--warmup N] [--api batch|single] "
+                         "[--order interleaved|grouped] [--streams N] [--uncached-dst]\n",
                          argv[0]);
             std::exit(2);
         }
     }
     if (a.ranks < 2 || a.ranks > kMaxRanks || a.chunk_bytes == 0 || a.batch == 0 ||
-        a.bytes_per_peer < a.chunk_bytes || (a.api != "batch" && a.api != "single")) {
+        a.bytes_per_peer < a.chunk_bytes || (a.api != "batch" && a.api != "single") ||
+        (a.order != "interleaved" && a.order != "grouped") || a.streams < 1) {
         std::fprintf(stderr, "invalid arguments\n");
         std::exit(2);
     }
@@ -133,11 +144,14 @@ void run_rank(int rank, const Args& a, Shared* shared) {
     void* send = nullptr;
     void* recv = nullptr;
     CHECK(hipMalloc(&send, region * a.ranks));
-    CHECK(hipMalloc(&recv, region * a.ranks));
+    if (a.uncached_dst)
+        CHECK(hipExtMallocWithFlags(&recv, region * a.ranks, hipDeviceMallocUncached));
+    else
+        CHECK(hipMalloc(&recv, region * a.ranks));
     CHECK(hipMemset(send, rank + 1, region * a.ranks));
     CHECK(hipIpcGetMemHandle(&shared->handles[rank], recv));
-    hipStream_t stream;
-    CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    std::vector<hipStream_t> streams(a.streams);
+    for (auto& s : streams) CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
     CHECK(hipDeviceSynchronize());
     pthread_barrier_wait(&shared->barrier);
 
@@ -150,12 +164,18 @@ void run_rank(int rank, const Args& a, Shared* shared) {
         peer_recv[peer] = static_cast<uint8_t*>(ptr);
     }
 
-    // Peer-interleaved order spreads every batch across all XGMI links.
+    // Peer-interleaved order spreads every batch across all XGMI links;
+    // "grouped" issues each peer's copies back to back, as the KIWI proxy's
+    // endpoint sweep does.
     std::vector<void*> dsts, srcs;
     std::vector<size_t> sizes;
-    for (size_t i = 0; i < copies_per_peer; ++i) {
-        for (int step = 1; step < a.ranks; ++step) {
-            const int peer = (rank + step) % a.ranks;
+    const bool grouped = a.order == "grouped";
+    const size_t outer = grouped ? a.ranks - 1 : copies_per_peer;
+    const size_t inner = grouped ? copies_per_peer : a.ranks - 1;
+    for (size_t o = 0; o < outer; ++o) {
+        for (size_t n = 0; n < inner; ++n) {
+            const size_t i = grouped ? n : o;
+            const int peer = (rank + 1 + static_cast<int>(grouped ? o : n)) % a.ranks;
             dsts.push_back(peer_recv[peer] + rank * region + i * a.chunk_bytes);
             srcs.push_back(static_cast<uint8_t*>(send) + peer * region + i * a.chunk_bytes);
             sizes.push_back(a.chunk_bytes);
@@ -171,6 +191,7 @@ void run_rank(int rank, const Args& a, Shared* shared) {
         const double start = now_ms();
         for (size_t off = 0; off < dsts.size(); off += a.batch) {
             const size_t count = std::min(a.batch, dsts.size() - off);
+            hipStream_t stream = streams[(off / a.batch) % streams.size()];
             const double call_start = now_ms();
             if (a.api == "batch") {
                 size_t fail = 0;
@@ -189,7 +210,7 @@ void run_rank(int rank, const Args& a, Shared* shared) {
             s.copies += static_cast<long>(count);
         }
         s.issue_ms = now_ms() - start;
-        CHECK(hipStreamSynchronize(stream));
+        for (auto stream : streams) CHECK(hipStreamSynchronize(stream));
         s.total_ms = now_ms() - start;
         if (it >= a.warmup && s.total_ms < best.total_ms) best = s;
     }
@@ -198,7 +219,7 @@ void run_rank(int rank, const Args& a, Shared* shared) {
 
     for (int peer = 0; peer < a.ranks; ++peer)
         if (peer_recv[peer]) CHECK(hipIpcCloseMemHandle(peer_recv[peer]));
-    CHECK(hipStreamDestroy(stream));
+    for (auto stream : streams) CHECK(hipStreamDestroy(stream));
     CHECK(hipFree(send));
     CHECK(hipFree(recv));
 }

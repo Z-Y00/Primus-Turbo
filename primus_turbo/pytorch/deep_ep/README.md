@@ -96,6 +96,38 @@ EP backend; `--breakdown` adds per-stage times.
 `benchmark/sdma_kiwi_proto/sdma_host_api_drive.hip.cpp` replays the dispatch
 copy pattern straight into `hipMemcpyBatchAsync` across one process per GPU.
 
+`benchmark/sdma_kiwi_proto/kiwi_sdma_trace.sh <dir> <benchmark args>` traces
+the dispatch benchmark under `rocprofv3` (kernels and HIP API), and
+`kiwi_sdma_timeline.py <dir>` turns the trace into a per-phase timeline:
+packing, first and last `hipMemcpyBatchAsync`, flag writes, data landed on the
+receiver, and unpack.
+
+Bandwidth breakdown at EP8 (4096 tokens, hidden 7168, BF16, about 411 MB
+sent per rank; the dispatch takes about 2.65 ms):
+
+| Phase | Time | Reference |
+|---|---|---|
+| prepare and barrier | 14 µs | |
+| packing (send kernel) | 334–477 µs | overlaps the transfer from about 200 µs |
+| SDMA transfer, first submit to landed | 1.9–2.1 ms (about 220 GB/s per rank) | the host driver moves the same volume in 1.23–1.41 ms (306–321 GB/s) |
+| unpack | about 0.31 ms | |
+
+- More packing workgroups (`num_sms` 20 → 80) cut packing from 477 to 334 µs
+  and submit the first copy at 208 instead of 459 µs, but the data still lands
+  at about 2.34 ms: packing is not on the critical path.
+- The receive buffer being uncached (`hipDeviceMallocUncached`) does not slow
+  SDMA writes (`sdma_host_api_drive --uncached-dst`).
+- Only copies inside one `hipMemcpyBatchAsync` call run across XGMI links in
+  parallel; successive calls serialize, even on different streams
+  (`--streams`). Three calls that each target a few destinations take 3.58 ms
+  instead of 1.23 ms (`--order grouped`). The proxy builds each call from one
+  endpoint sweep in (destination, channel) order and issues 2–8 calls per
+  dispatch, which is the likely cause of the 0.5–0.6 ms transfer gap. Building
+  calls that cover every destination should recover it.
+- The send kernel checks for a full chunk only at the end of each 512-token
+  scan tile. A channel holds about 410 tokens, so each (destination, channel)
+  workgroup posts one copy when it finishes and the chunk size has no effect.
+
 Set `KIWI_SDMA_PROFILE=1` to print per-second proxy statistics: copies,
 batch sizes, time inside `hipMemcpyBatchAsync`, and whether the copy stream
 still has unfinished work. A dispatch wait that exceeds 30 s ends the kernel
