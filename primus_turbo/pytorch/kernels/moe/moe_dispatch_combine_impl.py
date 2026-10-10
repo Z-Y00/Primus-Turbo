@@ -150,6 +150,7 @@ class EPBackend(Protocol):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
         num_worst_tokens: int = 0,
+        return_recv_hook: bool = False,
     ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         Optional[torch.Tensor],
@@ -159,6 +160,10 @@ class EPBackend(Protocol):
     ]:
         """Execute dispatch (layout + send) and return
         ``(recv_x, recv_topk_idx, recv_topk_weights, tokens_per_expert, handle)``.
+
+        With ``return_recv_hook`` a callable is appended. The received tensors
+        and the handle are valid on the current stream only after it is
+        called; work enqueued before then can overlap the transfer.
         """
         ...
 
@@ -216,9 +221,13 @@ class _DeepEPLikeBackend:
         """Extra keyword arguments forwarded to ``BufferClass(group, nvl, rdma, **kwargs)``."""
         return {}
 
-    def _dispatch_buffer(self, buffer, *args, **kwargs):
-        """Call the transport-specific Buffer dispatch entry point."""
-        return buffer.dispatch(*args, **kwargs)
+    def _dispatch_buffer(self, buffer, *args, return_recv_hook: bool = False, **kwargs):
+        """Call the transport-specific Buffer dispatch entry point.
+
+        Returns the Buffer's dispatch result followed by a receive hook, or
+        ``None`` when the transport completes the receive inside dispatch.
+        """
+        return buffer.dispatch(*args, **kwargs) + (None,)
 
     def _nvl_buffer_bytes(self, group: dist.ProcessGroup, hidden_bytes: int, configs) -> int:
         """NVL buffer size the transport needs for ``configs``."""
@@ -286,6 +295,7 @@ class _DeepEPLikeBackend:
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
         num_worst_tokens: int = 0,
+        return_recv_hook: bool = False,
     ):
         EventOverlapClass, EventHandleClass = self._get_event_classes()
         buffer = self._buffer
@@ -317,6 +327,7 @@ class _DeepEPLikeBackend:
                 tokens_per_expert,
                 handle,
                 after_event,
+                transport_hook,
             ) = self._dispatch_buffer(
                 buffer,
                 x,
@@ -330,23 +341,40 @@ class _DeepEPLikeBackend:
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
                 num_worst_tokens=num_worst_tokens,
+                return_recv_hook=return_recv_hook,
             )
         else:
-            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, after_event = (
-                self._dispatch_buffer(
-                    buffer,
-                    x,
-                    handle=handle,
-                    previous_event=previous_event,
-                    async_finish=async_finish,
-                    allocate_on_comm_stream=allocate_on_comm_stream,
-                )
+            (
+                recv_x,
+                recv_token_indices,
+                recv_token_probs,
+                tokens_per_expert,
+                handle,
+                after_event,
+                transport_hook,
+            ) = self._dispatch_buffer(
+                buffer,
+                x,
+                handle=handle,
+                previous_event=previous_event,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+                return_recv_hook=return_recv_hook,
             )
 
-        if async_finish:
-            after_event.current_stream_wait()
+        def recv_hook():
+            # The transport's receive kernels follow the send on the current
+            # stream, so the comm-stream event wait comes first.
+            if async_finish:
+                after_event.current_stream_wait()
+            if transport_hook is not None:
+                transport_hook()
 
-        return recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle
+        result = (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+        if return_recv_hook:
+            return result + (recv_hook,)
+        recv_hook()
+        return result
 
     def combine(
         self,
@@ -474,8 +502,14 @@ class KiwiSdmaEPBackend(TurboEPBackend):
             raise RuntimeError("KIWI_SDMA currently supports intranode EP groups of at most 8 ranks")
         super().init_buffer(group, hidden_bytes, config)
 
-    def _dispatch_buffer(self, buffer, *args, **kwargs):
-        return buffer.dispatch_sdma(*args, turbo_nvl_bytes=self._turbo_nvl_bytes, **kwargs)
+    def _dispatch_buffer(self, buffer, *args, return_recv_hook: bool = False, **kwargs):
+        result = buffer.dispatch_sdma(
+            *args,
+            turbo_nvl_bytes=self._turbo_nvl_bytes,
+            return_recv_hook=return_recv_hook,
+            **kwargs,
+        )
+        return result if return_recv_hook else result + (None,)
 
 
 # =========================================================================
@@ -607,10 +641,12 @@ def moe_dispatch_impl(
     async_finish: bool = False,
     allocate_on_comm_stream: bool = False,
     num_worst_tokens: int = 0,
+    return_recv_hook: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     name = _resolve_backend_name()
     backend = _get_backend_instance(name)
     _ensure_buffer(group, get_hidden_bytes(x), backend)
+    kwargs = {"return_recv_hook": True} if return_recv_hook else {}
     return backend.dispatch(
         x,
         handle=handle,
@@ -620,6 +656,7 @@ def moe_dispatch_impl(
         async_finish=async_finish,
         allocate_on_comm_stream=allocate_on_comm_stream,
         num_worst_tokens=num_worst_tokens,
+        **kwargs,
     )
 
 

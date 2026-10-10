@@ -39,6 +39,14 @@ def _get_backends():
         return ["TURBO"]
 
 
+def _recv_hook_backends():
+    """Backends for the receive-hook test; KIWI_SDMA needs its copy thresholds at launch."""
+    thresholds = [os.environ.get(n, "") for n in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE")]
+    if all(v.isdigit() and int(v) <= 1024 for v in thresholds) and torch.cuda.device_count() <= 8:
+        return _get_backends() + ["KIWI_SDMA"]
+    return _get_backends()
+
+
 def _build_tp_groups(tp_size):
     """Build (ep_group, tp_group, tp_ep_group) for the calling rank.
 
@@ -100,6 +108,7 @@ def _run_dispatch_combine(
     tp_size=1,
     routing_map=None,
     token_indices=None,
+    deepep_return_recv_hook=False,
 ):
     """Core dispatch-combine logic shared by all test variants."""
     if tp_size > 1:
@@ -121,6 +130,7 @@ def _run_dispatch_combine(
         pad_multiple=pad_multiple,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
+        deepep_return_recv_hook=deepep_return_recv_hook,
     )
 
     hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
@@ -133,9 +143,24 @@ def _run_dispatch_combine(
         router_topk * tp_size
     )
 
-    permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
-        hidden_states, probs, routing_map=routing_map, indices=token_indices
-    )
+    errors = []
+    if deepep_return_recv_hook:
+        # Independent work between the send and the receive, as a shared
+        # expert would run.
+        pre_hidden, pre_probs = dispatcher._pre_dispatch(
+            hidden_states, probs, routing_map, token_indices
+        )
+        tokens, token_probs = dispatcher._exec_dispatch(pre_hidden, pre_probs)
+        side = ans.float() @ ans.float()[:hidden_size, :].T
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher._post_dispatch(
+            tokens, token_probs
+        )
+        if not torch.allclose(side, ans.float() @ ans.float()[:hidden_size, :].T):
+            errors.append(f"rank {rank}: work overlapped with dispatch changed")
+    else:
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
+            hidden_states, probs, routing_map=routing_map, indices=token_indices
+        )
     num_permuted_rows = permuted_local_hidden_states.shape[0]
 
     permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
@@ -143,7 +168,6 @@ def _run_dispatch_combine(
 
     restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
 
-    errors = []
     if not torch.allclose(restored_hidden_states, ans):
         errors.append(f"rank {rank}: restored hidden states do not match original hidden states")
 
@@ -230,6 +254,16 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 permute_max_token_num=permute_max_token_num,
             )
+
+    # ------------------------------------------------------------------
+    # Receive hook: independent work between _exec_dispatch and _post_dispatch
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _recv_hook_backends())
+    def test_recv_hook(self, backend):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_dispatch_combine(self.rank, dist.group.WORLD, deepep_return_recv_hook=True)
 
     # ------------------------------------------------------------------
     # pad_multiple > 0

@@ -28,6 +28,7 @@ class MoEDispatch(torch.autograd.Function):
         async_finish,
         allocate_on_comm_stream,
         num_worst_tokens,
+        return_recv_hook=False,
     ) -> Tuple[
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         torch.Tensor,
@@ -35,7 +36,7 @@ class MoEDispatch(torch.autograd.Function):
         Union[List, torch.Tensor],
         Tuple,
     ]:
-        recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle = moe_dispatch_impl(
+        result = moe_dispatch_impl(
             x,
             group,
             None,
@@ -45,7 +46,9 @@ class MoEDispatch(torch.autograd.Function):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
             num_worst_tokens=num_worst_tokens,
+            return_recv_hook=return_recv_hook,
         )
+        recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle = result[:5]
         ctx.group = group
         ctx.handle = handle
         ctx.async_finish = async_finish
@@ -53,10 +56,10 @@ class MoEDispatch(torch.autograd.Function):
 
         tokens_per_expert = torch.tensor(tokens_per_expert)
 
-        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
+        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle) + result[5:]
 
     @staticmethod
-    def backward(ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle):
+    def backward(ctx, grad_output, grad_token_indices, grad_token_probs, *unused_grads):
         combined_x, combined_topk_weights = moe_combine_impl(
             grad_output,
             ctx.group,
@@ -108,6 +111,7 @@ def moe_dispatch(
     async_finish=False,
     allocate_on_comm_stream=False,
     num_worst_tokens: int = 0,
+    return_recv_hook: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
     """
     MoE dispatch operation: distributes input tokens to their assigned experts.
@@ -131,6 +135,10 @@ def moe_dispatch(
                                  which can optimize memory access patterns. Defaults to False.
         num_worst_tokens: Number of low-quality tokens to drop (for load balancing optimization).
                           Defaults to 0.
+        return_recv_hook: Return once the send is issued and append a callable to the
+                          result. The received tensors and the handle are valid on the
+                          current stream only after it is called, so independent work
+                          enqueued before the call overlaps the transfer. Defaults to False.
 
     Returns:
         A tuple containing:
@@ -139,6 +147,7 @@ def moe_dispatch(
             - recv_token_probs: Received token probability weights.
             - tokens_per_expert: Statistics of token count received by each expert.
             - handle: Communication handle that must be passed to moe_combine to complete the combine operation.
+            - recv_hook: Only with ``return_recv_hook``; see above.
     """
     return MoEDispatch.apply(
         x,
@@ -149,6 +158,7 @@ def moe_dispatch(
         async_finish,
         allocate_on_comm_stream,
         num_worst_tokens,
+        return_recv_hook,
     )
 
 

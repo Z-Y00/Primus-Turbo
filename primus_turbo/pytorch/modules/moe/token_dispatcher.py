@@ -126,6 +126,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         deepep_use_comm_stream: when False, pin EP kernels to the current stream.
         deepep_num_worst_tokens: ``> 0`` enables worst-case allocation mode.
         deepep_use_cuda_num_tokens_per_expert: keep ``tokens_per_expert`` on device.
+        deepep_return_recv_hook: ``_exec_dispatch`` returns once the send is issued;
+            the receive completes in ``wait_dispatch()``, which ``_post_dispatch``
+            calls. Work enqueued in between (e.g. shared experts) overlaps the
+            transfer. With ``deepep_async_finish`` the comm-stream wait moves there too.
     """
 
     # C++ helper caches the env once per process; first dispatcher wins, later
@@ -150,6 +154,7 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         deepep_num_worst_tokens: int = 0,
         deepep_use_cuda_num_tokens_per_expert: Optional[bool] = False,
         deepep_autotune_config: Optional[Config] = None,
+        deepep_return_recv_hook: bool = False,
     ):
         super().__init__(num_experts, router_topk, ep_group, tp_group, tp_ep_group)
 
@@ -192,6 +197,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
         self.deepep_allocate_on_comm_stream = deepep_allocate_on_comm_stream
         self.deepep_use_cuda_num_tokens_per_expert = deepep_use_cuda_num_tokens_per_expert
         self.deepep_num_worst_tokens = deepep_num_worst_tokens
+        # With a receive hook, _exec_dispatch returns once the send is issued;
+        # work enqueued before wait_dispatch() (or _post_dispatch) overlaps it.
+        self.deepep_return_recv_hook = deepep_return_recv_hook
+        self._recv_hook = None
 
         set_buffer_global_config(
             num_use_cu=deepep_num_use_cu,
@@ -283,14 +292,10 @@ class DeepEPTokenDispatcher(TokenDispatcher):
                 warnings.warn("DeepEP only supports float32 probs!")
             token_probs = token_probs.float()
 
+        if self._recv_hook is not None:
+            raise RuntimeError("the previous dispatch's receive hook has not run; call wait_dispatch()")
         # DeepEP already synced to build these host counts; reuse them in _post_dispatch.
-        (
-            hidden_states,
-            dispatched_indices,
-            dispatched_probs,
-            tokens_per_expert,
-            handle,
-        ) = turbo.ops.moe_dispatch(
+        result = turbo.ops.moe_dispatch(
             hidden_states,
             token_indices=self.token_indices,
             token_probs=token_probs,
@@ -299,7 +304,11 @@ class DeepEPTokenDispatcher(TokenDispatcher):
             async_finish=self.deepep_async_finish,
             allocate_on_comm_stream=self.deepep_allocate_on_comm_stream,
             num_worst_tokens=self.deepep_num_worst_tokens,
+            return_recv_hook=self.deepep_return_recv_hook,
         )
+        hidden_states, dispatched_indices, dispatched_probs, tokens_per_expert, handle = result[:5]
+        if self.deepep_return_recv_hook:
+            self._recv_hook = result[5]
 
         self.handle = handle
         self.tokens_per_expert = tokens_per_expert
@@ -307,7 +316,18 @@ class DeepEPTokenDispatcher(TokenDispatcher):
 
         return hidden_states, dispatched_probs
 
+    def wait_dispatch(self):
+        """Make the last dispatch's outputs valid on the current stream.
+
+        A no-op unless ``deepep_return_recv_hook`` is set; ``_post_dispatch``
+        calls it, so callers only need it to place the wait explicitly.
+        """
+        hook, self._recv_hook = self._recv_hook, None
+        if hook is not None:
+            hook()
+
     def _post_dispatch(self, hidden_states, dispatched_probs):
+        self.wait_dispatch()
         # Empty when num_worst_tokens > 0; DeepEP skips the host count then.
         if self.tokens_per_expert.numel() > 0:
             if self.pad_multiple > 0:

@@ -59,12 +59,22 @@ def _inputs(rank, args):
     )
     topk_weights, topk_idx = torch.topk(logits.softmax(-1), args.topk, dim=-1)
     gate = torch.zeros_like(logits).scatter_(1, topk_idx, topk_weights)
-    return x, w1, w2, topk_idx.to(torch.int64), gate
+    shared = None
+    if args.shared_intermediate > 0:
+        shared = (
+            torch.randn(2 * args.shared_intermediate, args.hidden, generator=generator,
+                        device="cuda", dtype=torch.bfloat16).mul_(2.0 / math.sqrt(args.hidden)),
+            torch.randn(args.hidden, args.shared_intermediate, generator=generator,
+                        device="cuda", dtype=torch.bfloat16)
+            .mul_(2.0 / math.sqrt(args.shared_intermediate)),
+        )
+    return x, w1, w2, topk_idx.to(torch.int64), gate, shared
 
 
 def _run(rank: int, args, store_path: str) -> None:
     os.environ["PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND"] = args.backend
-    os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
+    if not args.comm_stream:
+        os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
     if args.backend == "KIWI_SDMA":
         if os.environ.get("KIWI_SDMA_PROXY_CPU") is not None:
             os.environ["KIWI_SDMA_PROXY_CPU"] = str(
@@ -89,21 +99,29 @@ def _run(rank: int, args, store_path: str) -> None:
     from primus_turbo.pytorch.modules import DeepEPTokenDispatcher
     from primus_turbo.pytorch.ops import grouped_gemm
 
-    x, w1, w2, topk_idx, gate = _inputs(rank, args)
+    x, w1, w2, topk_idx, gate, shared = _inputs(rank, args)
     dispatcher = DeepEPTokenDispatcher(
         num_experts=args.num_experts,
         router_topk=args.topk,
         ep_group=dist.group.WORLD,
         permute_fusion=True,
         deepep_num_use_cu=args.num_sms,
-        deepep_async_finish=False,
-        deepep_allocate_on_comm_stream=False,
+        deepep_async_finish=args.comm_stream,
+        deepep_allocate_on_comm_stream=args.comm_stream,
+        deepep_use_comm_stream=args.comm_stream,
+        deepep_return_recv_hook=args.recv_hook,
     )
 
-    # Communication stages; everything else is local compute.
-    comm_stages = ("dispatch", "combine")
+    # Communication stages; everything else is local compute. With
+    # --comm-stream, dispatch and combine run on DeepEP's stream, so "dispatch"
+    # and "combine" only time the launch and "recv" the wait for it.
+    comm_stages = ("dispatch", "recv", "combine")
 
-    def moe_forward(x_arg, w1_arg, w2_arg, gate_arg, stage_events=None):
+    def shared_expert(x_arg, ws1, ws2):
+        gate_part, up_part = (x_arg @ ws1.T).chunk(2, dim=-1)
+        return (F.silu(gate_part) * up_part) @ ws2.T
+
+    def moe_forward(x_arg, w1_arg, w2_arg, gate_arg, shared_args=None, stage_events=None):
         # stage_events maps stage name -> list of (start, end) CUDA events
         # recorded on the current stream, so stages are timed on the GPU
         # without adding synchronization.
@@ -122,6 +140,11 @@ def _run(rank: int, args, store_path: str) -> None:
             "route", lambda: dispatcher._pre_dispatch(x_arg, gate_arg, None, topk_idx)
         )
         tokens, token_probs = stage("dispatch", lambda: dispatcher._exec_dispatch(hidden, probs_in))
+        # Independent of the dispatch: overlaps it when the receive is deferred.
+        shared_out = None
+        if shared_args is not None:
+            shared_out = stage("shared", lambda: shared_expert(x_arg, *shared_args))
+        stage("recv", dispatcher.wait_dispatch)
         dispatched, tokens_per_expert, probs = stage(
             "permute", lambda: dispatcher._post_dispatch(tokens, token_probs)
         )
@@ -144,22 +167,24 @@ def _run(rank: int, args, store_path: str) -> None:
             )
         unpermuted = stage("unpermute", lambda: dispatcher._pre_combine(dispatched))
         combined = stage("combine", lambda: dispatcher._exec_combine(unpermuted))
-        return dispatcher._post_combine(combined)
+        output = dispatcher._post_combine(combined)
+        return output if shared_out is None else output + shared_out
 
     grad_out = torch.randn_like(x)
 
     def iteration():
         if args.mode == "forward":
             with torch.no_grad():
-                return moe_forward(x, w1, w2, gate)
+                return moe_forward(x, w1, w2, gate, shared)
         x_grad = x.detach().requires_grad_(True)
         w1_grad = w1.detach().requires_grad_(True)
         w2_grad = w2.detach().requires_grad_(True)
         gate_grad = gate.detach().requires_grad_(True)
-        output = moe_forward(x_grad, w1_grad, w2_grad, gate_grad)
+        shared_grad = None if shared is None else tuple(w.detach().requires_grad_(True) for w in shared)
+        output = moe_forward(x_grad, w1_grad, w2_grad, gate_grad, shared_grad)
         torch.autograd.grad(
             output,
-            (x_grad, w1_grad, w2_grad, gate_grad),
+            (x_grad, w1_grad, w2_grad, gate_grad) + (shared_grad or ()),
             grad_out,
         )
         return output
@@ -201,11 +226,12 @@ def _run(rank: int, args, store_path: str) -> None:
         start = time.perf_counter()
         with torch.no_grad():
             for _ in range(args.iterations):
-                moe_forward(x, w1, w2, gate, stage_events)
+                moe_forward(x, w1, w2, gate, shared, stage_events)
         torch.cuda.synchronize()
         iteration_ms = (time.perf_counter() - start) * 1e3 / args.iterations
-        names = [name for name in ("route", "dispatch", "permute", "fc1", "activation",
-                                   "fc2", "unpermute", "combine") if name in stage_events]
+        names = [name for name in ("route", "dispatch", "shared", "recv", "permute", "fc1",
+                                   "activation", "fc2", "unpermute", "combine")
+                 if name in stage_events]
         per_stage = [
             sum(s.elapsed_time(e) for s, e in stage_events[name]) / len(stage_events[name])
             for name in names
@@ -252,6 +278,22 @@ if __name__ == "__main__":
         choices=("all", "dispatch", "dispatch,combine"),
         default="all",
         help="Run only a prefix of the layer (forward mode) to isolate transport issues.",
+    )
+    parser.add_argument(
+        "--shared-intermediate",
+        type=int,
+        default=0,
+        help="Add a shared-expert MLP of this intermediate size, run between dispatch and its receive.",
+    )
+    parser.add_argument(
+        "--recv-hook",
+        action="store_true",
+        help="Defer the dispatch receive to after the shared expert (DeepEP return_recv_hook style).",
+    )
+    parser.add_argument(
+        "--comm-stream",
+        action="store_true",
+        help="Run dispatch/combine on DeepEP's comm stream with async_finish.",
     )
     options = parser.parse_args()
     if options.num_experts % options.num_processes:

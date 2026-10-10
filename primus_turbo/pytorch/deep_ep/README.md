@@ -166,18 +166,30 @@ Current limitations:
 - memory: the receive region holds `num_ranks × max_tokens_per_rank` records
   and the send staging has the same size, about 475 MB each per rank at EP8,
   4096 tokens, hidden 7168;
-- the MoE layer does not overlap dispatch with compute yet. Callers can do it
-  with `dispatch_sdma(..., return_recv_hook=True)`: it returns after the send
-  kernel and appends a hook to the result; independent work can then run on the
-  stream while SDMA moves the data, and calling the hook launches the flag wait
-  and unpack on the current stream. The receive tensors are valid only after
-  the hook's kernels run, and no other dispatch may start until the hook has
-  been called. `bench_kiwi_sdma_dispatch.py --overlap-gemm N` measures this
-  against `TURBO` dispatch on a side stream. At EP8 (4096 tokens, hidden 7168,
-  2–8 BF16 GEMMs of 8192×7168×4096) the hook hides 1.3–1.7 ms of the 2.7 ms
-  KIWI dispatch, and TURBO hides 0.8–1.0 ms of its 1.8 ms. The send kernel
-  still runs ahead of the independent work on the same stream, so its packing
-  time stays exposed;
+- overlap needs independent work between the send and the receive.
+  `dispatch_sdma(..., return_recv_hook=True)` returns after the send kernel
+  and appends a hook; calling it launches the flag wait and unpack on the
+  current stream. The receive tensors are valid only after the hook's kernels
+  run, and no other dispatch may start until the hook has been called. The same
+  option exists as `moe_dispatch(..., return_recv_hook=True)` for every
+  backend (for `TURBO`/`DEEP_EP` the hook holds the comm-stream wait of
+  `async_finish`) and as `DeepEPTokenDispatcher(deepep_return_recv_hook=True)`,
+  where `_post_dispatch` (or `wait_dispatch()`) runs the hook, so work placed
+  after `_exec_dispatch`, such as a shared expert, overlaps the transfer.
+  `bench_moe_ep_backend.py --shared-intermediate N --recv-hook [--comm-stream]`
+  measures it. At EP8 (forward, 4096 tokens, hidden 7168, 20 SMs):
+
+  | Shared expert | `TURBO` serial | `TURBO` comm stream + hook | `KIWI_SDMA` serial | `KIWI_SDMA` hook |
+  |---|---|---|---|---|
+  | intermediate 2048 | 12.45 ms | 11.74 ms | 12.75 ms | 11.82 ms |
+  | intermediate 8192 | 14.39 ms | 13.27 ms | 14.76 ms | 13.38 ms |
+
+  KIWI gains more from overlap (0.94–1.38 ms against 0.71–1.12 ms) because the
+  transfer uses no CUs: the shared expert slows by about 0.07 ms next to it,
+  against about 0.45 ms next to TURBO's CU dispatch. KIWI stays 0.08–0.11 ms
+  behind because its send kernel (about 0.65 ms) still runs before the
+  overlapped work; running it on the comm stream (`--comm-stream`) does not
+  help (12.14 / 13.44 ms);
 - the backend is not CUDA-graph capturable because progress and copy
   submission run on a host proxy thread.
 
