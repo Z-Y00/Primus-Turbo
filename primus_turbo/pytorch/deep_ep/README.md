@@ -45,13 +45,12 @@ dispatch, each receiver tells every source where its rows start.
 A send kernel runs one workgroup per (destination, channel). It finds the row
 position of every token in its channel with a block-wide scan, packs one row
 per wavefront into local staging, and posts SDMA copy descriptors through a
-vendored KIWI device-to-host queue, then exits. By default the channel that
-finishes last posts one descriptor for the destination's whole contiguous block
-(7 copies per rank per dispatch at EP8). With
-`PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES=<bytes>` each channel instead posts a copy
-whenever about that many bytes are packed, overlapping packing with the
-transfer. Rows that stay on the local GPU are written directly into the
-outputs.
+vendored KIWI device-to-host queue, then exits. Each channel posts a copy
+whenever about `PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES` (default 1 MiB) are packed,
+overlapping packing with the transfer. With `0`, the channel that finishes last
+instead posts one descriptor for the destination's whole contiguous block (7
+copies per rank per dispatch at EP8). Rows that stay on the local GPU are
+written directly into the outputs.
 
 A CPU proxy combines the mixed-destination descriptors observed in one
 progress pass into `hipMemcpyBatchAsync`, so one call spreads copies across all
@@ -114,12 +113,13 @@ Status on MI300X (`rocm/primus:v26.7`, ROCm 7.15):
 
   | Dispatch | Copies per rank | Dispatch | Combine (CU) | Compute | MoE forward |
   |---|---|---|---|---|---|
-  | `KIWI_SDMA`, one copy per destination (default) | 7 | 2.69 ms | 2.34 ms | 7.70 ms | 12.46 ms |
-  | `KIWI_SDMA`, `PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES=1048576` | ~420 | 2.24 ms | 2.34 ms | 7.72 ms | 11.97 ms |
+  | `KIWI_SDMA`, 1 MiB chunks (default) | ~420 | 2.24 ms | 2.34 ms | 7.72 ms | 11.97 ms |
+  | `KIWI_SDMA`, `PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES=0` (one copy per destination) | 7 | 2.69 ms | 2.34 ms | 7.70 ms | 12.46 ms |
   | `TURBO` | | 1.94 ms | 2.27 ms | 7.62 ms | 11.63 ms |
 
-  One copy per destination needs about 3 `hipMemcpyBatchAsync` calls per
-  dispatch instead of about 52, but packing no longer overlaps the transfer;
+  Dispatch time is flat between 256 KiB and 4 MiB chunks (2.19–2.24 ms). One
+  copy per destination needs about 3 `hipMemcpyBatchAsync` calls per dispatch
+  instead of about 52, but packing no longer overlaps the transfer;
 - **do not set both variables to 0.** That routes every copy, including the
   small device-to-host reads PyTorch makes while the dispatch kernel is still
   running, to SDMA. Inside the full MoE layer every dispatch after the first
@@ -134,9 +134,18 @@ Current limitations:
 - memory: the receive region holds `num_ranks × max_tokens_per_rank` records
   and the send staging has the same size, about 475 MB each per rank at EP8,
   4096 tokens, hidden 7168;
-- dispatch is still synchronous: its flag wait and unpack run on the caller's
-  stream right after the send kernel, so the SDMA transfer is not yet
-  overlapped with other work;
+- the MoE layer does not overlap dispatch with compute yet. Callers can do it
+  with `dispatch_sdma(..., return_recv_hook=True)`: it returns after the send
+  kernel and appends a hook to the result; independent work can then run on the
+  stream while SDMA moves the data, and calling the hook launches the flag wait
+  and unpack on the current stream. The receive tensors are valid only after
+  the hook's kernels run, and no other dispatch may start until the hook has
+  been called. `bench_kiwi_sdma_dispatch.py --overlap-gemm N` measures this
+  against `TURBO` dispatch on a side stream. At EP8 (4096 tokens, hidden 7168,
+  2–8 BF16 GEMMs of 8192×7168×4096) the hook hides 1.3–1.7 ms of the 2.7 ms
+  KIWI dispatch, and TURBO hides 0.8–1.0 ms of its 1.8 ms. The send kernel
+  still runs ahead of the independent work on the same stream, so its packing
+  time stays exposed;
 - the backend is not CUDA-graph capturable because progress and copy
   submission run on a host proxy thread.
 

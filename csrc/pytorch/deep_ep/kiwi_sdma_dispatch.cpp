@@ -34,7 +34,11 @@ Buffer::intranode_dispatch_sdma(
     int expert_alignment, int num_worst_tokens,
     const primus_turbo::deep_ep::Config &config, int64_t turbo_nvl_bytes,
     std::optional<EventHandle> &previous_event, bool async,
-    bool allocate_on_comm_stream) {
+    bool allocate_on_comm_stream, bool defer_receive) {
+    // The next dispatch's copies would overwrite the rows a pending receive
+    // has not unpacked yet.
+    PRIMUS_TURBO_CHECK(!kiwi_sdma_pending_receive,
+                       "call the receive hook of the previous KIWI_SDMA dispatch first");
     const bool cached_mode = cached_rank_prefix_matrix.has_value();
     PRIMUS_TURBO_CHECK(num_rdma_ranks == 1);
     PRIMUS_TURBO_CHECK(config.num_sms > 0 && config.num_sms % 2 == 0);
@@ -179,9 +183,11 @@ Buffer::intranode_dispatch_sdma(
     }
 
     PRIMUS_TURBO_CHECK(turbo_nvl_bytes >= 0 && turbo_nvl_bytes <= num_nvl_bytes);
-    // 0 (default): one SDMA descriptor per destination. Positive: each channel
-    // copies runs of at most this many bytes. Must match on every rank.
-    size_t chunk_bytes = 0;
+    // Positive: each channel posts a copy whenever about this many bytes are
+    // packed (EP8 measurements were flat from 256 KiB to 4 MiB). 0: one copy
+    // per destination, which no longer overlaps packing with the transfer.
+    // Must match on every rank.
+    size_t chunk_bytes = 1 << 20;
     if (const char* value = std::getenv("PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES"))
         chunk_bytes = static_cast<size_t>(std::strtoull(value, nullptr, 10));
     const auto layout = primus_turbo::deep_ep::intranode::make_kiwi_sdma_layout(
@@ -219,12 +225,21 @@ Buffer::intranode_dispatch_sdma(
         staging, rank, num_ranks, num_channels, layout, epoch,
         kiwi_sdma_state->device_context(), kiwi_sdma_state->callback_id(),
         kiwi_sdma_state->flag_callback_id(), kiwi_sdma_state->diag(), launch_stream);
-    primus_turbo::deep_ep::intranode::kiwi_sdma_receive(
-        recv_x.data_ptr(), static_cast<float*>(recv_scales_ptr), recv_src_idx.data_ptr<int>(),
-        recv_topk_idx_ptr, recv_topk_weights_ptr, recv_channel_prefix_matrix.data_ptr<int>(),
-        rank_prefix_matrix.data_ptr<int>(), hidden_bytes, scale_bytes, num_topk,
-        buffer_ptrs_gpu, rank, num_ranks, num_channels, layout, epoch,
-        kiwi_sdma_state->diag(), launch_stream);
+    // Captures the tensors by value so they stay alive until the receive runs.
+    auto receive = [=, state = kiwi_sdma_state, buffer_ptrs = buffer_ptrs_gpu](hipStream_t stream) {
+        primus_turbo::deep_ep::intranode::kiwi_sdma_receive(
+            recv_x.data_ptr(), recv_x_scales ? recv_x_scales->data_ptr<float>() : nullptr,
+            recv_src_idx.data_ptr<int>(),
+            recv_topk_idx ? recv_topk_idx->data_ptr<int64_t>() : nullptr,
+            recv_topk_weights ? recv_topk_weights->data_ptr<float>() : nullptr,
+            recv_channel_prefix_matrix.data_ptr<int>(), rank_prefix_matrix.data_ptr<int>(),
+            hidden_bytes, scale_bytes, num_topk, buffer_ptrs, rank, num_ranks, num_channels,
+            layout, epoch, state->diag(), stream);
+    };
+    if (defer_receive)
+        kiwi_sdma_pending_receive = receive;
+    else
+        receive(launch_stream);
 
     std::optional<EventHandle> event;
     if (async) {
@@ -253,6 +268,15 @@ Buffer::intranode_dispatch_sdma(
             num_recv_tokens_per_expert_list, rank_prefix_matrix,
             channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx,
             send_head, event};
+}
+
+void Buffer::kiwi_sdma_receive_hook() {
+    PRIMUS_TURBO_CHECK(static_cast<bool>(kiwi_sdma_pending_receive),
+                       "no KIWI_SDMA dispatch is waiting for its receive hook");
+    // Clear first so a failing launch does not leave the hook armed.
+    auto receive = std::move(kiwi_sdma_pending_receive);
+    kiwi_sdma_pending_receive = nullptr;
+    receive(at::cuda::getCurrentCUDAStream());
 }
 
 } // namespace primus_turbo::pytorch::deep_ep

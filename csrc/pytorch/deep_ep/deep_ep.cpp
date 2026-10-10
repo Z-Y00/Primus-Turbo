@@ -211,6 +211,7 @@ void Buffer::destroy() {
 
     // Keep the KIWI proxy alive while outstanding dispatch kernels drain.
     PRIMUS_TURBO_CHECK_HIP(hipDeviceSynchronize());
+    kiwi_sdma_pending_receive = nullptr;
     if (kiwi_sdma_state) {
         kiwi_sdma_state.reset();
     }

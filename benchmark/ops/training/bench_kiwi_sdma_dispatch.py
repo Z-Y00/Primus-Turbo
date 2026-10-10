@@ -19,7 +19,84 @@ import torch.multiprocessing as mp
 import primus_turbo.pytorch as pt
 
 
+def _timed_ms(function, iterations: int) -> float:
+    dist.barrier()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iterations):
+        function()
+    torch.cuda.synchronize()
+    elapsed = torch.tensor((time.perf_counter() - start) * 1e3 / iterations,
+                           dtype=torch.float64, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()
+
+
+def _overlap(rank, args, buffer, dispatch_x, handle, config) -> None:
+    """How much dispatch time hides behind independent GEMMs.
+
+    KIWI: dispatch with return_recv_hook, run the GEMMs on the same stream,
+    then call the hook. TURBO: its CU dispatch on a side stream concurrently
+    with the same GEMMs. hidden = dispatch + gemm - overlapped.
+    """
+    a = torch.randn(args.gemm_m, args.gemm_k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(args.gemm_k, args.gemm_n, dtype=torch.bfloat16, device="cuda")
+
+    def gemm():
+        for _ in range(args.overlap_gemm):
+            torch.matmul(a, b)
+
+    def kiwi_dispatch():
+        buffer.dispatch_sdma(dispatch_x, handle=handle, config=config)
+
+    def kiwi_overlapped():
+        *_, hook = buffer.dispatch_sdma(
+            dispatch_x, handle=handle, config=config, return_recv_hook=True
+        )
+        gemm()
+        hook()
+
+    side = torch.cuda.Stream()
+
+    def turbo_dispatch():
+        buffer.dispatch(dispatch_x, handle=handle, config=config)
+
+    def turbo_overlapped():
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            turbo_dispatch()
+        gemm()
+        main.wait_stream(side)
+
+    rows = []
+    for _ in range(args.warmup):
+        gemm()
+    gemm_ms = _timed_ms(gemm, args.iterations)
+    for name, alone, overlapped in (
+        ("KIWI_SDMA (hook)", kiwi_dispatch, kiwi_overlapped),
+        ("TURBO (side stream)", turbo_dispatch, turbo_overlapped),
+    ):
+        for function in (alone, overlapped):
+            for _ in range(args.warmup):
+                function()
+        alone_ms = _timed_ms(alone, args.iterations)
+        overlapped_ms = _timed_ms(overlapped, args.iterations)
+        hidden = alone_ms + gemm_ms - overlapped_ms
+        rows.append((name, alone_ms, overlapped_ms, hidden))
+    if rank == 0:
+        print(f"overlap: gemm alone {gemm_ms:.3f} ms "
+              f"({args.overlap_gemm} x [{args.gemm_m}x{args.gemm_k}]x[{args.gemm_k}x{args.gemm_n}])")
+        for name, alone_ms, overlapped_ms, hidden in rows:
+            print(f"overlap: {name}: dispatch alone {alone_ms:.3f} ms, dispatch+gemm "
+                  f"{overlapped_ms:.3f} ms, hidden {hidden:.3f} ms "
+                  f"({100 * hidden / alone_ms:.0f}% of dispatch)", flush=True)
+
+
 def _run(rank: int, args, store_path: str) -> None:
+    # Run TURBO's dispatch on whichever stream is current, so the overlap
+    # benchmark can place it on a side stream.
+    os.environ["PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM"] = "1"
     if "KIWI_SDMA_PROXY_CPU" in os.environ:
         os.environ["KIWI_SDMA_PROXY_CPU"] = str(
             int(os.environ["KIWI_SDMA_PROXY_CPU"]) + rank
@@ -97,7 +174,7 @@ def _run(rank: int, args, store_path: str) -> None:
         record_bytes = (
             (metadata_bytes + 15) // 16 * 16 + (hidden_bytes + 15) // 16 * 16 + scale_bytes
         )
-        chunk_bytes = int(os.environ.get("PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES", "0"))
+        chunk_bytes = int(os.environ.get("PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES", str(1 << 20)))
         num_channels = args.num_sms // 2
         if chunk_bytes > 0:
             rows_per_chunk = max(1, chunk_bytes // record_bytes)
@@ -123,6 +200,8 @@ def _run(rank: int, args, store_path: str) -> None:
             f"copies_per_rank={copies_per_rank} proxy_cpu="
             f"{os.environ.get('KIWI_SDMA_PROXY_CPU', 'unbound')}"
         )
+    if args.overlap_gemm > 0:
+        _overlap(rank, args, buffer, dispatch_x, handle, config)
     buffer.destroy()
     dist.destroy_process_group()
 
@@ -136,6 +215,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-sms", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--overlap-gemm", type=int, default=0,
+                        help="GEMMs per iteration for the overlap measurement (0: skip)")
+    parser.add_argument("--gemm-m", type=int, default=8192)
+    parser.add_argument("--gemm-k", type=int, default=7168)
+    parser.add_argument("--gemm-n", type=int, default=4096)
     opts = parser.parse_args()
     for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE"):
         assert os.environ.get(name, "").isdigit() and int(os.environ[name]) <= 1024, name

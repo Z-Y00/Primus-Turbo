@@ -12,6 +12,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <functional>
 #include <memory>
 #include <tuple>
 #include <vector>
@@ -90,6 +91,9 @@ private:
     uint64_t kiwi_sdma_epoch = 0;
     // Flag offset of the last KIWI layout; flags are reset when it moves.
     size_t kiwi_sdma_flag_offset = static_cast<size_t>(-1);
+    // Receive step of a dispatch made with defer_receive, launched on the
+    // given stream by kiwi_sdma_receive_hook(). It keeps the outputs alive.
+    std::function<void(hipStream_t)> kiwi_sdma_pending_receive;
 
     // Pick the launch stream for this dispatch/combine call.  Returns the
     // caller's current stream when ``force_current_stream`` is set; otherwise
@@ -175,7 +179,12 @@ public:
         int expert_alignment, int num_worst_tokens,
         const primus_turbo::deep_ep::Config &config, int64_t turbo_nvl_bytes,
         std::optional<EventHandle> &previous_event, bool async,
-        bool allocate_on_comm_stream);
+        bool allocate_on_comm_stream, bool defer_receive);
+
+    // Waits for and unpacks the rows of the last dispatch made with
+    // defer_receive, on the caller's current stream. Until then the returned
+    // tensors hold only this rank's own rows.
+    void kiwi_sdma_receive_hook();
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     intranode_combine(const torch::Tensor &x, const std::optional<torch::Tensor> &topk_weights,

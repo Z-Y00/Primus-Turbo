@@ -590,11 +590,20 @@ class Buffer:
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
         turbo_nvl_bytes: Optional[int] = None,
+        return_recv_hook: bool = False,
     ):
         """Intranode BF16/FP16/FP8 dispatch through KIWI and batched SDMA.
 
         The returned handle is intentionally identical to :meth:`dispatch`, so
         the existing CU-based :meth:`combine` consumes it unchanged.
+
+        With ``return_recv_hook``, the call returns once this rank's rows are
+        packed and their SDMA copies posted, and a callable is appended to the
+        result. Until it is called, the received tensors hold only this rank's
+        own rows; calling it enqueues the wait for the peers' copies and the
+        unpack on the current stream. The copies need no workgroups, so other
+        kernels can run in between. Call the hook before the next dispatch on
+        this buffer.
 
         Each receiver reserves a record for every row it receives, after the
         first ``turbo_nvl_bytes`` of the NVL buffer that the CU kernels use
@@ -656,8 +665,9 @@ class Buffer:
                 getattr(previous_event, "event", None),
                 async_finish,
                 allocate_on_comm_stream,
+                return_recv_hook,
             )
-            return (
+            result = (
                 (recv_x, recv_x_scales) if x_scales is not None else recv_x,
                 None,
                 None,
@@ -665,6 +675,7 @@ class Buffer:
                 None,
                 EventOverlap(event),
             )
+            return result + (self.runtime.kiwi_sdma_receive_hook,) if return_recv_hook else result
 
         assert (
             num_tokens_per_rank is not None
@@ -703,6 +714,7 @@ class Buffer:
             getattr(previous_event, "event", None),
             async_finish,
             allocate_on_comm_stream,
+            return_recv_hook,
         )
         handle = (
             rank_prefix_matrix,
@@ -712,7 +724,7 @@ class Buffer:
             is_token_in_rank,
             send_head,
         )
-        return (
+        result = (
             (recv_x, recv_x_scales) if x_scales is not None else recv_x,
             recv_topk_idx,
             recv_topk_weights,
@@ -720,6 +732,7 @@ class Buffer:
             handle,
             EventOverlap(event),
         )
+        return result + (self.runtime.kiwi_sdma_receive_hook,) if return_recv_hook else result
 
     # noinspection PyTypeChecker
     def combine(

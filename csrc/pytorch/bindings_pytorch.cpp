@@ -353,6 +353,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_dispatch_sdma", &deep_ep::Buffer::intranode_dispatch_sdma)
+        .def("kiwi_sdma_receive_hook", &deep_ep::Buffer::kiwi_sdma_receive_hook)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
         .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
         .def("internode_combine", &deep_ep::Buffer::internode_combine)

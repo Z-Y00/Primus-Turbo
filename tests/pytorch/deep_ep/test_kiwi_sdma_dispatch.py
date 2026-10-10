@@ -138,6 +138,17 @@ class KiwiSdmaDispatchTest(MultiProcessTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(cached_x, recv_x, rtol=0, atol=0)
 
+        # Deferred receive: identical result once the hook has run, and no new
+        # dispatch until then.
+        hooked_x, _, _, _, _, _, hook = buffer.dispatch_sdma(
+            x, handle=handle, config=config, return_recv_hook=True
+        )
+        with self.assertRaisesRegex(RuntimeError, "receive hook"):
+            buffer.dispatch_sdma(x, handle=handle, config=config)
+        hook()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(hooked_x, recv_x, rtol=0, atol=0)
+
         if dtype == torch.bfloat16:
             combined, combined_weights, _ = buffer.combine(
                 recv_x,

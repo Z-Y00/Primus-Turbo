@@ -22,9 +22,9 @@ namespace primus_turbo::deep_ep::intranode {
 // waits for every peer's flag and an unpack kernel copies the records into the
 // output tensors; nothing polls the payload.
 //
-// By default each destination's rows go out as one SDMA descriptor once every
-// channel has packed its part; a positive chunk size instead copies each
-// channel's rows in runs of about that many bytes as they are packed.
+// Each channel posts a copy whenever about chunk_bytes of rows are packed; a
+// chunk size of 0 instead sends each destination's rows as one SDMA descriptor
+// once every channel has packed its part.
 
 // wall_clock64() runs at 100 MHz on CDNA3, unlike the core-clock budget of
 // NUM_TIMEOUT_CYCLES, so this is 30 s of real time.
