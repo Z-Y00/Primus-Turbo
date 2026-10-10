@@ -33,10 +33,15 @@ def _run(rank: int, args, store_path: str) -> None:
     )
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     config = pt.deep_ep.Config(args.num_sms, 4, 64, 4, 64)
-    nvl_bytes = config.get_nvl_buffer_size_hint(args.hidden * 2, args.num_processes)
-    buffer = pt.deep_ep.Buffer(
-        dist.group.WORLD, nvl_bytes, explicitly_destroy=True
+    Buffer = pt.deep_ep.Buffer
+    nvl_bytes = Buffer.get_kiwi_sdma_nvl_buffer_size_hint(
+        args.num_processes,
+        args.hidden * 2,
+        args.num_tokens,
+        num_topk=args.num_processes,
+        configs=(config, Buffer.get_combine_config(args.num_processes)),
     )
+    buffer = Buffer(dist.group.WORLD, nvl_bytes, explicitly_destroy=True)
 
     x = torch.full(
         (args.num_tokens, args.hidden), rank + 1, dtype=dtype, device="cuda"
@@ -88,10 +93,16 @@ def _run(rank: int, args, store_path: str) -> None:
     dist.reduce(latency, dst=0, op=dist.ReduceOp.MAX)
     if rank == 0:
         hidden_bytes = args.hidden * x.element_size()
-        record_bytes = 4 + hidden_bytes + scale_bytes
-        rows_per_chunk = max(1, (256 * 1024 - 16) // ((record_bytes + 15) // 16 * 16))
-        chunks = args.num_processes * args.num_processes * math.ceil(
-            args.num_tokens / rows_per_chunk
+        metadata_bytes = 4 + args.num_processes * 12
+        record_bytes = (
+            (metadata_bytes + 15) // 16 * 16 + (hidden_bytes + 15) // 16 * 16 + scale_bytes
+        )
+        rows_per_chunk = max(1, (1 << 20) // record_bytes)
+        num_channels = args.num_sms // 2
+        copies_per_rank = (
+            args.num_processes
+            * num_channels
+            * math.ceil(math.ceil(args.num_tokens / num_channels) / rows_per_chunk)
         )
         payload = (
             args.num_tokens
@@ -103,8 +114,8 @@ def _run(rank: int, args, store_path: str) -> None:
             f"KIWI SDMA {args.dtype.upper()} EP={args.num_processes} "
             f"M={args.num_tokens} H={args.hidden}: {latency.item():.2f} us, "
             f"{payload / (latency.item() * 1e3):.2f} GB/s cross-rank payload, "
-            f"target_chunk=262144 B rows_per_chunk={rows_per_chunk} "
-            f"worst_case_chunks={chunks} proxy_cpu="
+            f"target_chunk={1 << 20} B rows_per_chunk={rows_per_chunk} "
+            f"copies_per_rank={copies_per_rank} proxy_cpu="
             f"{os.environ.get('KIWI_SDMA_PROXY_CPU', 'unbound')}"
         )
     buffer.destroy()

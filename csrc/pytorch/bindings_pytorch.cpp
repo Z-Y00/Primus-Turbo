@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 
 #include "extensions.h"
+#include "primus_turbo/deep_ep/kiwi_sdma.h"
 
 namespace primus_turbo::pytorch {
 
@@ -319,12 +320,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
              py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
+        .def_readonly("num_sms", &primus_turbo::deep_ep::Config::num_sms)
         .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint",
              &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);
 
     deep_ep_module.def("get_low_latency_rdma_size_hint",
                        &primus_turbo::deep_ep::get_low_latency_rdma_size_hint);
+    deep_ep_module.def("get_kiwi_sdma_nvl_buffer_size_hint",
+                       &primus_turbo::deep_ep::intranode::kiwi_sdma_nvl_buffer_bytes,
+                       py::arg("turbo_bytes"), py::arg("num_channels"), py::arg("num_ranks"),
+                       py::arg("hidden_bytes"), py::arg("scale_bytes"), py::arg("num_topk"),
+                       py::arg("num_max_tokens_per_rank"));
 
     pybind11::class_<deep_ep::EventHandle>(deep_ep_module, "EventHandle")
         .def(pybind11::init<>())

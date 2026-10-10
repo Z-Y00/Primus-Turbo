@@ -18,3 +18,8 @@ set_source_files_properties(sdma_proto.hip.cpp PROPERTIES LANGUAGE HIP)
 add_executable(sdma_proto sdma_proto.hip.cpp)
 target_compile_options(sdma_proto PRIVATE -O3)
 target_link_libraries(sdma_proto PRIVATE kiwi_invoke Threads::Threads)
+
+set_source_files_properties(sdma_host_api_drive.hip.cpp PROPERTIES LANGUAGE HIP)
+add_executable(sdma_host_api_drive sdma_host_api_drive.hip.cpp)
+target_compile_options(sdma_host_api_drive PRIVATE -O3)
+target_link_libraries(sdma_host_api_drive PRIVATE Threads::Threads)

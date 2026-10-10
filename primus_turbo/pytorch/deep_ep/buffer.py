@@ -206,6 +206,49 @@ class Buffer:
             num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
         )
 
+    @staticmethod
+    def get_turbo_nvl_bytes(
+        hidden_bytes: int,
+        num_ranks: int,
+        configs: Optional[Tuple[Config, ...]] = None,
+    ) -> int:
+        """NVL bytes the CU dispatch/combine kernels may touch for ``configs``
+        (default: the default dispatch and combine configs). ``KIWI_SDMA``
+        places its receive region after these bytes."""
+        if configs is None:
+            configs = (Buffer.get_dispatch_config(num_ranks), Buffer.get_combine_config(num_ranks))
+        return max(cfg.get_nvl_buffer_size_hint(hidden_bytes, num_ranks) for cfg in configs)
+
+    @staticmethod
+    def get_kiwi_sdma_nvl_buffer_size_hint(
+        num_ranks: int,
+        hidden_bytes: int,
+        num_max_tokens_per_rank: int,
+        num_topk: int,
+        scale_bytes: int = 0,
+        configs: Optional[Tuple[Config, ...]] = None,
+    ) -> int:
+        """NVL buffer size for ``KIWI_SDMA`` dispatch plus the CU combine.
+
+        The receiver reserves one record per row it can receive, so the KIWI
+        region holds ``num_ranks * num_max_tokens_per_rank`` records after the
+        CU kernels' bytes. ``hidden_bytes`` is the combine (BF16/FP16) row size,
+        which also bounds an FP8 row plus its scales.
+        """
+        if configs is None:
+            configs = (Buffer.get_dispatch_config(num_ranks), Buffer.get_combine_config(num_ranks))
+        turbo_bytes = Buffer.get_turbo_nvl_bytes(hidden_bytes, num_ranks, configs)
+        num_channels = max(cfg.num_sms for cfg in configs) // 2
+        return deep_ep_cpp.get_kiwi_sdma_nvl_buffer_size_hint(
+            turbo_bytes,
+            num_channels,
+            num_ranks,
+            hidden_bytes,
+            scale_bytes,
+            num_topk,
+            num_max_tokens_per_rank,
+        )
+
     def get_comm_stream(self) -> torch.Stream:
         """
         Get the communication stream.
@@ -546,11 +589,17 @@ class Buffer:
         previous_event: Optional[EventOverlap] = None,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        turbo_nvl_bytes: Optional[int] = None,
     ):
         """Intranode BF16/FP16/FP8 dispatch through KIWI and batched SDMA.
 
         The returned handle is intentionally identical to :meth:`dispatch`, so
         the existing CU-based :meth:`combine` consumes it unchanged.
+
+        Each receiver reserves a record for every row it receives, after the
+        first ``turbo_nvl_bytes`` of the NVL buffer that the CU kernels use
+        (default: :meth:`get_turbo_nvl_bytes` for the default configs). Size
+        the buffer with :meth:`get_kiwi_sdma_nvl_buffer_size_hint`.
         """
         x, x_scales = x if isinstance(x, tuple) else (x, None)
         if x_scales is None:
@@ -560,6 +609,12 @@ class Buffer:
             assert x_scales.dtype == torch.float32
         assert self.runtime.get_num_rdma_ranks() == 1, "KIWI_SDMA is intranode-only"
         config = self.get_dispatch_config(self.group_size) if config is None else config
+        if turbo_nvl_bytes is None:
+            turbo_nvl_bytes = self.get_turbo_nvl_bytes(
+                x.size(1) * max(x.element_size(), 2),
+                self.group_size,
+                (config, self.get_combine_config(self.group_size)),
+            )
 
         if handle is not None:
             assert topk_idx is None and topk_weights is None
@@ -597,6 +652,7 @@ class Buffer:
                 expert_alignment,
                 num_worst_tokens,
                 config,
+                turbo_nvl_bytes,
                 getattr(previous_event, "event", None),
                 async_finish,
                 allocate_on_comm_stream,
@@ -643,6 +699,7 @@ class Buffer:
             expert_alignment,
             num_worst_tokens,
             config,
+            turbo_nvl_bytes,
             getattr(previous_event, "event", None),
             async_finish,
             allocate_on_comm_stream,

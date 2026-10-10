@@ -31,7 +31,7 @@ Buffer::intranode_dispatch_sdma(
     const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
     const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
     int expert_alignment, int num_worst_tokens,
-    const primus_turbo::deep_ep::Config &config,
+    const primus_turbo::deep_ep::Config &config, int64_t turbo_nvl_bytes,
     std::optional<EventHandle> &previous_event, bool async,
     bool allocate_on_comm_stream) {
     const bool cached_mode = cached_rank_prefix_matrix.has_value();
@@ -102,7 +102,7 @@ Buffer::intranode_dispatch_sdma(
 
     if (!kiwi_sdma_state)
         kiwi_sdma_state = get_kiwi_sdma_state(device_id);
-    kiwi_sdma_state->ensure(static_cast<size_t>(num_ranks));
+    kiwi_sdma_state->ensure(static_cast<size_t>(num_ranks) * num_channels);
 
     int num_recv_tokens = -1;
     torch::Tensor rank_prefix_matrix;
@@ -177,12 +177,24 @@ Buffer::intranode_dispatch_sdma(
             torch::empty({num_recv_tokens, num_topk}, topk_weights->options());
     }
 
+    PRIMUS_TURBO_CHECK(turbo_nvl_bytes >= 0 && turbo_nvl_bytes <= num_nvl_bytes);
     const auto layout = primus_turbo::deep_ep::intranode::make_kiwi_sdma_layout(
-        num_channels, num_ranks, hidden_bytes, scale_bytes, num_topk);
-    PRIMUS_TURBO_CHECK(static_cast<int64_t>(layout.total_bytes) <= num_nvl_bytes);
+        num_channels, num_ranks, hidden_bytes, scale_bytes, num_topk,
+        static_cast<size_t>(turbo_nvl_bytes), static_cast<size_t>(num_nvl_bytes));
+    if (static_cast<size_t>(num_recv_tokens) > layout.capacity_rows) {
+        throw std::runtime_error(
+            "KIWI_SDMA receive region holds " + std::to_string(layout.capacity_rows) +
+            " rows but this dispatch receives " + std::to_string(num_recv_tokens) +
+            "; size the buffer with deep_ep.get_kiwi_sdma_nvl_buffer_size_hint()");
+    }
+    // Rows for peer p are staged at [p * num_tokens, (p + 1) * num_tokens).
+    void* staging = kiwi_sdma_state->reserve_staging(
+        std::max<size_t>(1, static_cast<size_t>(num_ranks) * num_tokens) *
+        layout.record_stride);
     primus_turbo::deep_ep::intranode::kiwi_sdma_prepare(
-        buffer_ptrs[rank], layout, hidden_bytes, scale_bytes, is_fp8, launch_stream);
-    // All receive slots must be re-armed before any peer starts copying.
+        buffer_ptrs_gpu, rank_prefix_matrix.data_ptr<int>(), rank, layout, num_recv_tokens,
+        num_channels, num_ranks, hidden_bytes, scale_bytes, is_fp8, launch_stream);
+    // Every receiver must be armed before any peer starts copying.
     primus_turbo::deep_ep::intranode::barrier(
         barrier_signal_ptrs_gpu, rank, num_ranks, launch_stream);
     primus_turbo::deep_ep::intranode::kiwi_sdma_dispatch(
@@ -196,9 +208,9 @@ Buffer::intranode_dispatch_sdma(
         is_token_in_rank.data_ptr<bool>(), rank_prefix_matrix.data_ptr<int>(),
         channel_prefix_matrix.data_ptr<int>(), num_tokens, num_worst_tokens,
         hidden_bytes, scale_bytes, num_topk, num_experts, is_fp8,
-        buffer_ptrs_gpu, rank, num_ranks, num_channels, layout,
+        buffer_ptrs_gpu, staging, rank, num_ranks, num_channels, layout,
         kiwi_sdma_state->device_context(),
-        kiwi_sdma_state->callback_id(), launch_stream);
+        kiwi_sdma_state->callback_id(), kiwi_sdma_state->diag(), launch_stream);
 
     std::optional<EventHandle> event;
     if (async) {

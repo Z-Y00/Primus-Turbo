@@ -148,29 +148,6 @@ def _run(rank: int, args, store_path: str) -> None:
         )
         return output
 
-    if args.breakdown:
-        stage_times = {}
-        with torch.no_grad():
-            moe_forward(x, w1, w2, gate, stage_times)
-        names = ("dispatch", "fc1", "activation", "fc2", "combine")
-        values = torch.tensor(
-            [stage_times[name] for name in names],
-            dtype=torch.float64,
-            device="cuda",
-        )
-        dist.reduce(values, dst=0, op=dist.ReduceOp.MAX)
-        if rank == 0:
-            print(
-                "MOE breakdown backend="
-                + args.backend
-                + " "
-                + " ".join(
-                    f"{name}={value:.3f}ms"
-                    for name, value in zip(names, values.tolist())
-                ),
-                flush=True,
-            )
-
     output = None
     for _ in range(args.warmup):
         output = iteration()
@@ -198,6 +175,29 @@ def _run(rank: int, args, store_path: str) -> None:
             f"checksum={checksum.item():.7e}",
             flush=True,
         )
+
+    if args.breakdown:
+        stage_times = {}
+        with torch.no_grad():
+            moe_forward(x, w1, w2, gate, stage_times)
+        names = ("dispatch", "fc1", "activation", "fc2", "combine")
+        values = torch.tensor(
+            [stage_times[name] for name in names],
+            dtype=torch.float64,
+            device="cuda",
+        )
+        dist.reduce(values, dst=0, op=dist.ReduceOp.MAX)
+        if rank == 0:
+            print(
+                "MOE breakdown backend="
+                + args.backend
+                + " "
+                + " ".join(
+                    f"{name}={value:.3f}ms"
+                    for name, value in zip(names, values.tolist())
+                ),
+                flush=True,
+            )
 
     dist.barrier()
     dist.destroy_process_group()

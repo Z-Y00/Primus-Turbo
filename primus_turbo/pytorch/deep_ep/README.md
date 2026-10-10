@@ -37,13 +37,27 @@ See [DeepEP example](../../../docs/examples.md#4-deepep)
 ### KIWI SDMA dispatch backend
 
 `KIWI_SDMA` is an experimental intranode dispatch transport for 2–8 ranks.
-GPU sender workgroups compact routed BF16/FP16 or FP8+scale rows across all
-channels for each destination into approximately 256 KiB chunks in an
-eight-slot ring, then invoke a vendored KIWI device-to-host queue. A CPU proxy
-combines mixed-destination descriptors observed in one progress pass into
-`hipMemcpyBatchAsync`.
-Receivers poll an exact signaling-NaN bit pattern and load ready hidden rows
-directly into LDS before publishing the normal DeepEP receive tensors.
+Every receiver reserves one record per row it can receive, after the bytes the
+CU kernels use in the NVL buffer, in final `recv_x` order. A dispatch therefore
+never reuses receive memory: there is no ring, ACK, or in-iteration re-arm. The
+records are armed with sentinels once per dispatch, before the barrier, and
+each receiver tells every source where its rows start.
+
+One sender workgroup per (destination, channel) packs that channel's rows into
+local staging and copies runs of up to 1 MiB with a single descriptor through a
+vendored KIWI device-to-host queue. A CPU proxy combines the mixed-destination
+descriptors observed in one progress pass into `hipMemcpyBatchAsync`, so one
+call spreads copies across all XGMI links. Rows that stay on the local GPU are
+written directly by the CU. One receiver workgroup per (source, channel) polls
+an exact signaling-NaN pattern over each row's metadata, hidden, and scale
+words, loads the ready row into LDS, and writes the normal DeepEP receive
+tensors.
+
+Size the NVL buffer with `Buffer.get_kiwi_sdma_nvl_buffer_size_hint()`; the
+`KIWI_SDMA` MoE backend does this automatically for
+`PRIMUS_TURBO_KIWI_SDMA_MAX_TOKENS` tokens per rank (default 4096) and
+`PRIMUS_TURBO_KIWI_SDMA_MAX_TOPK` experts (default 32). A dispatch that would
+receive more rows fails with an explicit error.
 
 The backend changes dispatch only. Combine continues to use the existing
 TURBO CU implementation and consumes the same dispatch handle.
@@ -63,11 +77,37 @@ Use `benchmark/ops/training/bench_kiwi_sdma_dispatch.py` for focused
 2-, 4-, or 8-rank BF16/FP16/FP8 measurements. It reports cached-dispatch latency,
 cross-rank payload bandwidth, chunk geometry, and proxy affinity. When
 `KIWI_SDMA_PROXY_CPU` is set, the benchmark treats it as a base and pins rank
-`r` to `base + r`.
+`r` to `base + r`. `benchmark/ops/training/bench_moe_ep_backend.py` times the
+whole MoE layer (dispatch, grouped FC1, SwiGLU, grouped FC2, combine) for any
+EP backend; `--breakdown` adds per-stage times.
+`benchmark/sdma_kiwi_proto/sdma_host_api_drive.hip.cpp` replays the dispatch
+copy pattern straight into `hipMemcpyBatchAsync` across one process per GPU.
+
+Set `KIWI_SDMA_PROFILE=1` to print per-second proxy statistics: copies,
+batch sizes, time inside `hipMemcpyBatchAsync`, and whether the copy stream
+still has unfinished work. A dispatch wait that exceeds 30 s ends the kernel
+and prints which wait failed (`[KIWI_SDMA_DEVICE]` / `[KIWI_SDMA_FAILURE]`).
+
+Status on MI300X (`rocm/primus:v26.7`, ROCm 7.15):
+
+- the 2-rank suite passes (BF16, FP16, FP8 with scales, cached replay, zero
+  peers, duplicate experts, `-1` routes, CU combine);
+- 8-rank dispatch alone, 4096 tokens sent to every rank at hidden 7168, runs
+  repeatedly warm at about 4.2 ms per dispatch (about 98 GB/s cross-rank
+  payload per rank);
+- **known issue:** inside the full MoE layer at EP4/EP8, every dispatch after
+  the first stalls. Its GPU senders and the proxy submit every copy, but the
+  proxy's copy stream stops completing them, so receivers time out and the
+  layer output is wrong. This looks like the HIP runtime making peer copies
+  wait on the destination GPU while its dispatch kernel is spinning, and is
+  under investigation. Do not use `KIWI_SDMA` for training yet.
 
 Current limitations:
 
 - single-node groups only;
+- memory: the receive region holds `num_ranks × max_tokens_per_rank` records
+  and the send staging has the same size, about 475 MB each per rank at EP8,
+  4096 tokens, hidden 7168;
 - BF16/FP16 inputs must not contain the reserved signaling-NaN bit pattern
   `0x7f81`; FP8 E4M3 inputs must not contain `0x7f` or `0xff`, and FP8
   scales must be finite;

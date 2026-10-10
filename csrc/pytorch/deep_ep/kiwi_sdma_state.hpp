@@ -8,6 +8,8 @@
 
 #include <kiwi/invoke/invoke.hpp>
 
+#include "primus_turbo/deep_ep/kiwi_sdma.h"
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -33,10 +35,27 @@ public:
 
     void* device_context() const;
     uint8_t callback_id() const { return callback_id_; }
+    primus_turbo::deep_ep::intranode::KiwiSdmaDiag* diag() const { return diag_device_; }
 
 private:
+    struct ProxyProfile {
+        bool enabled = false;
+        double window_start_ms = 0;
+        double progress_ms = 0;
+        double api_ms = 0;
+        double max_call_us = 0;
+        size_t sweeps = 0;
+        size_t idle_sweeps = 0;
+        size_t calls = 0;
+        size_t copies = 0;
+        size_t max_batch = 0;
+        size_t bytes = 0;
+    };
+
     void proxy_loop();
     void flush();
+    void report_profile(double now_ms, bool force);
+    void report_device_timeout();
     void record_error(const std::string& message);
 
     int device_id_;
@@ -55,6 +74,10 @@ private:
     std::vector<size_t> sizes_;
     void* staging_ = nullptr;
     size_t staging_bytes_ = 0;
+    ProxyProfile profile_;
+    primus_turbo::deep_ep::intranode::KiwiSdmaDiag* diag_host_ = nullptr;
+    primus_turbo::deep_ep::intranode::KiwiSdmaDiag* diag_device_ = nullptr;
+    bool diag_reported_ = false;
 };
 
 // Process-wide ownership prevents one application object from tearing down a

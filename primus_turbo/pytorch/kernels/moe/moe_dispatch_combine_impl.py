@@ -220,6 +220,10 @@ class _DeepEPLikeBackend:
         """Call the transport-specific Buffer dispatch entry point."""
         return buffer.dispatch(*args, **kwargs)
 
+    def _nvl_buffer_bytes(self, group: dist.ProcessGroup, hidden_bytes: int, configs) -> int:
+        """NVL buffer size the transport needs for ``configs``."""
+        return max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()) for cfg in configs)
+
     # ------------------------------------------------------------------
     # EPBackend interface
     # ------------------------------------------------------------------
@@ -238,12 +242,11 @@ class _DeepEPLikeBackend:
         dispatch_config = config.dispatch_config or BufferClass.get_dispatch_config(group.size())
         combine_config = config.combine_config or BufferClass.get_combine_config(group.size())
 
-        num_nvl_bytes, num_rdma_bytes = 0, 0
+        num_nvl_bytes = self._nvl_buffer_bytes(
+            group, hidden_bytes, (dispatch_config, combine_config)
+        )
+        num_rdma_bytes = 0
         for cfg in (dispatch_config, combine_config):
-            num_nvl_bytes = max(
-                cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()),
-                num_nvl_bytes,
-            )
             try:
                 num_rdma_bytes = max(
                     cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()),
@@ -427,7 +430,27 @@ class KiwiSdmaEPBackend(TurboEPBackend):
     """KIWI GPU→CPU invoke plus host-issued batched SDMA dispatch.
 
     Combine deliberately remains on Turbo DeepEP's existing CU path.
+
+    Every receiver reserves a record for each row it can receive, so the NVL
+    buffer is sized for ``PRIMUS_TURBO_KIWI_SDMA_MAX_TOKENS`` tokens per rank
+    (default 4096) routed to at most ``PRIMUS_TURBO_KIWI_SDMA_MAX_TOPK``
+    experts (default 32). A dispatch that receives more rows fails with an
+    explicit error.
     """
+
+    _turbo_nvl_bytes: Optional[int] = None
+
+    def _nvl_buffer_bytes(self, group: dist.ProcessGroup, hidden_bytes: int, configs) -> int:
+        from primus_turbo.pytorch.deep_ep import Buffer
+
+        self._turbo_nvl_bytes = Buffer.get_turbo_nvl_bytes(hidden_bytes, group.size(), configs)
+        return Buffer.get_kiwi_sdma_nvl_buffer_size_hint(
+            group.size(),
+            hidden_bytes,
+            int(os.environ.get("PRIMUS_TURBO_KIWI_SDMA_MAX_TOKENS", "4096")),
+            int(os.environ.get("PRIMUS_TURBO_KIWI_SDMA_MAX_TOPK", "32")),
+            configs=configs,
+        )
 
     def init_buffer(
         self,
@@ -450,7 +473,7 @@ class KiwiSdmaEPBackend(TurboEPBackend):
         super().init_buffer(group, hidden_bytes, config)
 
     def _dispatch_buffer(self, buffer, *args, **kwargs):
-        return buffer.dispatch_sdma(*args, **kwargs)
+        return buffer.dispatch_sdma(*args, turbo_nvl_bytes=self._turbo_nvl_bytes, **kwargs)
 
 
 # =========================================================================

@@ -35,8 +35,16 @@ class KiwiSdmaDispatchTest(MultiProcessTestCase):
             "nccl", rank=self.rank, world_size=self.world_size, store=store
         )
         config = pt.deep_ep.Config(8, 4, 64, 4, 64)
-        nvl_bytes = config.get_nvl_buffer_size_hint(hidden * 2, self.world_size)
-        return pt.deep_ep.Buffer(dist.group.WORLD, nvl_bytes), config
+        Buffer = pt.deep_ep.Buffer
+        max_tokens = max(1024, int(os.environ.get("KIWI_SDMA_TEST_TOKENS", "37")))
+        nvl_bytes = Buffer.get_kiwi_sdma_nvl_buffer_size_hint(
+            self.world_size,
+            hidden * 2,
+            max_tokens,
+            num_topk=max(8, self.world_size),
+            configs=(config, Buffer.get_combine_config(self.world_size)),
+        )
+        return Buffer(dist.group.WORLD, nvl_bytes), config
 
     @skip_if_lt_x_gpu(2)
     @parametrize("dtype", [torch.bfloat16, torch.float16])

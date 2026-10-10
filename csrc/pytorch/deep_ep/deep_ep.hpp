@@ -168,7 +168,7 @@ public:
         const std::optional<torch::Tensor> &cached_rank_prefix_matrix,
         const std::optional<torch::Tensor> &cached_channel_prefix_matrix,
         int expert_alignment, int num_worst_tokens,
-        const primus_turbo::deep_ep::Config &config,
+        const primus_turbo::deep_ep::Config &config, int64_t turbo_nvl_bytes,
         std::optional<EventHandle> &previous_event, bool async,
         bool allocate_on_comm_stream);
 
