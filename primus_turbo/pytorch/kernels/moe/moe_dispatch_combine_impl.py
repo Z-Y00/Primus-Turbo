@@ -458,15 +458,17 @@ class KiwiSdmaEPBackend(TurboEPBackend):
         hidden_bytes: int,
         config: EPBufferConfig,
     ) -> None:
-        required = {
-            "ROC_P2P_SDMA_SIZE": "0",
-            "GPU_FORCE_BLIT_COPY_SIZE": "0",
-        }
-        missing = [f"{key}=0" for key, value in required.items() if os.environ.get(key) != value]
-        if missing:
+        # Thresholds in KB. KIWI chunks are at most 1 MiB, so values up to 1024
+        # keep full chunks on SDMA while smaller copies use blit kernels.
+        invalid = [
+            name
+            for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE")
+            if not os.environ.get(name, "").isdigit() or int(os.environ[name]) > 1024
+        ]
+        if invalid:
             raise RuntimeError(
-                "KIWI_SDMA requires these variables before process launch: "
-                + " ".join(missing)
+                "KIWI_SDMA requires these variables to be set to at most 1024 (KB) "
+                "before process launch: " + " ".join(invalid)
             )
         if group.size() > 8:
             raise RuntimeError("KIWI_SDMA currently supports intranode EP groups of at most 8 ranks")

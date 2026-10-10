@@ -21,15 +21,17 @@ def enabled() -> bool:
 
 
 def _validate_environment() -> None:
-    missing = [
+    # Thresholds in KB: copies at or below them run as blit kernels instead of
+    # SDMA. MegaMoE packs about 64 KiB per copy, so keep them at most 64.
+    invalid = [
         name
         for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE")
-        if os.getenv(name) != "0"
+        if not os.getenv(name, "").isdigit() or int(os.environ[name]) > 64
     ]
-    if missing:
+    if invalid:
         raise RuntimeError(
-            "MegaMoE KIWI_SDMA requires these variables to be 0 before process launch: "
-            + ", ".join(missing)
+            "MegaMoE KIWI_SDMA requires these variables to be set to at most 64 (KB) "
+            "before process launch: " + ", ".join(invalid)
         )
 
 

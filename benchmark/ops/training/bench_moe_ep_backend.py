@@ -71,8 +71,9 @@ def _run(rank: int, args, store_path: str) -> None:
                 int(os.environ["KIWI_SDMA_PROXY_CPU"]) + rank
             )
         for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE"):
-            if os.environ.get(name) != "0":
-                raise RuntimeError(f"{args.backend} requires {name}=0 before launch")
+            value = os.environ.get(name, "")
+            if not value.isdigit() or int(value) > 1024:
+                raise RuntimeError(f"{args.backend} requires {name} <= 1024 (KB) before launch")
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -114,6 +115,10 @@ def _run(rank: int, args, store_path: str) -> None:
             "dispatch",
             lambda: dispatcher.token_dispatch(x_arg, gate_arg, indices=topk_idx),
         )
+        if args.stages == "dispatch":
+            return dispatched
+        if args.stages == "dispatch,combine":
+            return stage("combine", lambda: dispatcher.token_combine(dispatched))
         group_lens = tokens_per_expert.to(device=x_arg.device, dtype=torch.int64)
         fc1 = stage(
             "fc1",
@@ -218,6 +223,12 @@ if __name__ == "__main__":
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--breakdown", action="store_true")
+    parser.add_argument(
+        "--stages",
+        choices=("all", "dispatch", "dispatch,combine"),
+        default="all",
+        help="Run only a prefix of the layer (forward mode) to isolate transport issues.",
+    )
     options = parser.parse_args()
     if options.num_experts % options.num_processes:
         parser.error("--num-experts must be divisible by --num-processes")

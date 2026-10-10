@@ -62,12 +62,17 @@ receive more rows fails with an explicit error.
 The backend changes dispatch only. Combine continues to use the existing
 TURBO CU implementation and consumes the same dispatch handle.
 
-ROCm 7.15 selects a CU blit kernel for small peer copies by default. Set these
-variables **before launching Python**:
+ROCm chooses between SDMA and a CU blit kernel per copy by size.
+`GPU_FORCE_BLIT_COPY_SIZE` (KB, default 16) runs copies up to that size as
+blit kernels, and `ROC_P2P_SDMA_SIZE` (KB, default 1024) is the size above
+which peer copies use SDMA; by default every KIWI chunk of up to 1 MiB would
+therefore run on CUs. Set both to 64 **before launching Python**, so KIWI
+chunks use SDMA while small copies, such as PyTorch's device-to-host reads of
+token counts, stay on blit kernels:
 
 ```bash
-export ROC_P2P_SDMA_SIZE=0
-export GPU_FORCE_BLIT_COPY_SIZE=0
+export ROC_P2P_SDMA_SIZE=64
+export GPU_FORCE_BLIT_COPY_SIZE=64
 export PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND=KIWI_SDMA
 # Optional: pin each process's proxy thread to this logical CPU.
 export KIWI_SDMA_PROXY_CPU=4
@@ -95,12 +100,20 @@ Status on MI300X (`rocm/primus:v26.7`, ROCm 7.15):
 - 8-rank dispatch alone, 4096 tokens sent to every rank at hidden 7168, runs
   repeatedly warm at about 4.2 ms per dispatch (about 98 GB/s cross-rank
   payload per rank);
-- **known issue:** inside the full MoE layer at EP4/EP8, every dispatch after
-  the first stalls. Its GPU senders and the proxy submit every copy, but the
-  proxy's copy stream stops completing them, so receivers time out and the
-  layer output is wrong. This looks like the HIP runtime making peer copies
-  wait on the destination GPU while its dispatch kernel is spinning, and is
-  under investigation. Do not use `KIWI_SDMA` for training yet.
+- the full MoE layer at EP4 (hidden 7168, intermediate 2048, 256 experts,
+  top-8, 4096 tokens per rank) runs warm with the output checksum matching
+  `TURBO`: 16.0 ms per forward iteration versus 11.9 ms for `TURBO`;
+- **do not set both variables to 0.** That routes every copy, including the
+  small device-to-host reads PyTorch makes while the dispatch kernel is still
+  running, to SDMA. Inside the full MoE layer every dispatch after the first
+  then stalls: the proxy submits all copies but the copy stream stops
+  completing them and the receivers time out. A standalone reproducer
+  (`benchmark/sdma_kiwi_proto/sdma_d2h_stall_repro.hip.cpp`) does not yet
+  trigger this outside PyTorch;
+- a dispatch measured alone (with device synchronization before and after)
+  takes far longer than its share of a warm iteration (about 143 ms at EP4);
+  this is not yet understood;
+- EP8 inside the full MoE layer has not been rerun with the 64 KB settings.
 
 Current limitations:
 
@@ -127,7 +140,8 @@ each expert/source-rank segment into contiguous row chunks (64 KiB payloads
 where counts permit). Before each dispatch, ranks re-arm and rendezvous on
 the destination pool; the GEMM side uses system-coherent bitwise sentinel
 polling over every valid BF16 or FP8+scale word instead of the CU completion
-counter. `ROC_P2P_SDMA_SIZE=0` and `GPU_FORCE_BLIT_COPY_SIZE=0` are mandatory
-for this opt-in mode as well. MegaMoE MXFP8 uses the E4M3 FNUZ NaN encoding
+counter. This mode also needs `ROC_P2P_SDMA_SIZE` and
+`GPU_FORCE_BLIT_COPY_SIZE` set, at most 64 (KB) because its copies are about
+64 KiB; it has not been run on gfx950 hardware yet. MegaMoE MXFP8 uses the E4M3 FNUZ NaN encoding
 `0x80` as its data sentinel (`0x7f` is a valid finite maximum in this format)
 and `0xff` as its E8M0 scale sentinel.

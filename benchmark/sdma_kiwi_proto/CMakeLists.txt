@@ -23,3 +23,8 @@ set_source_files_properties(sdma_host_api_drive.hip.cpp PROPERTIES LANGUAGE HIP)
 add_executable(sdma_host_api_drive sdma_host_api_drive.hip.cpp)
 target_compile_options(sdma_host_api_drive PRIVATE -O3)
 target_link_libraries(sdma_host_api_drive PRIVATE Threads::Threads)
+
+set_source_files_properties(sdma_d2h_stall_repro.hip.cpp PROPERTIES LANGUAGE HIP)
+add_executable(sdma_d2h_stall_repro sdma_d2h_stall_repro.hip.cpp)
+target_compile_options(sdma_d2h_stall_repro PRIVATE -O3)
+target_link_libraries(sdma_d2h_stall_repro PRIVATE Threads::Threads)

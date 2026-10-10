@@ -35,14 +35,17 @@ def test_mega_moe_sdma_rejects_unknown_selection(monkeypatch):
 
 def test_mega_moe_sdma_requires_blit_environment(monkeypatch):
     monkeypatch.delenv("ROC_P2P_SDMA_SIZE", raising=False)
-    monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "0")
+    monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "64")
     with pytest.raises(RuntimeError, match="ROC_P2P_SDMA_SIZE"):
         sdma._validate_environment()
 
-    monkeypatch.setenv("ROC_P2P_SDMA_SIZE", "0")
-    monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "1")
+    monkeypatch.setenv("ROC_P2P_SDMA_SIZE", "64")
+    monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "1024")
     with pytest.raises(RuntimeError, match="GPU_FORCE_BLIT_COPY_SIZE"):
         sdma._validate_environment()
 
+    monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "64")
+    sdma._validate_environment()
+    monkeypatch.setenv("ROC_P2P_SDMA_SIZE", "0")
     monkeypatch.setenv("GPU_FORCE_BLIT_COPY_SIZE", "0")
     sdma._validate_environment()

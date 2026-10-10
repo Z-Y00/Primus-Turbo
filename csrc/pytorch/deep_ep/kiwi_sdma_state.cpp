@@ -24,9 +24,17 @@ namespace {
 constexpr size_t kQueueCapacity = 1024;
 constexpr size_t kMaxBatchCopies = 4096;
 
-bool env_is_zero(const char* name) {
+// KIWI chunks are at most 1 MiB, so copy thresholds up to that still route
+// full chunks to SDMA; smaller copies (including PyTorch's small device-to-host
+// reads) go to blit kernels.
+constexpr long kMaxCopyThresholdKb = 1024;
+
+bool env_threshold_ok(const char* name) {
     const char* value = std::getenv(name);
-    return value != nullptr && std::string(value) == "0";
+    if (value == nullptr || *value == '\0') return false;
+    char* end = nullptr;
+    const long kb = std::strtol(value, &end, 10);
+    return *end == '\0' && kb >= 0 && kb <= kMaxCopyThresholdKb;
 }
 
 double now_ms() {
@@ -38,11 +46,11 @@ double now_ms() {
 } // namespace
 
 KiwiSdmaState::KiwiSdmaState(int device_id) : device_id_(device_id) {
-    if (!env_is_zero("ROC_P2P_SDMA_SIZE") ||
-        !env_is_zero("GPU_FORCE_BLIT_COPY_SIZE")) {
+    if (!env_threshold_ok("ROC_P2P_SDMA_SIZE") ||
+        !env_threshold_ok("GPU_FORCE_BLIT_COPY_SIZE")) {
         throw std::runtime_error(
-            "KIWI_SDMA requires ROC_P2P_SDMA_SIZE=0 and "
-            "GPU_FORCE_BLIT_COPY_SIZE=0 before process launch");
+            "KIWI_SDMA requires ROC_P2P_SDMA_SIZE and GPU_FORCE_BLIT_COPY_SIZE to be set "
+            "to at most 1024 (KB) before process launch");
     }
 }
 

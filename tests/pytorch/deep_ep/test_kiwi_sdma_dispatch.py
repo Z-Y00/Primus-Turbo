@@ -50,8 +50,8 @@ class KiwiSdmaDispatchTest(MultiProcessTestCase):
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     @parametrize("hidden", [2048, 7168])
     def test_dispatch_cached_and_cu_combine(self, dtype, hidden):
-        assert os.environ.get("ROC_P2P_SDMA_SIZE") == "0"
-        assert os.environ.get("GPU_FORCE_BLIT_COPY_SIZE") == "0"
+        for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE"):
+            assert os.environ.get(name, "").isdigit() and int(os.environ[name]) <= 1024, name
         tokens = int(os.environ.get("KIWI_SDMA_TEST_TOKENS", "37"))
         experts_per_rank = 2
         num_experts = experts_per_rank * self.world_size

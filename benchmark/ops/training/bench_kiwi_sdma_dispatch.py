@@ -132,7 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=50)
     opts = parser.parse_args()
-    assert os.environ.get("ROC_P2P_SDMA_SIZE") == "0"
-    assert os.environ.get("GPU_FORCE_BLIT_COPY_SIZE") == "0"
+    for name in ("ROC_P2P_SDMA_SIZE", "GPU_FORCE_BLIT_COPY_SIZE"):
+        assert os.environ.get(name, "").isdigit() and int(os.environ[name]) <= 1024, name
     with tempfile.NamedTemporaryFile() as store:
         mp.spawn(_run, args=(opts, store.name), nprocs=opts.num_processes)
