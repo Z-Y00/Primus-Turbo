@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <hip/hip_runtime.h>
@@ -14,9 +15,10 @@ namespace primus_turbo::deep_ep::intranode {
 
 // The receiver reserves one record slot for every row it can receive, in final
 // recv_x order, so a dispatch never reuses receive memory: no ring, ACK, or
-// in-iteration re-arm. Senders pack rows into local staging and copy runs of
-// up to this many bytes per SDMA descriptor.
-constexpr size_t kKiwiSdmaTargetChunkBytes = 1024 * 1024;
+// in-iteration re-arm. Senders pack rows into local staging. By default each
+// destination's rows go out as one SDMA descriptor once every channel has
+// packed its part; a positive chunk size instead copies each channel's rows in
+// runs of at most that many bytes as they are packed.
 // wall_clock64() runs at 100 MHz on CDNA3, unlike the core-clock budget of
 // NUM_TIMEOUT_CYCLES, so this is 30 s of real time.
 constexpr uint64_t kKiwiSdmaTimeoutTicks = 30ull * 100 * 1000 * 1000;
@@ -56,9 +58,10 @@ struct KiwiSdmaLayout {
     size_t hidden_offset;
     size_t scale_offset;
     size_t record_stride;
-    int rows_per_chunk;
+    int rows_per_chunk;     // 0: one copy per destination
     size_t prefix_offset;   // num_ranks x num_channels int32 channel prefixes
     size_t base_offset;     // num_ranks int32: first row of this rank's data in each peer
+    size_t counter_offset;  // num_ranks int32: sender channels done packing, per destination
     size_t rows_offset;     // records, indexed by final recv_x row
     size_t capacity_rows;
     size_t region_bytes;    // prefix + capacity_rows records
@@ -76,10 +79,11 @@ inline size_t kiwi_sdma_record_stride(int hidden_bytes, int scale_bytes, int num
     return kiwi_sdma_align_up(scale_offset + scale_bytes, 16);
 }
 
-// Channel prefixes plus the per-peer row bases, before the records.
+// Channel prefixes, per-peer row bases, and per-destination counters, before
+// the records.
 inline size_t kiwi_sdma_prefix_bytes(int num_channels, int num_ranks) {
     return kiwi_sdma_align_up(
-        static_cast<size_t>(num_ranks) * (num_channels + 1) * sizeof(int32_t), 256);
+        static_cast<size_t>(num_ranks) * (num_channels + 2) * sizeof(int32_t), 256);
 }
 
 // num_nvl_bytes the KIWI backend needs: TURBO's own region plus a receive
@@ -94,19 +98,21 @@ inline size_t kiwi_sdma_nvl_buffer_bytes(size_t turbo_bytes, int num_channels, i
 
 inline KiwiSdmaLayout make_kiwi_sdma_layout(int num_channels, int num_ranks,
                                              int hidden_bytes, int scale_bytes, int num_topk,
-                                             size_t turbo_bytes, size_t num_nvl_bytes) {
+                                             size_t turbo_bytes, size_t num_nvl_bytes,
+                                             size_t chunk_bytes) {
     KiwiSdmaLayout l{};
     l.metadata_bytes = sizeof(int32_t) +
                        static_cast<size_t>(num_topk) * (sizeof(int64_t) + sizeof(float));
     l.hidden_offset = kiwi_sdma_align_up(l.metadata_bytes, 16);
     l.scale_offset = kiwi_sdma_align_up(l.hidden_offset + hidden_bytes, 16);
     l.record_stride = kiwi_sdma_record_stride(hidden_bytes, scale_bytes, num_topk);
-    l.rows_per_chunk =
-        static_cast<int>(kKiwiSdmaTargetChunkBytes / l.record_stride);
-    if (l.rows_per_chunk < 1) l.rows_per_chunk = 1;
+    l.rows_per_chunk = 0;
+    if (chunk_bytes > 0)
+        l.rows_per_chunk = std::max(1, static_cast<int>(chunk_bytes / l.record_stride));
     l.prefix_offset = kiwi_sdma_align_up(turbo_bytes, 256);
     l.base_offset =
         l.prefix_offset + static_cast<size_t>(num_ranks) * num_channels * sizeof(int32_t);
+    l.counter_offset = l.base_offset + static_cast<size_t>(num_ranks) * sizeof(int32_t);
     l.rows_offset = l.prefix_offset + kiwi_sdma_prefix_bytes(num_channels, num_ranks);
     l.capacity_rows =
         num_nvl_bytes > l.rows_offset ? (num_nvl_bytes - l.rows_offset) / l.record_stride : 0;

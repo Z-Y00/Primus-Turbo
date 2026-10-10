@@ -99,6 +99,7 @@ __global__ void prepare_kiwi_sdma(void** buffer_ptrs, const int* rank_prefix_mat
                                               layout.base_offset) +
                        rank;
         __hip_atomic_store(remote, row_base, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        reinterpret_cast<int*>(base + layout.counter_offset)[source] = 0;
     }
 
     auto* prefix = reinterpret_cast<uint32_t*>(base + layout.prefix_offset);
@@ -191,6 +192,30 @@ dispatch_kiwi_sdma(
         // Staging rows for peer p occupy [p * num_tokens, (p + 1) * num_tokens).
         uint8_t* peer_staging =
             staging + static_cast<size_t>(peer) * num_tokens * layout.record_stride;
+        // Copies num_rows staged rows starting at peer row first_row. invoke() is
+        // wave-cooperative, so wave 0 submits and lane 0's clock decides timeouts.
+        auto submit = [&](int first_row, int num_rows) {
+            if (tid >= kWarpSize) return;
+            const uint64_t dst = reinterpret_cast<uint64_t>(
+                peer_base + layout.rows_offset +
+                static_cast<size_t>(peer_row_base + first_row) * layout.record_stride);
+            const uint64_t src = reinterpret_cast<uint64_t>(
+                peer_staging + static_cast<size_t>(first_row) * layout.record_stride);
+            const uint64_t bytes = static_cast<uint64_t>(num_rows) * layout.record_stride;
+            const auto start = wall_clock64();
+            while (!handle.invoke(callback_id, dst, src, bytes)) {
+                const uint64_t elapsed = __shfl(wall_clock64() - start, 0);
+                if (elapsed > kKiwiSdmaTimeoutTicks) {
+                    if (tid == 0) {
+                        report_failure(diag, kKiwiSdmaSenderInvokeTimeout, rank, peer, first_row,
+                                       0, bytes, first_row, num_rows);
+                        aborted = 1;
+                    }
+                    break;
+                }
+            }
+        };
+
         __shared__ int selected_token;
         int cursor = token_begin;
         int chunk_first = row_begin;
@@ -289,37 +314,38 @@ dispatch_kiwi_sdma(
                     local ? topk_weights[token * num_topk + k] : 0.0f;
             }
 
-            const bool flush = row + 1 == row_end || row + 1 - chunk_first == layout.rows_per_chunk;
+            const bool flush =
+                layout.rows_per_chunk > 0 &&
+                (row + 1 == row_end || row + 1 - chunk_first == layout.rows_per_chunk);
             if (flush) {
                 // Every wave's staging writes must be visible to the SDMA engine.
                 __threadfence_system();
                 __syncthreads();
-                if (tid < kWarpSize) {
-                    const uint64_t dst = reinterpret_cast<uint64_t>(
-                        peer_base + layout.rows_offset +
-                        static_cast<size_t>(peer_row_base + chunk_first) * layout.record_stride);
-                    const uint64_t src = reinterpret_cast<uint64_t>(
-                        peer_staging + static_cast<size_t>(chunk_first) * layout.record_stride);
-                    const uint64_t bytes =
-                        static_cast<uint64_t>(row + 1 - chunk_first) * layout.record_stride;
-                    const auto start = wall_clock64();
-                    while (!handle.invoke(callback_id, dst, src, bytes)) {
-                        // invoke() is wave-cooperative: decide on lane 0's clock.
-                        const uint64_t elapsed = __shfl(wall_clock64() - start, 0);
-                        if (elapsed > kKiwiSdmaTimeoutTicks) {
-                            if (tid == 0) {
-                                report_failure(diag, kKiwiSdmaSenderInvokeTimeout, rank, peer,
-                                               chunk_first, 0, bytes, row, row_end);
-                                aborted = 1;
-                            }
-                            break;
-                        }
-                    }
-                }
+                submit(chunk_first, row + 1 - chunk_first);
                 chunk_first = row + 1;
             }
             __syncthreads();
             if (aborted) break;
+        }
+
+        if (layout.rows_per_chunk == 0 && !local && !aborted) {
+            // One descriptor per destination: the channel that finishes packing
+            // last copies every channel's rows. Each block's system fence makes
+            // its staging rows visible before it is counted.
+            __threadfence_system();
+            __syncthreads();
+            __shared__ int is_last;
+            if (tid == 0) {
+                auto* counter = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[rank]) +
+                                                       layout.counter_offset) +
+                                peer;
+                is_last = __hip_atomic_fetch_add(counter, 1, __ATOMIC_ACQ_REL,
+                                                 __HIP_MEMORY_SCOPE_AGENT) == num_channels - 1;
+            }
+            __syncthreads();
+            const int total_rows = channel_prefix_matrix[peer * num_channels + num_channels - 1];
+            if (is_last && total_rows > 0) submit(0, total_rows);
+            __syncthreads();
         }
         // Every exit saves the handle: it carries the queue's producer index
         // into the next launch.

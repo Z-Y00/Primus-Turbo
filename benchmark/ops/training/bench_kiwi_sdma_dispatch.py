@@ -97,13 +97,18 @@ def _run(rank: int, args, store_path: str) -> None:
         record_bytes = (
             (metadata_bytes + 15) // 16 * 16 + (hidden_bytes + 15) // 16 * 16 + scale_bytes
         )
-        rows_per_chunk = max(1, (1 << 20) // record_bytes)
+        chunk_bytes = int(os.environ.get("PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES", "0"))
         num_channels = args.num_sms // 2
-        copies_per_rank = (
-            args.num_processes
-            * num_channels
-            * math.ceil(math.ceil(args.num_tokens / num_channels) / rows_per_chunk)
-        )
+        if chunk_bytes > 0:
+            rows_per_chunk = max(1, chunk_bytes // record_bytes)
+            copies_per_rank = (
+                (args.num_processes - 1)
+                * num_channels
+                * math.ceil(math.ceil(args.num_tokens / num_channels) / rows_per_chunk)
+            )
+        else:
+            rows_per_chunk = args.num_tokens
+            copies_per_rank = args.num_processes - 1
         payload = (
             args.num_tokens
             * args.hidden
@@ -114,7 +119,7 @@ def _run(rank: int, args, store_path: str) -> None:
             f"KIWI SDMA {args.dtype.upper()} EP={args.num_processes} "
             f"M={args.num_tokens} H={args.hidden}: {latency.item():.2f} us, "
             f"{payload / (latency.item() * 1e3):.2f} GB/s cross-rank payload, "
-            f"target_chunk={1 << 20} B rows_per_chunk={rows_per_chunk} "
+            f"chunk_bytes={chunk_bytes or 'per-destination'} rows_per_copy={rows_per_chunk} "
             f"copies_per_rank={copies_per_rank} proxy_cpu="
             f"{os.environ.get('KIWI_SDMA_PROXY_CPU', 'unbound')}"
         )

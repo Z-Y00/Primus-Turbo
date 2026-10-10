@@ -44,10 +44,14 @@ records are armed with sentinels once per dispatch, before the barrier, and
 each receiver tells every source where its rows start.
 
 One sender workgroup per (destination, channel) packs that channel's rows into
-local staging and copies runs of up to 1 MiB with a single descriptor through a
-vendored KIWI device-to-host queue. A CPU proxy combines the mixed-destination
-descriptors observed in one progress pass into `hipMemcpyBatchAsync`, so one
-call spreads copies across all XGMI links. Rows that stay on the local GPU are
+local staging. By default the channel that finishes last issues one SDMA
+descriptor for the destination's whole contiguous block (7 copies per rank per
+dispatch at EP8). With `PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES=<bytes>` each channel
+instead copies runs of at most that many bytes as soon as they are packed,
+overlapping packing with the transfer. Descriptors go through a vendored KIWI
+device-to-host queue; a CPU proxy combines the mixed-destination descriptors
+observed in one progress pass into `hipMemcpyBatchAsync`, so one call spreads
+copies across all XGMI links. Rows that stay on the local GPU are
 written directly by the CU. One receiver workgroup per (source, channel) polls
 an exact signaling-NaN pattern over each row's metadata, hidden, and scale
 words, loads the ready row into LDS, and writes the normal DeepEP receive
@@ -97,12 +101,19 @@ Status on MI300X (`rocm/primus:v26.7`, ROCm 7.15):
 
 - the 2-rank suite passes (BF16, FP16, FP8 with scales, cached replay, zero
   peers, duplicate experts, `-1` routes, CU combine);
-- 8-rank dispatch alone, 4096 tokens sent to every rank at hidden 7168, runs
-  repeatedly warm at about 4.2 ms per dispatch (about 98 GB/s cross-rank
-  payload per rank);
-- the full MoE layer at EP4 (hidden 7168, intermediate 2048, 256 experts,
-  top-8, 4096 tokens per rank) runs warm with the output checksum matching
-  `TURBO`: 16.0 ms per forward iteration versus 11.9 ms for `TURBO`;
+- the full MoE layer (hidden 7168, intermediate 2048, 256 experts, top-8,
+  4096 tokens per rank) runs warm with the output checksum matching `TURBO`.
+  At EP8, with 64 KB thresholds:
+
+  | Dispatch | Copies per rank per dispatch | Dispatch alone (all 4096 tokens to every rank) | MoE forward |
+  |---|---|---|---|
+  | `KIWI_SDMA`, one copy per destination (default) | 7 | 6.84 ms | 16.39 ms |
+  | `KIWI_SDMA`, `PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES=1048576` | 420 | 5.64 ms | 14.11 ms |
+  | `TURBO` | | | 11.56 ms |
+
+  One copy per destination needs about 3 `hipMemcpyBatchAsync` calls per
+  dispatch instead of about 52, but packing no longer overlaps the transfer.
+  At EP4, the default mode takes 16.0 ms against 11.9 ms for `TURBO`;
 - **do not set both variables to 0.** That routes every copy, including the
   small device-to-host reads PyTorch makes while the dispatch kernel is still
   running, to SDMA. Inside the full MoE layer every dispatch after the first
@@ -112,8 +123,7 @@ Status on MI300X (`rocm/primus:v26.7`, ROCm 7.15):
   trigger this outside PyTorch;
 - a dispatch measured alone (with device synchronization before and after)
   takes far longer than its share of a warm iteration (about 143 ms at EP4);
-  this is not yet understood;
-- EP8 inside the full MoE layer has not been rerun with the 64 KB settings.
+  this is not yet understood.
 
 Current limitations:
 

@@ -10,6 +10,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <chrono>
+#include <cstdlib>
 #include <torch/python.h>
 
 #include "primus_turbo/deep_ep/api.h"
@@ -178,9 +179,14 @@ Buffer::intranode_dispatch_sdma(
     }
 
     PRIMUS_TURBO_CHECK(turbo_nvl_bytes >= 0 && turbo_nvl_bytes <= num_nvl_bytes);
+    // 0 (default): one SDMA descriptor per destination. Positive: each channel
+    // copies runs of at most this many bytes. Must match on every rank.
+    size_t chunk_bytes = 0;
+    if (const char* value = std::getenv("PRIMUS_TURBO_KIWI_SDMA_CHUNK_BYTES"))
+        chunk_bytes = static_cast<size_t>(std::strtoull(value, nullptr, 10));
     const auto layout = primus_turbo::deep_ep::intranode::make_kiwi_sdma_layout(
         num_channels, num_ranks, hidden_bytes, scale_bytes, num_topk,
-        static_cast<size_t>(turbo_nvl_bytes), static_cast<size_t>(num_nvl_bytes));
+        static_cast<size_t>(turbo_nvl_bytes), static_cast<size_t>(num_nvl_bytes), chunk_bytes);
     if (static_cast<size_t>(num_recv_tokens) > layout.capacity_rows) {
         throw std::runtime_error(
             "KIWI_SDMA receive region holds " + std::to_string(layout.capacity_rows) +
