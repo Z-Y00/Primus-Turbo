@@ -129,3 +129,9 @@
 - Context: persistent loop that prefetches the next item's operands into registers.
 - Takeaway: to cancel a speculative buffer_load on the last iteration without an `scf.if`, build its descriptor with `num_records = live ? size : 0`; OOB-checked loads return zeros with no memory traffic. Before blaming "loop overhead", diff the ISA of the loop at NPROG=T against the persistent build — identical code means the gap is wasted speculative work.
 - Applicability: any FlyDSL persistent kernel with cross-iteration register prefetch.
+
+### 2026-10-11 19:56 round-25 — REJECTED (persistent backward + L2 prefetch)
+- Context: sparse-MLA backward, 1 WG/CU, LDS and VGPRs full, short top-k (4-6 tiles).
+- Signal: linear fit over top-k lengths implied a large per-token fixed cost.
+- Takeaway: don't infer fixed cost from a linear fit across compression ratios — per-tile cost changes with the kv pool's cache locality. Count bytes first: the kernel was at ~70% of copy bandwidth, so persistence was flat and `global_prefetch` of the next token (~400 KB/CU) made it 5-13% slower (extra traffic / L2 thrash).
+- Applicability: any "hide the prologue" idea on a kernel that streams per-item inputs once.
