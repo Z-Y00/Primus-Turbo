@@ -1432,7 +1432,8 @@ def sparse_mla_bwd_gfx1250(
     dsink = None
     # Closed-form bands (same tests as the forward): cr0 = SWA window only; cr128 = window + causal
     # pool of P = num_kv - T rows (kv row T + p visible iff t >= cr * (p + 1) - 1, cr = T / P).
-    # No intermediate / inverse.
+    # No intermediate / inverse. Shapes only, the indices are not read: other indices with these
+    # shapes (e.g. packed sequences) get wrong results; see ``sparse_mla_func``.
     pool_p = num_kv - T_
     if pool_p > 0 and not (T_ % pool_p == 0 and T_ // pool_p >= 64 and topk >= _SWA_W + pool_p):
         pool_p = -1
