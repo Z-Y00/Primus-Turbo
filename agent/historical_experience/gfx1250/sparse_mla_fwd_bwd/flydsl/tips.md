@@ -112,3 +112,9 @@
 - Signal: `ds_load_tr16` count rose 66 -> 98 after adding pins; unpinned builds had the same source but 66.
 - Takeaway: the backend CSEs repeated LDS loads only within a scheduling region; `sched_barrier` splits regions, so reuse across pins must be written in the source (load once, keep in a Python variable). Count `ds_load_*` in the ISA before/after adding pins. Making reuse explicit where the compiler already merged it only adds live ranges (H128: +5%).
 - Applicability: any pinned / hand-pipelined FlyDSL kernel.
+
+### 2026-10-11 18:36 round-22 — ACCEPTED (backward on the single-wave, 32-heads-per-wave layout)
+- Context: fused per-token sparse attention backward (S, dP, dS, dQ^T, per-slot dKV C^T), LDS ~317 KB on H128.
+- Signal: 8 waves (2/SIMD) capped VGPRs at 512 with a 256-VGPR dQ^T accumulator — no room for LDS prefetch; ~1 LDS fragment per WMMA.
+- Takeaway: the forward's recipe transfers: 4 waves x 32 heads (`waves_per_eu=1`, 914 VGPRs) so K (S/dP) and K^T (dQ^T) fragments feed two head groups, TDM gather for kv tiles (a register loader would need 64-128 staging VGPRs at 4 waves), prefetch 8 with pins. With a single kv buffer, issue the next gather after the last phase that reads K (barrier) and hide it under a phase that does not (C^T). -10..-15% kernel time on every shape, +9.3% step.
+- Applicability: any per-row/per-token fused attention backward on gfx1250 whose accumulator footprint blocks prefetch at 2 waves/SIMD.
