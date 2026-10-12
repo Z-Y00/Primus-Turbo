@@ -118,3 +118,9 @@
 - Signal: 8 waves (2/SIMD) capped VGPRs at 512 with a 256-VGPR dQ^T accumulator — no room for LDS prefetch; ~1 LDS fragment per WMMA.
 - Takeaway: the forward's recipe transfers: 4 waves x 32 heads (`waves_per_eu=1`, 914 VGPRs) so K (S/dP) and K^T (dQ^T) fragments feed two head groups, TDM gather for kv tiles (a register loader would need 64-128 staging VGPRs at 4 waves), prefetch 8 with pins. With a single kv buffer, issue the next gather after the last phase that reads K (barrier) and hide it under a phase that does not (C^T). -10..-15% kernel time on every shape, +9.3% step.
 - Applicability: any per-row/per-token fused attention backward on gfx1250 whose accumulator footprint blocks prefetch at 2 waves/SIMD.
+
+### 2026-10-11 19:27 round-23 — ACCEPTED (persistent forward)
+- Context: per-token sparse attention forward, 1 wave/SIMD; pro 1 WG/CU, flash 2 WGs/CU.
+- Signal: dropping the q load sped cr0/cr128 by 15-23%, i.e. the per-token prologue was exposed.
+- Takeaway: persistent WGs (grid = CUs x WGs/CU) carrying the next token's q fragments and next index octets through an outer `range(..., init=...)`, with tile slots/gathers on a global tile index, hide the prologue at unchanged occupancy. Pays only where nothing else shares the CU (1 WG/CU: -8..-10%); with 2 WGs/CU the sibling already hid it. The outer loop costs ~9% at one token per WG, so always A/B against the non-loop kernel, not the loop at NPROG=T.
+- Applicability: short-top-k / short-sequence attention kernels at 1 WG per CU.

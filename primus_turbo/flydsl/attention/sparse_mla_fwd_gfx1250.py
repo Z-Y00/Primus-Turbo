@@ -127,6 +127,11 @@ def _sbuf_load_v8i32(rsrc, byte_off):
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _num_cus(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _default_config(num_heads, topk):
     hpw = 32 if num_heads % 32 == 0 else 16
     waves = min(num_heads // hpw, 4)
@@ -136,7 +141,7 @@ def _default_config(num_heads, topk):
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250(
-    num_heads, topk, scale, has_sink, idx16=False, hpw=None, waves=None, block_k=None
+    num_heads, topk, scale, has_sink, idx16=False, hpw=None, waves=None, block_k=None, persist=True
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
@@ -177,6 +182,8 @@ def build_sparse_mla_fwd_gfx1250(
         O: fx.Tensor,  # noqa: E741
         LSE: fx.Tensor,
         NKV: fx.Int32,
+        N_TOK: fx.Int32,
+        NPROG: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
         wave = uniform(tid // WAVE)
@@ -184,22 +191,27 @@ def build_sparse_mla_fwd_gfx1250(
         l16 = lane % 16
         hi = lane // 16
         l8 = lane % 8
-        tok = fx.Int32(fx.block_idx.x)
+        bid = fx.Int32(fx.block_idx.x)
         h_lane = [fx.Int32(fx.block_idx.y) * HB + wave * hpw + g * 16 + l16 for g in range_constexpr(G)]
+        # Persistent: this workgroup owns tokens bid, bid + NPROG, ... (NPROG <= N_TOK).
+        n_loc = (N_TOK - bid + NPROG - fx.Int32(1)) // NPROG
+
+        def tok_of(j):
+            # Past the last token, keep re-fetching it into buffers that are never read.
+            return bid + fx.Int32((j < n_loc).select(j, n_loc - fx.Int32(1))) * NPROG
 
         arena = fx.SharedAllocator(static=False)
         arena.allocate(LDS_B)
         lds0 = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
 
-        rsrc_idx = make_rsrc(tensor_addr(TOPK) + fx.Int64(tok) * (topk * 4), topk * 4)
+        rsrc_idx = make_rsrc(tensor_addr(TOPK), N_TOK * (topk * 4))
         kv_addr = tensor_addr(KV)
         v4i = vec_type(4, fx.Int32)
 
-        def load_rows(t):
-            # Tiles past the end re-fetch the last one: every wave keeps issuing (no branch, and
-            # the tensorcnt bookkeeping stays uniform) into a buffer that is never read again.
-            ct = fx.Int32((t < NT).select(t, fx.Int32(NT - 1)))
-            base = ct * BN + wave * (OPW * RPO)
+        # The TDM tile stream runs across tokens: tile g is tile g % NT of local token g // NT,
+        # so the next token's first tiles land while the current one finishes.
+        def load_rows(g):
+            base = tok_of(g // NT) * topk + (g % NT) * BN + wave * (OPW * RPO)
             return [_sbuf_load_v8i32(rsrc_idx, (base + j * 8) * 4) for j in range_constexpr(IW)]
 
         def issue(t, octs):
@@ -224,32 +236,37 @@ def build_sparse_mla_fwd_gfx1250(
             issue(fx.Int32(s), pro[s])
 
         # ---- Q fragments (B operand of S^T = K Q^T): lane holds head h_lane[g].
-        rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok) * (H * DQK * 2), H * DQK * 2)
-        q_frag = []
-        for g in range_constexpr(G):
-            q_off = h_lane[g] * (DQK * 2) + hi * 16
-            q_frag.append(
-                [
-                    cat(buf_load_b128(rsrc_q, q_off + ks * 64), buf_load_b128(rsrc_q, q_off + ks * 64 + 32))
-                    for ks in range_constexpr(KS)
-                ]
-            )
+        def load_q(tok):
+            rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok) * (H * DQK * 2), H * DQK * 2)
+            out = []
+            for g in range_constexpr(G):
+                q_off = h_lane[g] * (DQK * 2) + hi * 16
+                for ks in range_constexpr(KS):
+                    out.append(
+                        cat(
+                            buf_load_b128(rsrc_q, q_off + ks * 64),
+                            buf_load_b128(rsrc_q, q_off + ks * 64 + 32),
+                        )
+                    )
+            return out
+
+        q_first = load_q(tok_of(fx.Int32(0)))
 
         k_lane = l16 * ROW + hi * 16
         v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
         v8e = vec_type(8, fx.BFloat16)
 
-        def valid_of(t):
+        def valid_of(tok, t):
             # Validity of the kv rows this lane's score elements cover: kt*16 + hi*8 + i.
             out = []
             for kt in range_constexpr(KT):
-                o = (t * BN + kt * 16 + hi * 8) * 4
+                o = (tok * topk + t * BN + kt * 16 + hi * 8) * 4
                 iv = cat(Vec(buf_load(rsrc_idx, o, v4i)), Vec(buf_load(rsrc_idx, o + 16, v4i)))
                 out.append([iv[i] >= fx.Int32(0) for i in range_constexpr(8)])
             return out
 
         # A step is (load: () -> fragment, mma: fragment -> None).
-        def qk_steps(kbase):
+        def qk_steps(kbase, q_frag):
             s = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KT)] for _ in range_constexpr(G)]
             steps = []
             for kt in range_constexpr(KT):
@@ -333,78 +350,95 @@ def build_sparse_mla_fwd_gfx1250(
             p = [[st[2 * G + G * DT + g * PC + pc] for pc in range_constexpr(PC)] for g in range_constexpr(G)]
             return m, l, o, p
 
-        # ---- prologue: scores and P of tile 0.
-        _rocdl.s_wait_tensorcnt((NBUF - 2) * OPW)
-        gpu.barrier()
-        s0, steps0 = qk_steps(lds0)
-        run_steps(steps0)
-        v0 = valid_of(fx.Int32(0))
-        m, l, p = [], [], []  # noqa: E741
-        for g in range_constexpr(G):
-            mg, lg, _, pg = softmax(s0[g], v0, fx.Float32(_NEG_INF), fx.Float32(0.0))
-            m.append(mg)
-            l.append(lg)
-            p.append(pg)
-        o = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DT)] for _ in range_constexpr(G)]
-        st = pack_state(m, l, o, p)
+        NQ = G * KS  # q fragments carried across tokens
+        for j, tsm in range(fx.Index(0), fx.Index(n_loc), fx.Index(1), init=q_first + pro[NBUF - 1]):
+            ji = fx.Int32(j)
+            tok = tok_of(ji)
+            g0 = ji * NT  # stream index of this token's tile 0
+            qf = [tsm[i] for i in range_constexpr(NQ)]
+            q_frag = [qf[g * KS : (g + 1) * KS] for g in range_constexpr(G)]
+            octs_in = [tsm[NQ + i] for i in range_constexpr(IW)]
 
-        if const_expr(NT > 1):
-            for t, sm in range(fx.Index(0), fx.Index(NT - 1), fx.Index(1), init=st + pro[NBUF - 1]):
-                ti = fx.Int32(t)
-                m, l, o, p = unpack_state(sm)  # noqa: E741
-                # Tile t+1 landed (tiles complete in issue order), and every wave is done with
-                # tile t-1's buffer, which the gather below overwrites.
-                _rocdl.s_wait_tensorcnt((NBUF - 3) * OPW)
-                gpu.barrier()
-                issue(ti + NBUF - 1, [sm[NS + j] for j in range_constexpr(IW)])
-                nxt = load_rows(ti + NBUF)
-                valid = valid_of(ti + 1)
-                s_n, qk = qk_steps(lds0 + ((ti + 1) % NBUF) * TILE_B)
-                pv = pv_steps(lds0 + (ti % NBUF) * TILE_B, p, o)
-                seq = []
-                for i in range_constexpr(max(len(qk), len(pv))):
-                    if const_expr(i < len(qk)):
-                        seq.append(qk[i])
-                    if const_expr(i < len(pv)):
-                        seq.append(pv[i])
-                run_steps(seq)
-                m2, l2, p2 = [], [], []
-                for g in range_constexpr(G):
-                    mg, lg, ag, pg = softmax(s_n[g], valid, m[g], l[g])
-                    m2.append(mg)
-                    l2.append(lg)
-                    p2.append(pg)
-                    o[g] = [vmul_scalar(o[g][dt], ag) for dt in range_constexpr(DT)]
-                res = yield pack_state(m2, l2, o, p2) + nxt
-            st = [res[i] for i in range_constexpr(NS)]
+            # ---- prologue: scores and P of tile 0.
+            _rocdl.s_wait_tensorcnt((NBUF - 2) * OPW)
+            gpu.barrier()
+            s0, steps0 = qk_steps(lds0 + (g0 % NBUF) * TILE_B, q_frag)
+            run_steps(steps0)
+            v0 = valid_of(tok, fx.Int32(0))
+            m, l, p = [], [], []  # noqa: E741
+            for g in range_constexpr(G):
+                mg, lg, _, pg = softmax(s0[g], v0, fx.Float32(_NEG_INF), fx.Float32(0.0))
+                m.append(mg)
+                l.append(lg)
+                p.append(pg)
+            o = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DT)] for _ in range_constexpr(G)]
+            st = pack_state(m, l, o, p) + octs_in
 
-        m, l, o, p = unpack_state(st)  # noqa: E741
-        run_steps(pv_steps(lds0 + ((NT - 1) % NBUF) * TILE_B, p, o))
+            if const_expr(NT > 1):
+                for t, sm in range(fx.Index(0), fx.Index(NT - 1), fx.Index(1), init=st):
+                    ti = fx.Int32(t)
+                    gt = g0 + ti
+                    m, l, o, p = unpack_state(sm)  # noqa: E741
+                    # Tile t+1 landed (tiles complete in issue order), and every wave is done with
+                    # tile t-1's buffer, which the gather below overwrites.
+                    _rocdl.s_wait_tensorcnt((NBUF - 3) * OPW)
+                    gpu.barrier()
+                    issue(gt + NBUF - 1, [sm[NS + i] for i in range_constexpr(IW)])
+                    nxt = load_rows(gt + NBUF)
+                    valid = valid_of(tok, ti + 1)
+                    s_n, qk = qk_steps(lds0 + ((gt + 1) % NBUF) * TILE_B, q_frag)
+                    pv = pv_steps(lds0 + (gt % NBUF) * TILE_B, p, o)
+                    seq = []
+                    for i in range_constexpr(max(len(qk), len(pv))):
+                        if const_expr(i < len(qk)):
+                            seq.append(qk[i])
+                        if const_expr(i < len(pv)):
+                            seq.append(pv[i])
+                    run_steps(seq)
+                    m2, l2, p2 = [], [], []
+                    for g in range_constexpr(G):
+                        mg, lg, ag, pg = softmax(s_n[g], valid, m[g], l[g])
+                        m2.append(mg)
+                        l2.append(lg)
+                        p2.append(pg)
+                        o[g] = [vmul_scalar(o[g][dt], ag) for dt in range_constexpr(DT)]
+                    res = yield pack_state(m2, l2, o, p2) + nxt
+                st = [res[i] for i in range_constexpr(NS + IW)]
+
+            m, l, o, p = unpack_state(st)  # noqa: E741
+            # Every wave is past tile NT-2, whose buffer takes the next token's tile 1; the next
+            # token's q loads into fresh registers (this token's q is dead) under the last P*V.
+            gpu.barrier()
+            issue(g0 + NT + NBUF - 2, [st[NS + i] for i in range_constexpr(IW)])
+            octs_next = load_rows(g0 + NT + NBUF - 1)
+            q_next = load_q(tok_of(ji + 1))
+            run_steps(pv_steps(lds0 + ((g0 + NT - 1) % NBUF) * TILE_B, p, o))
+
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            for g in range_constexpr(G):
+                l_tot = fadd(l[g], swap_halves(l[g]))
+                if const_expr(has_sink):
+                    rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
+                    sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
+                    mf = fmax(m[g], sink_log2)
+                    af = exp2(fsub(m[g], mf))
+                    l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
+                    o_scale = fmul(af, rcp(l_out))
+                else:
+                    mf = m[g]
+                    l_out = l_tot
+                    o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
+                o_off = h_lane[g] * (DV * 2) + hi * 16
+                for dt in range_constexpr(DT):
+                    o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                    buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
+                lse = fmul(fadd(mf, log2(l_out)), LN2)
+                # Lanes 16..31 hold the same heads; push their store out of range.
+                buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+            _ = yield q_next + octs_next
         # The over-issued gathers must land before the workgroup's LDS is released.
         _rocdl.s_wait_tensorcnt(0)
-
-        rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
-        rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
-        for g in range_constexpr(G):
-            l_tot = fadd(l[g], swap_halves(l[g]))
-            if const_expr(has_sink):
-                rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
-                sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
-                mf = fmax(m[g], sink_log2)
-                af = exp2(fsub(m[g], mf))
-                l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
-                o_scale = fmul(af, rcp(l_out))
-            else:
-                mf = m[g]
-                l_out = l_tot
-                o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
-            o_off = h_lane[g] * (DV * 2) + hi * 16
-            for dt in range_constexpr(DT):
-                o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
-                buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
-            lse = fmul(fadd(mf, log2(l_out)), LN2)
-            # Lanes 16..31 hold the same heads; push their store out of range.
-            buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
 
     @flyc.jit
     def launch_sparse_mla_fwd_gfx1250(
@@ -416,16 +450,20 @@ def build_sparse_mla_fwd_gfx1250(
         LSE: fx.Tensor,
         n_tok: fx.Int32,
         NKV: fx.Int32,
+        n_prog: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         sparse_mla_fwd_gfx1250_kernel(
-            Q, KV, TOPK, SINK, O, LSE, NKV, value_attrs={"rocdl.waves_per_eu": 1}
-        ).launch(grid=(fx.Index(n_tok), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
+            Q, KV, TOPK, SINK, O, LSE, NKV, n_tok, n_prog, value_attrs={"rocdl.waves_per_eu": 1}
+        ).launch(grid=(fx.Index(n_prog), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
 
     compiled = {}
 
     def run(q, kv, topk_indices, sink, o, lse, stream=None):
-        args = (q, kv, topk_indices, o if sink is None else sink, o, lse, int(q.shape[0]), int(kv.shape[0]))
+        n_tok = int(q.shape[0])
+        # One wave per SIMD: 4 // WAVES workgroups per CU, each looping over its tokens.
+        n_prog = min(n_tok, _num_cus(q.device) * (4 // WAVES)) if persist else n_tok
+        args = (q, kv, topk_indices, o if sink is None else sink, o, lse, n_tok, int(kv.shape[0]), n_prog)
         fn = compiled.get("fn")
         if fn is None:
             fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
