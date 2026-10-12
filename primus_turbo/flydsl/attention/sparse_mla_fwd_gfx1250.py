@@ -29,6 +29,10 @@ mode: 8 x i32 or 16 x i16 row indices per op, read with scalar loads); every wav
 share of each tile. The loop is software-pipelined: iteration t computes the scores of tile
 t+1 interleaved with the P*V of tile t, LDS operands are loaded several WMMAs ahead, and
 ``sched_barrier`` pins that order against the machine scheduler.
+
+The cr0 band (every token's top-k is its 128-row sliding window, kv = the T latent rows) has
+its own kernel: a workgroup owns a block of consecutive tokens, gathers their shared window to
+LDS once, and walks the tokens with per-lane row offsets into it and a closed-form band mask.
 """
 
 import functools
@@ -492,7 +496,277 @@ def build_sparse_mla_fwd_gfx1250(
     return run
 
 
-def sparse_mla_fwd_gfx1250(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None, stream=None):
+_SWA_W = 128  # cr0 band: slot s of token t is kv row t - 127 + s (rows < 0 unused)
+
+
+@functools.lru_cache(maxsize=64)
+def build_sparse_mla_fwd_gfx1250_swa(num_heads, scale, has_sink, block_t=16, block_k=None):
+    """Launcher for the cr0 band; see ``sparse_mla_fwd_gfx1250``.
+
+    A workgroup owns ``block_t`` consecutive tokens and loads their shared kv window
+    (``block_t + 127`` rows) to LDS once; token ``t0 + r`` reads its 128 slots at row offset
+    ``r`` (per-lane fragment addresses), and the band mask is closed-form (no top-k reads).
+    """
+    H = num_heads
+    hpw = 32
+    WAVES = min(H // hpw, 4)
+    BN = block_k or (64 if WAVES == 4 else 32)
+    G = hpw // 16
+    HB = WAVES * hpw
+    if H % HB:
+        raise ValueError(f"num_heads {H} must split into {WAVES} waves of {hpw} heads")
+    BT = block_t
+    BLOCK = WAVES * WAVE
+    NT = _SWA_W // BN
+    KT = BN // 16
+    PC = BN // 32
+    KS = DV // 32
+    DT = DV // 16
+    OPS = -(-(BT + _SWA_W - 1) // (8 * WAVES))  # 8-row TDM gathers per wave
+    WR = OPS * 8 * WAVES  # window rows in LDS
+    c_log2 = float(scale) * LOG2E
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def sparse_mla_fwd_gfx1250_swa_kernel(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        SINK: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
+        NKV: fx.Int32,
+        N_TOK: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        wave = uniform(tid // WAVE)
+        lane = tid % WAVE
+        l16 = lane % 16
+        hi = lane // 16
+        l8 = lane % 8
+        t0 = fx.Int32(fx.block_idx.x) * BT
+        h_lane = [fx.Int32(fx.block_idx.y) * HB + wave * hpw + g * 16 + l16 for g in range_constexpr(G)]
+        n_loc = fx.Int32((N_TOK - t0 < fx.Int32(BT)).select(N_TOK - t0, fx.Int32(BT)))
+
+        def tok_of(j):
+            return t0 + fx.Int32((j < n_loc).select(j, n_loc - fx.Int32(1)))
+
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(WR * ROW)
+        lds0 = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
+
+        # Window row i = kv row t0 - 127 + i; rows < 0 (and >= NKV) land as zeros.
+        kv_addr = tensor_addr(KV)
+        row0 = t0 - fx.Int32(_SWA_W - 1)
+        for m in range_constexpr(OPS):
+            r = (wave * OPS + m) * 8
+            _tdm_gather(lds0 + r * ROW, kv_addr, [row0 + r + i for i in range_constexpr(8)], 8, NKV)
+
+        def load_q(j):
+            n_rec = fx.Int32((j < n_loc).select(fx.Int32(H * DQK * 2), fx.Int32(0)))
+            rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok_of(j)) * (H * DQK * 2), n_rec)
+            out = []
+            for g in range_constexpr(G):
+                q_off = h_lane[g] * (DQK * 2) + hi * 16
+                for ks in range_constexpr(KS):
+                    out.append(
+                        cat(
+                            buf_load_b128(rsrc_q, q_off + ks * 64),
+                            buf_load_b128(rsrc_q, q_off + ks * 64 + 32),
+                        )
+                    )
+            return out
+
+        q_first = load_q(fx.Int32(0))
+        _rocdl.s_wait_tensorcnt(0)
+        gpu.barrier()
+
+        k_lane = l16 * ROW + hi * 16
+        v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
+        v8e = vec_type(8, fx.BFloat16)
+
+        def valid_of(lim, t):
+            # Slot t * BN + kt * 16 + hi * 8 + i is a kv row iff it is >= lim = 127 - tok.
+            out = []
+            for kt in range_constexpr(KT):
+                b = hi * 8 + fx.Int32(t * BN + kt * 16) - lim
+                out.append([b >= fx.Int32(-i) for i in range_constexpr(8)])
+            return out
+
+        def qk_steps(kbase, q_frag):
+            s = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KT)] for _ in range_constexpr(G)]
+            steps = []
+            for kt in range_constexpr(KT):
+                for ks in range_constexpr(KS):
+
+                    def ld(kt=kt, ks=ks):
+                        off = kbase + (kt * 16 * ROW + ks * 64)
+                        return cat(lds_load(off, v8e), lds_load(off + 32, v8e))
+
+                    def mma(a, kt=kt, ks=ks):
+                        for g in range_constexpr(G):
+                            s[g][kt] = wmma_bf16(a, q_frag[g][ks], s[g][kt])
+
+                    steps.append((ld, mma))
+            return s, steps
+
+        def pv_steps(vbase, p_frag, o):
+            steps = []
+            for dt in range_constexpr(DT):
+                for pc in range_constexpr(PC):
+
+                    def ld(dt=dt, pc=pc):
+                        base = vbase + (pc * 32 * ROW + dt * 32)
+                        return cat(lds_load_tr16(base), lds_load_tr16(base + 16 * ROW))
+
+                    def mma(a, dt=dt, pc=pc):
+                        for g in range_constexpr(G):
+                            o[g][dt] = wmma_bf16(a, p_frag[g][pc], o[g][dt])
+
+                    steps.append((ld, mma))
+            return steps
+
+        def run_steps(steps):
+            q = [steps[i][0]() for i in range_constexpr(min(PREFETCH, len(steps)))]
+            for i in range_constexpr(len(steps)):
+                a = q.pop(0)
+                if const_expr(i + PREFETCH < len(steps)):
+                    q.append(steps[i + PREFETCH][0]())
+                steps[i][1](a)
+                if const_expr((i + 1) % PIN == 0):
+                    _rocdl.sched_barrier(0)
+
+        def softmax(s, valid, m_run, l_run):
+            vals = []
+            for kt in range_constexpr(KT):
+                sv = vmul_scalar(s[kt], c_log2)
+                for i in range_constexpr(8):
+                    vals.append(fx.Float32(valid[kt][i].select(sv[i], fx.Float32(_NEG_INF))))
+            tmax = vals[0]
+            for v in vals[1:]:
+                tmax = fmax(tmax, v)
+            tmax = fmax(tmax, swap_halves(tmax))
+            m_new = fmax(m_run, tmax)
+            m_use = fx.Float32((m_new == fx.Float32(_NEG_INF)).select(fx.Float32(0.0), m_new))
+            alpha = exp2(fsub(m_run, m_use))
+            ps = [exp2(fsub(v, m_use)) for v in vals]
+            rs = ps[0]
+            for p in ps[1:]:
+                rs = fadd(rs, p)
+            l_new = fadd(fmul(l_run, alpha), rs)
+            packs = [
+                to_bf16(Vec.from_elements(ps[kt * 8 : kt * 8 + 8], fx.Float32)) for kt in range_constexpr(KT)
+            ]
+            return m_new, l_new, alpha, [cat(packs[2 * pc], packs[2 * pc + 1]) for pc in range_constexpr(PC)]
+
+        NQ = G * KS
+
+        def token(ji, qf):
+            tok = tok_of(ji)
+            kb = lds0 + (tok - t0) * ROW + k_lane
+            vb = lds0 + (tok - t0) * ROW + v_lane
+            lim = fx.Int32(_SWA_W - 1) - tok
+            q_frag = [qf[g * KS : (g + 1) * KS] for g in range_constexpr(G)]
+
+            s0, steps0 = qk_steps(kb, q_frag)
+            run_steps(steps0)
+            v0 = valid_of(lim, 0)
+            m, l, p = [], [], []  # noqa: E741
+            for g in range_constexpr(G):
+                mg, lg, _, pg = softmax(s0[g], v0, fx.Float32(_NEG_INF), fx.Float32(0.0))
+                m.append(mg)
+                l.append(lg)
+                p.append(pg)
+            o = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DT)] for _ in range_constexpr(G)]
+            for t in range_constexpr(NT - 1):
+                valid = valid_of(lim, t + 1)
+                s_n, qk = qk_steps(kb + (t + 1) * BN * ROW, q_frag)
+                pv = pv_steps(vb + t * BN * ROW, p, o)
+                seq = []
+                for i in range_constexpr(max(len(qk), len(pv))):
+                    if const_expr(i < len(qk)):
+                        seq.append(qk[i])
+                    if const_expr(i < len(pv)):
+                        seq.append(pv[i])
+                run_steps(seq)
+                p = []
+                for g in range_constexpr(G):
+                    m[g], l[g], ag, pg = softmax(s_n[g], valid, m[g], l[g])
+                    p.append(pg)
+                    o[g] = [vmul_scalar(o[g][dt], ag) for dt in range_constexpr(DT)]
+
+            # This token's q is dead: the next token's loads land under the last P*V.
+            nxt = load_q(ji + 1)
+            run_steps(pv_steps(vb + (NT - 1) * BN * ROW, p, o))
+
+            rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok) * (H * 4), H * 4)
+            for g in range_constexpr(G):
+                l_tot = fadd(l[g], swap_halves(l[g]))
+                if const_expr(has_sink):
+                    rsrc_sink = make_rsrc(tensor_addr(SINK), H * 4)
+                    sink_log2 = fmul(fx.Float32(buf_load(rsrc_sink, h_lane[g] * 4, T.f32)), LOG2E)
+                    mf = fmax(m[g], sink_log2)
+                    af = exp2(fsub(m[g], mf))
+                    l_out = fadd(fmul(l_tot, af), exp2(fsub(sink_log2, mf)))
+                    o_scale = fmul(af, rcp(l_out))
+                else:
+                    mf = m[g]
+                    l_out = l_tot
+                    o_scale = fx.Float32((l_tot > fx.Float32(0.0)).select(rcp(l_tot), fx.Float32(0.0)))
+                o_off = h_lane[g] * (DV * 2) + hi * 16
+                for dt in range_constexpr(DT):
+                    o16 = to_bf16(vmul_scalar(o[g][dt], o_scale))
+                    buf_store(o16.bitcast(fx.Int32), rsrc_o, o_off + dt * 32)
+                lse = fmul(fadd(mf, log2(l_out)), LN2)
+                buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
+            return nxt
+
+        for j, tsm in range(fx.Index(0), fx.Index(n_loc), fx.Index(1), init=q_first):
+            _ = yield token(fx.Int32(j), [tsm[i] for i in range_constexpr(NQ)])
+
+    @flyc.jit
+    def launch_sparse_mla_fwd_gfx1250_swa(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        SINK: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        LSE: fx.Tensor,
+        NKV: fx.Int32,
+        n_tok: fx.Int32,
+        n_blk: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        sparse_mla_fwd_gfx1250_swa_kernel(
+            Q, KV, SINK, O, LSE, NKV, n_tok, value_attrs={"rocdl.waves_per_eu": 1}
+        ).launch(grid=(fx.Index(n_blk), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
+
+    compiled = {}
+
+    def run(q, kv, sink, o, lse, stream=None):
+        n_tok = int(q.shape[0])
+        args = (q, kv, o if sink is None else sink, o, lse, int(kv.shape[0]), n_tok, -(-n_tok // BT))
+        fn = compiled.get("fn")
+        if fn is None:
+            fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250_swa, *args, fx.Stream(stream))
+            compiled["fn"] = fn
+        return fn(*args, stream)
+
+    return run
+
+
+def _swa_block_t(n_tok, num_heads, device):
+    """Largest token block (16 / 8 / 4) that still gives every workgroup slot a block; ``None``
+    when even 4 does not (each workgroup walks its tokens serially, so the GPU would idle)."""
+    waves = min(num_heads // 32, 4)
+    slots = _num_cus(device) * (4 // waves)
+    for bt in (16, 8, 4):
+        if -(-n_tok // bt) * (num_heads // (32 * waves)) >= slots:
+            return bt
+    return None
+
+
+def sparse_mla_fwd_gfx1250(
+    q, kv, topk_indices, attn_sink=None, kv_lora_rank=512, scale=None, stream=None, use_swa=True
+):
     """o ``[T, H, 512]`` (q.dtype) and lse ``[T, H]`` fp32; see the module docstring."""
     assert kv_lora_rank == DV and q.shape[-1] == DQK, "gfx1250 sparse-MLA is the 512 + 64 latent layout"
     assert q.dtype == torch.bfloat16 and q.is_contiguous() and topk_indices.is_contiguous()
@@ -508,6 +782,13 @@ def sparse_mla_fwd_gfx1250(q, kv, topk_indices, attn_sink=None, kv_lora_rank=512
     o = torch.empty(T_, H, DV, dtype=q.dtype, device=q.device)
     lse = torch.empty(T_, H, dtype=torch.float32, device=q.device)
     if T_ == 0:
+        return o, lse
+    # cr0 band (same closed-form test as the backward): every token's top-k is its SWA window.
+    bt = _swa_block_t(T_, H, q.device) if H % 32 == 0 else None
+    if use_swa and kv.shape[0] == T_ and topk == _SWA_W and bt is not None:
+        build_sparse_mla_fwd_gfx1250_swa(H, float(scale), attn_sink is not None, block_t=bt)(
+            q, kv, attn_sink, o, lse, stream=stream
+        )
         return o, lse
     hpw, waves, _ = _default_config(H, topk)
     # 16-bit indices halve the TDM op count; worth it where each wave issues several ops per tile.

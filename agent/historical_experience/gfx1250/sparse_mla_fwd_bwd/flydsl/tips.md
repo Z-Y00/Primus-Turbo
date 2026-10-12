@@ -163,3 +163,9 @@
 - Takeaway: key rows every workgroup shares can feed WMMA fragments straight from global memory (L2-resident; transpose a tiny K^T copy for the transposed operand) when LDS is full; the dead P tile of the window phase holds the pool dS / P. Near the VGPR limit, LICM hoists one VGPR per distinct `lane_off + uniform + const` offset and spills them in the prologue (all scratch stores before the loop): pass the wave-uniform part as the buffer soffset so the constant folds into the instruction offset (78 -> 46 spills), then trade prefetch depth / held fragments for the rest.
 - Gate token-block kernels on workgroup count: each walks its tokens serially, so below ~CUs/2 workgroups the per-token kernel wins.
 - Applicability: kernels with large loop-carried accumulators near the VGPR cap; attention backward with a shared (global) key subset.
+
+### 2026-10-11 21:54 round-31 — ACCEPTED (ablate the forward's memory streams before restructuring)
+- Context: short-top-k (128-192) sparse attention forward, 1 wave/SIMD, q / o streamed once per token.
+- Signal: ablations with zero-size buffer descriptors (instructions still issued, no traffic): o store off -> 2x faster, q load off -> -11..-15%, kv gather off -> -16%. The o write, not the gather, dominates; the window-in-LDS forward (per-lane row offsets, closed-form mask) recovered the gather share (-11..-13%) only.
+- Takeaway: ablate each memory stream with `num_records = 0` before choosing what to restructure. Re-using one output buffer across timing iterations skews store-heavy kernels by 6-10% (time with fresh allocations, as training does). Per-lane-address fragment loads (`ds_load_b128`, `ds_load_tr16`) make a sliding window a free row shift.
+- Applicability: any attention forward with short rows; any store-heavy kernel benchmark.
