@@ -184,27 +184,37 @@ def benchmark_sparse_mla(variants, crs, seqlens, backends, iters, output_csv):
 
     results = pd.DataFrame(rows)
     keys = ["Variant", "CR", "SeqLen"]
+    passes = ("Forward", "Backward", "Step")
+    speedup = {}
     if "TRITON" in backends and "Step Time (ms)" in results.columns:
-        step = pd.to_numeric(results["Step Time (ms)"], errors="coerce")
-        triton = results.assign(_t=step)[results["Backend"] == "TRITON"].set_index(keys)["_t"]
-        base = results[keys].apply(lambda r: triton.get(tuple(r), float("nan")), axis=1)
-        results["Step Speedup vs Triton"] = (base / step).map(lambda x: f"{x:.2f}x" if x == x else "-")
+        for p in passes:
+            t = pd.to_numeric(results[f"{p} Time (ms)"], errors="coerce")
+            triton = results.assign(_t=t)[results["Backend"] == "TRITON"].set_index(keys)["_t"]
+            base = results[keys].apply(lambda r, tr=triton: tr.get(tuple(r), float("nan")), axis=1)
+            speedup[p] = base / t
+            results[f"{p} Speedup vs Triton"] = speedup[p].map(lambda x: f"{x:.2f}x" if x == x else "-")
 
     print("\nFinal Results:")
     print(tabulate(results, headers="keys", tablefmt="grid", showindex=False))
 
-    # One line per (variant, seqlen), compression ratios side by side: no cross-cr averages.
+    # Forward, backward and step separately, one line per (variant, seqlen) with compression
+    # ratios side by side: no averages across passes or compression ratios.
     for backend in backends:
         part = results[results["Backend"] == backend]
         if "Step TFLOPS" not in part.columns or part.empty:
             continue
-        part = part.assign(**{"Step TFLOPS": pd.to_numeric(part["Step TFLOPS"], errors="coerce")})
-        pivot = part.pivot_table(
-            index=["Variant", "SeqLen"], columns="CR", values="Step TFLOPS", aggfunc="first"
-        )
-        pivot.columns = [f"cr={c}" for c in pivot.columns]
-        print(f"\n{backend} step TFLOPS (fwd + bwd, valid slots) by compression ratio:")
-        print(tabulate(pivot.reset_index(), headers="keys", tablefmt="grid", showindex=False, floatfmt=".1f"))
+        for p in passes:
+            tf = pd.to_numeric(part[f"{p} TFLOPS"], errors="coerce")
+            cell = tf.map(lambda x: f"{x:.1f}")
+            if p in speedup and backend != "TRITON":
+                cell = cell + speedup[p][part.index].map(lambda x: f" ({x:.2f}x)" if x == x else "")
+            pivot = part.assign(_c=cell).pivot_table(
+                index=["Variant", "SeqLen"], columns="CR", values="_c", aggfunc="first"
+            )
+            pivot.columns = [f"cr={c}" for c in pivot.columns]
+            vs = " (speedup vs Triton)" if p in speedup and backend != "TRITON" else ""
+            print(f"\n{backend} {p.lower()} TFLOPS{vs}, valid slots, by compression ratio:")
+            print(tabulate(pivot.reset_index(), headers="keys", tablefmt="grid", showindex=False))
 
     filename = output_csv or f"sparse_mla_benchmark_result_{datetime.now():%Y%m%d}_{gpu_name}.csv"
     results.to_csv(filename, index=False)
