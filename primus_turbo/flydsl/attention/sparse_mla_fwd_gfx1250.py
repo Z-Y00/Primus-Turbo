@@ -236,8 +236,10 @@ def build_sparse_mla_fwd_gfx1250(
             issue(fx.Int32(s), pro[s])
 
         # ---- Q fragments (B operand of S^T = K Q^T): lane holds head h_lane[g].
-        def load_q(tok):
-            rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok) * (H * DQK * 2), H * DQK * 2)
+        def load_q(j):
+            # Past the last token the range is empty: the loads return zeros without memory traffic.
+            n_rec = fx.Int32((j < n_loc).select(fx.Int32(H * DQK * 2), fx.Int32(0)))
+            rsrc_q = make_rsrc(tensor_addr(Q) + fx.Int64(tok_of(j)) * (H * DQK * 2), n_rec)
             out = []
             for g in range_constexpr(G):
                 q_off = h_lane[g] * (DQK * 2) + hi * 16
@@ -250,7 +252,7 @@ def build_sparse_mla_fwd_gfx1250(
                     )
             return out
 
-        q_first = load_q(tok_of(fx.Int32(0)))
+        q_first = load_q(fx.Int32(0))
 
         k_lane = l16 * ROW + hi * 16
         v_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
@@ -411,7 +413,7 @@ def build_sparse_mla_fwd_gfx1250(
             gpu.barrier()
             issue(g0 + NT + NBUF - 2, [st[NS + i] for i in range_constexpr(IW)])
             octs_next = load_rows(g0 + NT + NBUF - 1)
-            q_next = load_q(tok_of(ji + 1))
+            q_next = load_q(ji + 1)
             run_steps(pv_steps(lds0 + ((g0 + NT - 1) % NBUF) * TILE_B, p, o))
 
             rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)

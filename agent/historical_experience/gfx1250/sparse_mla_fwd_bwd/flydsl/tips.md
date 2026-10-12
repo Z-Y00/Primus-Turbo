@@ -124,3 +124,8 @@
 - Signal: dropping the q load sped cr0/cr128 by 15-23%, i.e. the per-token prologue was exposed.
 - Takeaway: persistent WGs (grid = CUs x WGs/CU) carrying the next token's q fragments and next index octets through an outer `range(..., init=...)`, with tile slots/gathers on a global tile index, hide the prologue at unchanged occupancy. Pays only where nothing else shares the CU (1 WG/CU: -8..-10%); with 2 WGs/CU the sibling already hid it. The outer loop costs ~9% at one token per WG, so always A/B against the non-loop kernel, not the loop at NPROG=T.
 - Applicability: short-top-k / short-sequence attention kernels at 1 WG per CU.
+
+### 2026-10-11 19:36 round-24 — ACCEPTED (branch-free skip of a speculative prefetch)
+- Context: persistent loop that prefetches the next item's operands into registers.
+- Takeaway: to cancel a speculative buffer_load on the last iteration without an `scf.if`, build its descriptor with `num_records = live ? size : 0`; OOB-checked loads return zeros with no memory traffic. Before blaming "loop overhead", diff the ISA of the loop at NPROG=T against the persistent build — identical code means the gap is wasted speculative work.
+- Applicability: any FlyDSL persistent kernel with cross-iteration register prefetch.
