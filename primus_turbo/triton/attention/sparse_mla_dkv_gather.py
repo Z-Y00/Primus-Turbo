@@ -33,6 +33,19 @@ def _sum_entries(Interm, InvData, s, t, D: tl.constexpr, BLOCK_K: tl.constexpr):
 
 
 @triton.jit
+def _row_of(InvPtr, x, num_kv, LOG_KV: tl.constexpr):
+    # Largest r with inv_ptr[r] <= x, for x < inv_ptr[num_kv]: the non-empty row holding entry x.
+    lo = 0
+    hi = num_kv
+    for _ in tl.static_range(LOG_KV):
+        mid = (lo + hi) // 2
+        go = tl.load(InvPtr + mid) <= x
+        lo = tl.where(go, mid, lo)
+        hi = tl.where(go, hi, mid)
+    return lo
+
+
+@triton.jit
 def _dkv_gather_main(
     Interm,  # [rows, D] bf16
     Keys,  # [E] sorted kv row per entry (-1 = invalid, first)
@@ -47,6 +60,7 @@ def _dkv_gather_main(
     SEG: tl.constexpr,
     ROW_BK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LOG_KV: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_d = tl.arange(0, D)
@@ -63,11 +77,12 @@ def _dkv_gather_main(
         b1 = tl.minimum(b0 + SEG, E)
         lo = tl.maximum(b0, tl.load(InvPtr))
         if lo < b1:
-            r_first = tl.load(Keys + lo).to(tl.int32)
-            r_last = tl.load(Keys + b1 - 1).to(tl.int32)
-            for r in range(r_first, r_last + 1):
-                p0 = tl.load(InvPtr + r)
-                p1 = tl.load(InvPtr + r + 1)
+            r = tl.load(Keys + lo).to(tl.int32)
+            p0 = tl.load(InvPtr + r)
+            p1 = tl.load(InvPtr + r + 1)
+            # Visit only the block's non-empty rows: with chunked tokens the kv rows touched by
+            # a chunk can leave long runs of empty rows (e.g. between the window and the pool).
+            while p0 < b1:
                 if p1 - p0 > SEG:
                     acc = _sum_entries(Interm, InvData, tl.maximum(p0, lo), tl.minimum(p1, b1), D, BLOCK_K)
                     if (p0 >= b0) & (p1 <= b1):
@@ -77,6 +92,17 @@ def _dkv_gather_main(
                         tl.store(Side + (b * 2) * D + offs_d, acc)
                     else:
                         tl.store(Side + (b * 2 + 1) * D + offs_d, acc)
+                if p1 < b1:
+                    # Next non-empty row: r + 1 if it holds entries, else the row holding p1.
+                    p2 = tl.load(InvPtr + r + 2)
+                    if p2 > p1:
+                        r = r + 1
+                    else:
+                        r = _row_of(InvPtr, p1, num_kv, LOG_KV)
+                    p0 = p1
+                    p1 = tl.load(InvPtr + r + 1)
+                else:
+                    p0 = b1
 
 
 @triton.jit
@@ -118,6 +144,7 @@ def dkv_gather_acc(interm, keys, inv_ptr, inv_data, acc, d=512, seg=256, row_bk=
         SEG=seg,
         ROW_BK=row_bk,
         BLOCK_K=block_k,
+        LOG_KV=max(1, num_kv.bit_length()),
         num_warps=num_warps,
     )
     _dkv_gather_fixup[(num_kv,)](acc, side, inv_ptr, acc.stride(0), D=d, SEG=seg, num_warps=4)

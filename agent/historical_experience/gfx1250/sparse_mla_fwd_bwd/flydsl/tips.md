@@ -145,3 +145,9 @@
 - Context: backward dKV needs the inverse of the [T, topk] map (torch stable sort, 78-87 us at T=4096).
 - Takeaway: a per-block counting sort with a [blocks x kv rows] table wins 2x at T=4096 but the table grows as T x num_kv (68 MB at T=16K) and loses there; LDS-atomic placement is deterministic only if a kv row occurs once per top-k row. In FlyDSL, `gpu.barrier()` drains global stores (`s_wait_storecnt 0`) — use `s_wait_dscnt 0` + `s_barrier_signal/wait` when only LDS ordering is needed.
 - Applicability: any FlyDSL loop that interleaves global stores with workgroup barriers; any CSR/inverse-index build.
+
+### 2026-10-11 20:36 round-28 — ACCEPTED (gather skips empty CSR rows)
+- Context: dKV gather over a CSR inverse built per token chunk; heavy rows split into fixed blocks.
+- Signal: stage times summed well below the full backward only when the intermediate was chunked (cr128 at 16K); per-chunk gather time fell chunk by chunk.
+- Takeaway: a per-block loop `for r in range(row(first), row(last) + 1)` is O(row span), not O(entries): chunking leaves long runs of empty rows (between window and pool rows), walked serially. Jump to the next non-empty row (r + 1, else binary search of inv_ptr). Check chunked vs unchunked stage sums when a long-sequence shape regresses.
+- Applicability: any CSR-based gather / segmented reduction over chunked inputs.
