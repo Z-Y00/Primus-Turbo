@@ -73,7 +73,9 @@ _GATHER_SEG = 256  # CSR entries per gather program
 
 
 @functools.lru_cache(maxsize=64)
-def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=None, prefetch=None, pin=None):
+def build_sparse_mla_bwd_gfx1250(
+    num_heads, topk, scale, block_k=32, d_split=None, prefetch=None, pin=None, ct_group=None
+):
     H = num_heads
     if H % 32 or 128 % H:
         raise ValueError(f"gfx1250 sparse-MLA backward needs num_heads in (32, 64, 128), got {H}")
@@ -119,6 +121,10 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
     if pin is None:
         pin = 4 if prefetch else 0
     pin_every = pin if pin > 0 else 1 << 30
+    # Without pinned prefetch the backend already merges the repeated Q^T / dO^T loads.
+    CTG = (KT if prefetch else 1) if ct_group is None else ct_group
+    if KT % CTG:
+        raise ValueError(f"ct_group {CTG} must divide the {KT} slot sub-tiles")
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_kernel(
@@ -316,18 +322,20 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
                         new[j] = wmma_bf16(fr[-1], cur["b"], new[j])
 
                     steps.append((ld, mma))
-            # C^T[d, slot] = Q^T dS + dO^T P over this wave's d tiles.
-            for kt in range_constexpr(KT):
-                for hc in range_constexpr(HC):
+            # C^T[d, slot] = Q^T dS + dO^T P over this wave's d tiles; each Q^T / dO^T fragment
+            # feeds the CTG slot tiles of a group.
+            for kg in range_constexpr(KT // CTG):
+                for kt in range_constexpr(kg * CTG, kg * CTG + CTG):
+                    for hc in range_constexpr(HC):
 
-                    def ld(kt=kt, hc=hc):
-                        o = (kt * 16 + l16) * SP + hc * 64 + hi * 16
-                        return (frag(ds_lds + o), frag(p_lds + o))
+                        def ld(kt=kt, hc=hc):
+                            o = (kt * 16 + l16) * SP + hc * 64 + hi * 16
+                            return (frag(ds_lds + o), frag(p_lds + o))
 
-                    def keep(fr, hc=hc):
-                        cur[("bs", hc)], cur[("bp", hc)] = fr
+                        def keep(fr, kt=kt, hc=hc):
+                            cur[("bs", kt, hc)], cur[("bp", kt, hc)] = fr
 
-                    steps.append((ld, keep))
+                        steps.append((ld, keep))
                 for j in range_constexpr(DTW):
                     dt = wave * DTW + j
                     for hc in range_constexpr(HC):
@@ -336,14 +344,15 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
                             o = tr_lane + hc * 32 * ROW + dt * 32
                             return (frag_tr(q_lds + o, ROW), frag_tr(do_lds + o, ROW))
 
-                        def mma(fr, kt=kt, hc=hc, dt=dt):
-                            c = Vec.filled(8, 0.0, fx.Float32) if hc == 0 else cur["c"]
-                            c = wmma_bf16(fr[0], cur[("bs", hc)], c)
-                            c = wmma_bf16(fr[1], cur[("bp", hc)], c)
-                            cur["c"] = c
-                            if const_expr(hc == HC - 1):
-                                im_off = (t * BN + kt * 16 + l16) * (DV * 2) + dt * 32 + hi * 16
-                                buf_store(to_bf16(c).bitcast(fx.Int32), rsrc_im, im_off)
+                        def mma(fr, kg=kg, hc=hc, dt=dt):
+                            for kt in range_constexpr(kg * CTG, kg * CTG + CTG):
+                                c = Vec.filled(8, 0.0, fx.Float32) if hc == 0 else cur[("c", kt)]
+                                c = wmma_bf16(fr[0], cur[("bs", kt, hc)], c)
+                                c = wmma_bf16(fr[1], cur[("bp", kt, hc)], c)
+                                cur[("c", kt)] = c
+                                if const_expr(hc == HC - 1):
+                                    im_off = (t * BN + kt * 16 + l16) * (DV * 2) + dt * 32 + hi * 16
+                                    buf_store(to_bf16(c).bitcast(fx.Int32), rsrc_im, im_off)
 
                         steps.append((ld, mma))
             run_steps(steps)

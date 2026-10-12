@@ -106,3 +106,9 @@
 - Signal: ISA had ~1 `s_wait_dscnt` per WMMA; source-level prefetch 8 + `sched_barrier(0)` every 4 steps gave -4..-5% bwd kernel time on H64 (363 VGPRs) but spilled on H128 (452 VGPRs -> 512 + 9..41 spills, up to 2.5x slower).
 - Takeaway: the round-17 prefetch recipe needs ~64+ free VGPRs; gate it on the register budget per config. Pins without prefetch only constrain the scheduler (-11%), and prefetch without pins is undone by the backend (no gain) — they only work together. Split a big step list into `(load, mma)` steps where shared operands (A fragment for several B, B for several A) are loaded by the first step of their group and kept in a Python dict.
 - Applicability: any gfx1250 FlyDSL WMMA kernel; check `.vgpr_count`/`.vgpr_spill_count` per config before enabling deep prefetch.
+
+### 2026-10-11 18:22 round-21 — ACCEPTED (operand reuse must be explicit under sched_barrier)
+- Context: FlyDSL WMMA loop where the same LDS fragment is read for several WMMAs (no LDS store in between), compiled with `sched_barrier(0)` pins.
+- Signal: `ds_load_tr16` count rose 66 -> 98 after adding pins; unpinned builds had the same source but 66.
+- Takeaway: the backend CSEs repeated LDS loads only within a scheduling region; `sched_barrier` splits regions, so reuse across pins must be written in the source (load once, keep in a Python variable). Count `ds_load_*` in the ISA before/after adding pins. Making reuse explicit where the compiler already merged it only adds live ranges (H128: +5%).
+- Applicability: any pinned / hand-pipelined FlyDSL kernel.
