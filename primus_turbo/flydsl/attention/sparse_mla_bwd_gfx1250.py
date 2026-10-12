@@ -791,6 +791,7 @@ def build_sparse_mla_bwd_gfx1250_w1(num_heads, topk, scale, block_k=None, prefet
 _SWA_W = 128  # cr0 window: slot s of token t is kv row t - 127 + s
 _SWA_HW = 64  # heads per workgroup of the SWA kernel
 _SWA_BT = 16  # tokens per SWA workgroup
+_SWA_POOL_MAX = 32  # pool slots the SWA kernel's VGPR budget holds (cr128 up to T = 4096)
 
 
 def _swa_rows(block_t):
@@ -799,7 +800,9 @@ def _swa_rows(block_t):
 
 
 @functools.lru_cache(maxsize=64)
-def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, pin=4, c_dt=4):
+def build_sparse_mla_bwd_gfx1250_swa(
+    num_heads, scale, block_t=16, prefetch=None, pin=4, c_dt=4, pool_p=0, pool_cr=0, pool_la=2, bf_hold=None
+):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
     A workgroup owns ``block_t`` consecutive tokens and 64 heads (one wave per SIMD, waves split
@@ -807,7 +810,14 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
     ``i`` reads its 128 rows at offset ``i``. Each token does S / dP, P / dS, dQ written per d tile
     (all 128 slots in one pass), and adds ``C^T = Q^T dS + dO^T P`` into fp32 dKV tiles of the
     whole window held in VGPRs (dS / P rows read shifted by ``i``). The tiles go out once per
-    block as a ``[window, 512]`` fp32 partial, summed per kv row by ``build_swa_dkv_reduce``."""
+    block as a ``[window, 512]`` fp32 partial, summed per kv row by ``build_swa_dkv_reduce``.
+
+    ``pool_p > 0`` adds cr128's causal pool: slots 128 .. 128 + pool_p - 1 are kv rows
+    ``T + p``, visible iff ``t >= pool_cr * (p + 1) - 1``. The pool rows are shared by every token,
+    so their K / K^T fragments come from global memory (``KVT`` is the pool's K^T); pool dS / P
+    take the window P tile's LDS once the window C^T is done, pool C^T accumulates over the block
+    in VGPRs (one ``[NPP, 512]`` partial per workgroup in ``PPART``) and dQ runs over the window
+    and pool slots in one pass."""
     H, HW, W, BT = num_heads, _SWA_HW, _SWA_W, block_t
     if H % HW:
         raise ValueError(f"SWA backward needs num_heads % {HW} == 0, got {H}")
@@ -844,6 +854,19 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
     if DTW % c_dt:
         raise ValueError(f"c_dt {c_dt} must divide {DTW}")
     NACC = NR * DTW
+    POOL = pool_p > 0
+    # The pool accumulators take ~128 VGPRs: shallower prefetch, dS^T fragments reloaded per step.
+    if prefetch is None:
+        prefetch = 2 if POOL else 4
+    if bf_hold is None:
+        bf_hold = not POOL
+    NPP = -(-pool_p // 32) * 32  # pool slots processed (dQ steps of 32)
+    NPT = NPP // 16
+    KTWP = NPT // DS
+    NPC = NPP // 32
+    NPACC = NPT * DTW
+    if 2 * NPP > W:
+        raise ValueError(f"pool of {pool_p} rows does not fit the window P tile")
     c_log2 = float(scale) * LOG2E
     pin_every = pin if pin > 0 else 1 << 30
     # Row tiles whose shifted dS / P rows can fall outside the 128 slots (read as zeros).
@@ -859,6 +882,8 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
         DQ: fx.Tensor,
         DELTA: fx.Tensor,
         PART: fx.Tensor,
+        KVT: fx.Tensor,
+        PPART: fx.Tensor,
         N_TOK: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
@@ -1017,29 +1042,143 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
                 run(steps)
             return new
 
+        if const_expr(POOL):
+            rsrc_kvp = make_rsrc(tensor_addr(KV) + fx.Int64(N_TOK) * (DQK * 2), pool_p * DQK * 2)
+            rsrc_kvt = make_rsrc(tensor_addr(KVT), DV * NPP * 2)
+            kp0 = ds * KTWP
+
+        def gfrag(rsrc, o, soff):
+            # Wave-uniform parts of the offset go to soffset so the constants fold into the
+            # instruction offset instead of one hoisted VGPR per fragment.
+            lo = Vec(buf_load(rsrc, o, v4i, soff=soff)).bitcast(fx.BFloat16)
+            return cat(lo, Vec(buf_load(rsrc, o + 32, v4i, soff=soff)).bitcast(fx.BFloat16))
+
+        def pool_k(kk, ks):
+            # Pool K fragment (lane = pool row (kp0 + kk) * 16 + l16): rows past the pool read zeros.
+            return gfrag(rsrc_kvp, (kk * 16 + l16) * (DQK * 2) + ks * 64 + hi * 16, kp0 * (16 * DQK * 2))
+
+        def pool_kt(j, pc):
+            # Pool K^T fragment (lane = latent column (dt0 + j) * 16 + l16) from the transposed copy.
+            o = (j * 16 + l16) * (NPP * 2) + (pc * 32 + hi * 8) * 2
+            return gfrag(rsrc_kvt, o, dt0 * (16 * NPP * 2))
+
+        def sdp_pool(tok, lse2, dlt):
+            # Pool dS rows 0..NPP and P rows NPP..2*NPP go to the (dead) window P tile.
+            s = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTWP)] for _ in range_constexpr(G)]
+            dp = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTWP)] for _ in range_constexpr(G)]
+            cur = {}
+            steps = []
+            for ks in range_constexpr(KS):
+                for kk in range_constexpr(KTWP):
+
+                    def ld(ks=ks, kk=kk):
+                        bk = pool_k(kk, ks)
+                        if const_expr(kk == 0):
+                            aq = [_frag(q_row[g] + ks * 64) for g in range_constexpr(G)]
+                            ad = [_frag(do_row[g] + ks * 64) for g in range_constexpr(G)]
+                            return (*aq, *ad, bk)
+                        return (bk,)
+
+                    def mma(fr, kk=kk):
+                        if const_expr(kk == 0):
+                            cur["aq"], cur["ad"] = fr[:G], fr[G : 2 * G]
+                        for g in range_constexpr(G):
+                            s[g][kk] = wmma_bf16(cur["aq"][g], fr[-1], s[g][kk])
+                            dp[g][kk] = wmma_bf16(cur["ad"][g], fr[-1], dp[g][kk])
+
+                    steps.append((ld, mma))
+            run(steps)
+            for kk in range_constexpr(KTWP):
+                slot = (kp0 + kk) * 16 + l16
+                lim = fx.Int32(
+                    (slot < fx.Int32(pool_p)).select(slot * pool_cr + (pool_cr - 1), fx.Int32(1 << 30))
+                )
+                ok = tok >= lim
+                for g in range_constexpr(G):
+                    sv = vmul_scalar(s[g][kk], c_log2)
+                    pv, dsv = [], []
+                    for i in range_constexpr(8):
+                        p = fx.Float32(ok.select(exp2(fsub(sv[i], lse2[g][i])), fx.Float32(0.0)))
+                        pv.append(p)
+                        dsv.append(fmul(fmul(p, fsub(dp[g][kk][i], dlt[g][i])), scale))
+                    slot_off = slot * SP + (hp * 32 + g * 16 + hi * 8) * 2
+                    lds_store(to_bf16(Vec.from_elements(dsv, fx.Float32)), p_lds + slot_off)
+                    lds_store(to_bf16(Vec.from_elements(pv, fx.Float32)), p_lds + NPP * SP + slot_off)
+
+        def ct_pool(pacc):
+            # pacc[r * DTW + j] += C^T[d tile wave*DTW + j, pool rows r*16..] (no shift).
+            new = list(pacc)
+            cur = {}
+            for half in range_constexpr(DTW // c_dt):
+                steps = []
+                for j in range_constexpr(c_dt):
+                    dt = wave * DTW + half * c_dt + j
+                    for hc in range_constexpr(HC):
+
+                        def ld(dt=dt, hc=hc):
+                            o = tr_lane + hc * 32 * ROW + dt * 32
+                            return (_frag_tr(q_lds + o, ROW), _frag_tr(do_lds + o, ROW))
+
+                        def keep(fr, j=j, hc=hc):
+                            cur[("a", j, hc)] = fr
+
+                        steps.append((ld, keep))
+                for r in range_constexpr(NPT):
+                    for hc in range_constexpr(HC):
+
+                        def ld(r=r, hc=hc):
+                            o = (r * 16 + l16) * SP + hc * 64 + hi * 16
+                            return (_frag(p_lds + o), _frag(p_lds + NPP * SP + o))
+
+                        def mma(fr, r=r, hc=hc, half=half):
+                            for j in range_constexpr(c_dt):
+                                k = r * DTW + half * c_dt + j
+                                a = cur[("a", j, hc)]
+                                new[k] = wmma_bf16(a[0], fr[0], new[k])
+                                new[k] = wmma_bf16(a[1], fr[1], new[k])
+
+                        steps.append((ld, mma))
+                run(steps)
+            return new
+
         def dq_pass(kbase, tok):
             rsrc_dq = make_rsrc(tensor_addr(DQ) + fx.Int64(tok * H + h0) * (DQK * 2), HW * DQK * 2)
-            bb = ds_lds + tr_ds + hp * 64
-            bf = [
-                [_frag_tr(bb + pc * 32 * SP + g * 32, SP) for g in range_constexpr(G)]
-                for pc in range_constexpr(PC)
-            ]
+            NS = PC + NPC
+
+            def b_frags(pc):
+                # dS^T fragments of slot step pc (window slots, then the pool's).
+                base = ds_lds + tr_ds + hp * 64 + pc * 32 * SP
+                if const_expr(pc >= PC):
+                    base = p_lds + tr_ds + hp * 64 + (pc - PC) * 32 * SP
+                return [_frag_tr(base + g * 32, SP) for g in range_constexpr(G)]
+
+            bf = [b_frags(pc) for pc in range_constexpr(NS)] if bf_hold else None
             dq_off = [(hp * 32 + g * 16 + l16) * (DQK * 2) + hi * 16 for g in range_constexpr(G)]
+            # Pool K^T comes from global memory: its loads run pool_la d tiles ahead.
+            kq = [pool_kt(j, pc) for j in range_constexpr(min(pool_la, DTQ)) for pc in range_constexpr(NPC)]
             cur = {}
             steps = []
             for j in range_constexpr(DTQ):
-                for pc in range_constexpr(PC):
+                for pc in range_constexpr(NS):
 
                     def ld(j=j, pc=pc):
-                        return (_frag_tr(kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32, ROW),)
+                        bq = () if bf_hold else tuple(b_frags(pc))
+                        if const_expr(pc < PC):
+                            return (_frag_tr(kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32, ROW), *bq)
+                        if const_expr(j + pool_la < DTQ):
+                            kq.append(pool_kt(j + pool_la, pc - PC))
+                        return (kq.pop(0), *bq)
 
                     def mma(fr, j=j, pc=pc):
                         for g in range_constexpr(G):
                             c = Vec.filled(8, 0.0, fx.Float32) if pc == 0 else cur[g]
-                            cur[g] = wmma_bf16(fr[0], bf[pc][g], c)
-                            if const_expr(pc == PC - 1):
+                            cur[g] = wmma_bf16(fr[0], bf[pc][g] if bf_hold else fr[1 + g], c)
+                            if const_expr(pc == NS - 1):
                                 buf_store(
-                                    to_bf16(cur[g]).bitcast(fx.Int32), rsrc_dq, dq_off[g] + (dt0 + j) * 32
+                                    to_bf16(cur[g]).bitcast(fx.Int32),
+                                    rsrc_dq,
+                                    dq_off[g] + j * 32,
+                                    soff=dt0 * 32,
                                 )
 
                     steps.append((ld, mma))
@@ -1050,12 +1189,14 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
                 for j in range_constexpr(RZ // DS):
                     buf_store(zero, rsrc_dq, rz_off + j * 16)
 
-        init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(NACC)] + o_first
+        NA = NACC + NPACC
+        init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(NA)] + o_first
         for i, st in range(fx.Index(0), fx.Index(n_i), fx.Index(1), init=init):
             ii = fx.Int32(i)
             tok = t0 + ii
             acc = [st[k] for k in range_constexpr(NACC)]
-            o_regs = [st[NACC + j] for j in range_constexpr(CPP)]
+            pacc = [st[NACC + k] for k in range_constexpr(NPACC)]
+            o_regs = [st[NA + j] for j in range_constexpr(CPP)]
             # Q / dO of this token (and on the first pass the kv window) landed.
             _rocdl.s_wait_tensorcnt(0)
             gpu.barrier()
@@ -1105,14 +1246,28 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
             sdp(kbase, tok, lse2, dlt)
             gpu.barrier()
             acc = ct(acc, ii)
-            # Every wave is done with Q / dO: the next token's land under dQ.
             gpu.barrier()
+            if const_expr(POOL):
+                sdp_pool(tok, lse2, dlt)
+                gpu.barrier()
+                pacc = ct_pool(pacc)
+                gpu.barrier()
+            # Every wave is done with Q / dO: the next token's land under dQ.
             nxt = ii + fx.Int32(1) < n_i
             issue_qdo(tok + fx.Int32(1), nxt)
             o_n = load_o(tok + fx.Int32(1), nxt)
             dq_pass(kbase, tok)
-            res = yield acc + o_n
+            res = yield acc + pacc + o_n
         _rocdl.s_wait_tensorcnt(0)
+
+        if const_expr(POOL):
+            rsrc_pp = make_rsrc(tensor_addr(PPART) + fx.Int64(bid) * (NPP * DV * 4), NPP * DV * 4)
+            for r in range_constexpr(NPT):
+                for j in range_constexpr(DTW):
+                    v = Vec(res[NACC + r * DTW + j])
+                    off = (r * 16 + l16) * (DV * 4) + ((wave * DTW + j) * 16 + hi * 8) * 4
+                    buf_store(v.shuffle(v, [0, 1, 2, 3]), rsrc_pp, off)
+                    buf_store(v.shuffle(v, [4, 5, 6, 7]), rsrc_pp, off + 16)
 
         # ---- this block's fp32 partial: lane holds window row r*16 + l16, d = dt*16 + hi*8 + [0, 8).
         rsrc_pt = make_rsrc(tensor_addr(PART) + fx.Int64(bid) * (WR * DV * 4), WR * DV * 4)
@@ -1133,19 +1288,23 @@ def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, p
         DQ: fx.Tensor,
         DELTA: fx.Tensor,
         PART: fx.Tensor,
+        KVT: fx.Tensor,
+        PPART: fx.Tensor,
         n_tok: fx.Int32,
         n_prog: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         sparse_mla_bwd_gfx1250_swa_kernel(
-            Q, KV, O, DO, LSE, DQ, DELTA, PART, n_tok, value_attrs={"rocdl.waves_per_eu": 1}
+            Q, KV, O, DO, LSE, DQ, DELTA, PART, KVT, PPART, n_tok, value_attrs={"rocdl.waves_per_eu": 1}
         ).launch(grid=(fx.Index(n_prog), 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     compiled = {}
 
-    def run_(q, kv, o, do, lse, dq, delta, part, stream=None):
+    def run_(q, kv, o, do, lse, dq, delta, part, kvt=None, ppart=None, stream=None):
         n_tok = int(q.shape[0])
-        args = (q, kv, o, do, lse, dq, delta, part, n_tok, -(-n_tok // BT) * NHW)
+        kvt = part if kvt is None else kvt
+        ppart = part if ppart is None else ppart
+        args = (q, kv, o, do, lse, dq, delta, part, kvt, ppart, n_tok, -(-n_tok // BT) * NHW)
         fn = compiled.get("fn")
         if fn is None:
             fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_bwd_gfx1250_swa, *args, fx.Stream(stream))
@@ -1271,24 +1430,41 @@ def sparse_mla_bwd_gfx1250(
     dq = torch.empty_like(q)
     delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
     dsink = None
-    # cr0 (pure SWA, same test as the forward's closed-form band): no intermediate / inverse.
+    # Closed-form bands (same tests as the forward): cr0 = SWA window only; cr128 = window + causal
+    # pool of P = num_kv - T rows (kv row T + p visible iff t >= cr * (p + 1) - 1, cr = T / P).
+    # No intermediate / inverse.
+    pool_p = num_kv - T_
+    if pool_p > 0 and not (T_ % pool_p == 0 and T_ // pool_p >= 64 and topk >= _SWA_W + pool_p):
+        pool_p = -1
+    if pool_p == 0 and topk != _SWA_W:
+        pool_p = -1
+    npp = -(-pool_p // 32) * 32 if pool_p >= 0 else -1
     n_part = -(-T_ // _SWA_BT) * (H // _SWA_HW)
-    part_bytes = n_part * _swa_rows(_SWA_BT) * DV * 4
+    part_bytes = n_part * (_swa_rows(_SWA_BT) + npp) * DV * 4
     if (
         use_swa
         and T_ > 0
-        and num_kv == T_
-        and topk == _SWA_W
+        and 0 <= npp <= _SWA_POOL_MAX
         and H % _SWA_HW == 0
         and kv.dtype == torch.bfloat16
         and (interm_bytes is None or part_bytes <= interm_bytes)
+        # Each workgroup walks its 16 tokens serially: with too few of them the GPU idles.
+        and 2 * n_part >= _num_cus(q.device)
     ):
         part = torch.empty(n_part, _swa_rows(_SWA_BT), DV, dtype=torch.float32, device=q.device)
-        build_sparse_mla_bwd_gfx1250_swa(H, float(scale), block_t=_SWA_BT)(
-            q, kv2, o, do, lse, dq, delta, part, stream=stream
-        )
+        kvt = ppart = None
+        if pool_p > 0:
+            kvt = torch.zeros(DV, npp, dtype=kv.dtype, device=q.device)
+            kvt[:, :pool_p] = kv2[T_:, :DV].t()
+            ppart = torch.empty(n_part, npp, DV, dtype=torch.float32, device=q.device)
+        build_sparse_mla_bwd_gfx1250_swa(
+            H, float(scale), block_t=_SWA_BT, pool_p=max(pool_p, 0), pool_cr=T_ // pool_p if pool_p > 0 else 0
+        )(q, kv2, o, do, lse, dq, delta, part, kvt, ppart, stream=stream)
         dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
-        build_swa_dkv_reduce(H, block_t=_SWA_BT)(part, dkv, stream=stream)
+        build_swa_dkv_reduce(H, block_t=_SWA_BT)(part, dkv[:T_], stream=stream)
+        if pool_p > 0:
+            dkv[T_:, :DV] = ppart[:, :pool_p].sum(0)
+            dkv[T_:, DV:] = 0
         if attn_sink is not None:
             dsink = -(torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
         return dq, dkv.view(kv_shape), dsink
