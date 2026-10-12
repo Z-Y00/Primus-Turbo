@@ -90,18 +90,19 @@ def _v_i32(vals):
     return vector.from_elements(T.vec(len(vals), T.i32), [_raw(fx.Int32(v)) for v in vals])
 
 
-def _tdm_gather(lds_addr, kv_addr, words, n_idx, n_rows):
-    """Gather ``n_idx`` latent rows (indices packed in 8 dwords: 8 x i32 or 16 x i16) to LDS."""
+def _tdm_gather(lds_addr, kv_addr, words, n_idx, n_rows, row_len=DQK):
+    """Gather the first 512 columns of ``n_idx`` rows of length ``row_len`` (indices packed in
+    8 dwords: 8 x i32 or 16 x i16) to LDS."""
     hdr = (fx.Int32(-(1 << 30)) if n_idx == 8 else fx.Int32(-(1 << 31))) | fx.Int32(1)
     g0 = _v_i32([hdr, lds_addr, fx.Int32(kv_addr), fx.Int32(kv_addr >> fx.Int64(32)) | fx.Int32(-(1 << 31))])
     g1 = _v_i32(
         [
             _TDM_G1_CFG,
-            DQK << 16,
+            row_len << 16,
             (n_rows & fx.Int32(0xFFFF)) << fx.Int32(16),
             ((n_rows >> fx.Int32(16)) & fx.Int32(0xFFFF)) | fx.Int32(DV << 16),
             n_idx,
-            DQK,
+            row_len,
             0,
             0,
         ]

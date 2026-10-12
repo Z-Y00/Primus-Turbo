@@ -151,3 +151,9 @@
 - Signal: stage times summed well below the full backward only when the intermediate was chunked (cr128 at 16K); per-chunk gather time fell chunk by chunk.
 - Takeaway: a per-block loop `for r in range(row(first), row(last) + 1)` is O(row span), not O(entries): chunking leaves long runs of empty rows (between window and pool rows), walked serially. Jump to the next non-empty row (r + 1, else binary search of inv_ptr). Check chunked vs unchunked stage sums when a long-sequence shape regresses.
 - Applicability: any CSR-based gather / segmented reduction over chunked inputs.
+
+### 2026-10-11 21:05 round-29 — ACCEPTED (banded top-k: accumulate dKV across tokens on chip)
+- Context: sparse-MLA backward where the top-k is a sliding window (cr0); per-token dKV went to a bf16 [T, topk, 512] intermediate reduced by sort + gather.
+- Takeaway: for a banded top-k, give a workgroup a block of consecutive tokens (16) and fewer heads (64) so the window-wide fp32 dKV tiles (9 x 16 rows x 128 d per wave = 576 VGPRs) fit; process all top-k slots in one tile so dQ is written per d tile (no dQ accumulators); gather the block's kv window once (token i reads rows i..i+127) and read dS / P rows shifted by i per lane (out-of-range lanes point at a zero LDS row). Emit one fp32 partial per block; a closed-form per-row reduction replaces the CSR inverse. -40% / -53% backward, and more accurate than the bf16 intermediate.
+- Measurement: SNR vs the old path / Triton fell (51.8 vs 67.7 dB) only because those two share the same bf16 rounding; check a changed reduction order against an fp64 reference before calling it a regression.
+- Applicability: any attention backward whose key set is a band (SWA, local attention) or otherwise shared by neighbouring queries.

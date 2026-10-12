@@ -34,6 +34,11 @@ The default kernel (``build_sparse_mla_bwd_gfx1250_w1``) runs the same steps wit
 SIMD and 32 heads per wave (two 16-head groups), so each K / K^T fragment read from LDS feeds
 two WMMAs; kv tiles arrive by TDM gather and LDS operands are prefetched several WMMA steps
 ahead. The 8-wave kernel above remains for kv tiles that do not divide top-k.
+
+Pure SWA (cr0: top-k is the 128-row window ``[t-127, t]``) skips the intermediate and the
+inverse: ``build_sparse_mla_bwd_gfx1250_swa`` accumulates dKV over 16 consecutive tokens in
+VGPRs and writes one fp32 partial per token block, which ``build_swa_dkv_reduce`` sums per kv
+row into the bf16 dKV.
 """
 
 import functools
@@ -783,6 +788,435 @@ def build_sparse_mla_bwd_gfx1250_w1(num_heads, topk, scale, block_k=None, prefet
     return run_
 
 
+_SWA_W = 128  # cr0 window: slot s of token t is kv row t - 127 + s
+_SWA_HW = 64  # heads per workgroup of the SWA kernel
+_SWA_BT = 16  # tokens per SWA workgroup
+
+
+def _swa_rows(block_t):
+    """Rows of a token block's kv window (``block_t + 127``, whole 16-row tiles)."""
+    return -(-(block_t + _SWA_W - 1) // 16) * 16
+
+
+@functools.lru_cache(maxsize=64)
+def build_sparse_mla_bwd_gfx1250_swa(num_heads, scale, block_t=16, prefetch=4, pin=4, c_dt=4):
+    """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
+
+    A workgroup owns ``block_t`` consecutive tokens and 64 heads (one wave per SIMD, waves split
+    as in the w1 kernel). The block's ``block_t + 127`` kv rows are gathered to LDS once; token
+    ``i`` reads its 128 rows at offset ``i``. Each token does S / dP, P / dS, dQ written per d tile
+    (all 128 slots in one pass), and adds ``C^T = Q^T dS + dO^T P`` into fp32 dKV tiles of the
+    whole window held in VGPRs (dS / P rows read shifted by ``i``). The tiles go out once per
+    block as a ``[window, 512]`` fp32 partial, summed per kv row by ``build_swa_dkv_reduce``."""
+    H, HW, W, BT = num_heads, _SWA_HW, _SWA_W, block_t
+    if H % HW:
+        raise ValueError(f"SWA backward needs num_heads % {HW} == 0, got {H}")
+    NHW = H // HW
+    WAVES = 4
+    BLOCK = WAVES * WAVE
+    HP = HW // 32
+    DS = WAVES // HP
+    G = 2
+    KT = W // 16
+    KTW = KT // DS
+    PC = W // 32
+    KS = DV // 32
+    DT = DV // 16
+    DTQ = DT // DS
+    HC = HW // 32
+    DTW = DT // WAVES
+    RZ = (DQK - DV) * 2 // 32
+    WR = _swa_rows(BT)
+    NR = WR // 16
+    RPO = 8
+    NOP = WR // RPO
+    OPW = -(-NOP // WAVES)
+    QOP = HW // RPO // WAVES
+    SP = HW * 2 + 16
+    QO_B = HW * ROW
+    DS_B = W * SP
+    PPH = BLOCK // HW
+    CPR = DV * 2 // 16
+    CPP = CPR // PPH
+    LDS_B = 2 * QO_B + WR * ROW + 2 * DS_B + PPH * HW * 4 + SP
+    if LDS_B > _LDS_CAP:
+        raise ValueError(f"SWA backward block {BT} does not fit in LDS")
+    if DTW % c_dt:
+        raise ValueError(f"c_dt {c_dt} must divide {DTW}")
+    NACC = NR * DTW
+    c_log2 = float(scale) * LOG2E
+    pin_every = pin if pin > 0 else 1 << 30
+    # Row tiles whose shifted dS / P rows can fall outside the 128 slots (read as zeros).
+    edge = [r * 16 - (BT - 1) < 0 or r * 16 + 15 >= W for r in range(NR)]
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def sparse_mla_bwd_gfx1250_swa_kernel(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        DO: fx.Tensor,
+        LSE: fx.Tensor,
+        DQ: fx.Tensor,
+        DELTA: fx.Tensor,
+        PART: fx.Tensor,
+        N_TOK: fx.Int32,
+    ):
+        tid = fx.Int32(fx.thread_idx.x)
+        wave = uniform(tid // WAVE)
+        hp = wave % HP
+        ds = wave // HP
+        lane = tid % WAVE
+        l16 = lane % 16
+        hi = lane // 16
+        l8 = lane % 8
+        bid = fx.Int32(fx.block_idx.x)
+        t0 = (bid // NHW) * BT
+        h0 = (bid % NHW) * HW
+        n_i = fx.Int32((N_TOK - t0 < fx.Int32(BT)).select(N_TOK - t0, fx.Int32(BT)))
+
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(LDS_B)
+        lds0 = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
+        q_lds = lds0
+        do_lds = q_lds + QO_B
+        kw_lds = do_lds + QO_B
+        ds_lds = kw_lds + WR * ROW
+        p_lds = ds_lds + DS_B
+        dl_lds = p_lds + DS_B
+        zr_lds = dl_lds + PPH * HW * 4
+
+        v4i = vec_type(4, fx.Int32)
+        v4f = vec_type(4, fx.Float32)
+        n_rows = N_TOK * H
+
+        # ---- the block's kv window, once: row r is kv row t0 - 127 + r (out of range -> zeros).
+        kv0 = t0 - (W - 1)
+        for k in range_constexpr(OPW):
+            op = wave + k * WAVES
+            op = fx.Int32((op < NOP).select(op, fx.Int32(NOP - 1)))
+            r0 = kv0 + op * RPO
+            _tdm_gather(kw_lds + op * (RPO * ROW), tensor_addr(KV), [r0 + e for e in range(RPO)], RPO, N_TOK)
+
+        def issue_qdo(tok, ok):
+            # Past the last token every row index is negative: nothing is fetched.
+            base = fx.Int32(ok.select(tok * H + h0, fx.Int32(-(1 << 30))))
+            for k in range_constexpr(QOP):
+                op = wave * QOP + k
+                r0 = base + op * RPO
+                words = [r0 + e for e in range(RPO)]
+                _tdm_gather(q_lds + op * (RPO * ROW), tensor_addr(Q), words, RPO, n_rows)
+                _tdm_gather(do_lds + op * (RPO * ROW), tensor_addr(DO), words, RPO, n_rows, row_len=DV)
+
+        h_d = tid // PPH
+        p_d = tid % PPH
+
+        def load_o(tok, ok):
+            n_rec = fx.Int32(ok.select(fx.Int32(HW * DV * 2), fx.Int32(0)))
+            rsrc = make_rsrc(tensor_addr(O) + fx.Int64(tok * H + h0) * (DV * 2), n_rec)
+            return [buf_load(rsrc, h_d * (DV * 2) + (p_d * CPP + j) * 16, v4i) for j in range_constexpr(CPP)]
+
+        issue_qdo(t0, fx.Int32(0) == fx.Int32(0))
+        o_first = load_o(t0, fx.Int32(0) == fx.Int32(0))
+        lds_store(Vec.filled(4, 0, fx.Int32), zr_lds + (tid % (SP // 16)) * 16)
+
+        a_lane = l16 * ROW + hi * 16
+        tr_lane = (hi * 8 + l8) * ROW + (l16 // 8) * 16
+        tr_ds = (hi * 8 + l8) * SP + (l16 // 8) * 16
+        q_row = [q_lds + (hp * 32 + g * 16) * ROW + a_lane for g in range_constexpr(G)]
+        do_row = [do_lds + (hp * 32 + g * 16) * ROW + a_lane for g in range_constexpr(G)]
+        kt0 = ds * KTW
+        dt0 = ds * DTQ
+
+        def run(steps):
+            _run_steps(steps, prefetch, pin_every)
+
+        def sdp(kbase, tok, lse2, dlt):
+            kb_w = kbase + a_lane + kt0 * 16 * ROW
+            s = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)] for _ in range_constexpr(G)]
+            dp = [[Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)] for _ in range_constexpr(G)]
+            cur = {}
+            steps = []
+            for ks in range_constexpr(KS):
+                for kk in range_constexpr(KTW):
+
+                    def ld(ks=ks, kk=kk):
+                        bk = _frag(kb_w + kk * 16 * ROW + ks * 64)
+                        if const_expr(kk == 0):
+                            aq = [_frag(q_row[g] + ks * 64) for g in range_constexpr(G)]
+                            ad = [_frag(do_row[g] + ks * 64) for g in range_constexpr(G)]
+                            return (*aq, *ad, bk)
+                        return (bk,)
+
+                    def mma(fr, kk=kk):
+                        if const_expr(kk == 0):
+                            cur["aq"], cur["ad"] = fr[:G], fr[G : 2 * G]
+                        for g in range_constexpr(G):
+                            s[g][kk] = wmma_bf16(cur["aq"][g], fr[-1], s[g][kk])
+                            dp[g][kk] = wmma_bf16(cur["ad"][g], fr[-1], dp[g][kk])
+
+                    steps.append((ld, mma))
+            run(steps)
+            # P, dS: lane = slot kt*16 + l16 (kv row tok - 127 + slot), element i = head row.
+            for kk in range_constexpr(KTW):
+                slot = (kt0 + kk) * 16 + l16
+                ok = (tok - (W - 1) + slot) >= fx.Int32(0)
+                for g in range_constexpr(G):
+                    sv = vmul_scalar(s[g][kk], c_log2)
+                    pv, dsv = [], []
+                    for i in range_constexpr(8):
+                        p = fx.Float32(ok.select(exp2(fsub(sv[i], lse2[g][i])), fx.Float32(0.0)))
+                        pv.append(p)
+                        dsv.append(fmul(fmul(p, fsub(dp[g][kk][i], dlt[g][i])), scale))
+                    slot_off = slot * SP + (hp * 32 + g * 16 + hi * 8) * 2
+                    lds_store(to_bf16(Vec.from_elements(dsv, fx.Float32)), ds_lds + slot_off)
+                    lds_store(to_bf16(Vec.from_elements(pv, fx.Float32)), p_lds + slot_off)
+
+        def ct(acc, ii):
+            # acc[r * DTW + j] += C^T[d tile wave*DTW + j, window rows r*16..] for token ii: window
+            # row r*16 + l16 is slot r*16 + l16 - ii.
+            new = list(acc)
+            cur = {}
+            for half in range_constexpr(DTW // c_dt):
+                steps = []
+                for j in range_constexpr(c_dt):
+                    dt = wave * DTW + half * c_dt + j
+                    for hc in range_constexpr(HC):
+
+                        def ld(dt=dt, hc=hc):
+                            o = tr_lane + hc * 32 * ROW + dt * 32
+                            return (_frag_tr(q_lds + o, ROW), _frag_tr(do_lds + o, ROW))
+
+                        def keep(fr, j=j, hc=hc):
+                            cur[("a", j, hc)] = fr
+
+                        steps.append((ld, keep))
+                for r in range_constexpr(NR):
+                    for hc in range_constexpr(HC):
+
+                        def ld(r=r, hc=hc):
+                            slot = fx.Int32(r * 16) + l16 - ii
+                            col = hc * 64 + hi * 16
+                            a_s = ds_lds + slot * SP + col
+                            a_p = p_lds + slot * SP + col
+                            if const_expr(edge[r]):
+                                z = zr_lds + col
+                                bad = fx.Int32((slot < fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)))
+                                bad = bad | fx.Int32((slot >= fx.Int32(W)).select(fx.Int32(1), fx.Int32(0)))
+                                a_s = fx.Int32((bad != fx.Int32(0)).select(z, a_s))
+                                a_p = fx.Int32((bad != fx.Int32(0)).select(z, a_p))
+                            return (_frag(a_s), _frag(a_p))
+
+                        def mma(fr, r=r, hc=hc, half=half):
+                            for j in range_constexpr(c_dt):
+                                k = r * DTW + half * c_dt + j
+                                a = cur[("a", j, hc)]
+                                new[k] = wmma_bf16(a[0], fr[0], new[k])
+                                new[k] = wmma_bf16(a[1], fr[1], new[k])
+
+                        steps.append((ld, mma))
+                run(steps)
+            return new
+
+        def dq_pass(kbase, tok):
+            rsrc_dq = make_rsrc(tensor_addr(DQ) + fx.Int64(tok * H + h0) * (DQK * 2), HW * DQK * 2)
+            bb = ds_lds + tr_ds + hp * 64
+            bf = [
+                [_frag_tr(bb + pc * 32 * SP + g * 32, SP) for g in range_constexpr(G)]
+                for pc in range_constexpr(PC)
+            ]
+            dq_off = [(hp * 32 + g * 16 + l16) * (DQK * 2) + hi * 16 for g in range_constexpr(G)]
+            cur = {}
+            steps = []
+            for j in range_constexpr(DTQ):
+                for pc in range_constexpr(PC):
+
+                    def ld(j=j, pc=pc):
+                        return (_frag_tr(kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32, ROW),)
+
+                    def mma(fr, j=j, pc=pc):
+                        for g in range_constexpr(G):
+                            c = Vec.filled(8, 0.0, fx.Float32) if pc == 0 else cur[g]
+                            cur[g] = wmma_bf16(fr[0], bf[pc][g], c)
+                            if const_expr(pc == PC - 1):
+                                buf_store(
+                                    to_bf16(cur[g]).bitcast(fx.Int32), rsrc_dq, dq_off[g] + (dt0 + j) * 32
+                                )
+
+                    steps.append((ld, mma))
+            run(steps)
+            zero = Vec.filled(4, 0, fx.Int32)
+            for g in range_constexpr(G):
+                rz_off = dq_off[g] - hi * 16 + DV * 2 + hi * (RZ * 16) + ds * (RZ // DS * 16)
+                for j in range_constexpr(RZ // DS):
+                    buf_store(zero, rsrc_dq, rz_off + j * 16)
+
+        init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(NACC)] + o_first
+        for i, st in range(fx.Index(0), fx.Index(n_i), fx.Index(1), init=init):
+            ii = fx.Int32(i)
+            tok = t0 + ii
+            acc = [st[k] for k in range_constexpr(NACC)]
+            o_regs = [st[NACC + j] for j in range_constexpr(CPP)]
+            # Q / dO of this token (and on the first pass the kv window) landed.
+            _rocdl.s_wait_tensorcnt(0)
+            gpu.barrier()
+
+            # ---- delta = rowsum(O * dO): thread (h_d, p_d) sums part p_d of head h_d.
+            a = fx.Float32(0.0)
+            for j in range_constexpr(CPP):
+                ov = Vec(o_regs[j]).bitcast(fx.BFloat16)
+                dv = Vec(lds_load(do_lds + h_d * ROW + (p_d * CPP + j) * 16, v4i)).bitcast(fx.BFloat16)
+                for e in range_constexpr(8):
+                    a = fadd(a, fmul(fx.Float32(ov[e]), fx.Float32(dv[e])))
+            lds_store(a, dl_lds + (p_d * HW + h_d) * 4, align=4)
+            gpu.barrier()
+            delta_h = fx.Float32(lds_load(dl_lds + h_d * 4, T.f32, align=4))
+            for k in range_constexpr(1, PPH):
+                delta_h = fadd(delta_h, fx.Float32(lds_load(dl_lds + (k * HW + h_d) * 4, T.f32, align=4)))
+            rsrc_dl = make_rsrc(tensor_addr(DELTA) + fx.Int64(tok * H + h0) * 4, HW * 4)
+            buf_store(delta_h, rsrc_dl, fx.Int32((p_d == 0).select(h_d * 4, fx.Int32(0x7FFFFFF0))))
+
+            rsrc_lse = make_rsrc(tensor_addr(LSE) + fx.Int64(tok * H + h0) * 4, HW * 4)
+            lse2, dlt = [], []
+            for g in range_constexpr(G):
+                hrow = hp * 32 + g * 16 + hi * 8
+                lsev = cat(
+                    Vec(buf_load(rsrc_lse, hrow * 4, v4f)), Vec(buf_load(rsrc_lse, hrow * 4 + 16, v4f))
+                )
+                dg = [fx.Float32(0.0)] * 8
+                for k in range_constexpr(PPH):
+                    o = dl_lds + (k * HW + hrow) * 4
+                    dlv = cat(lds_load(o, v4f), lds_load(o + 16, v4f))
+                    dg = [fadd(dg[e], fx.Float32(dlv[e])) for e in range_constexpr(8)]
+                dlt.append(dg)
+                lg = []
+                for e in range_constexpr(8):
+                    l_ = fx.Float32(lsev[e])
+                    # No visible key and no sink: lse = -inf, P must be 0.
+                    lg.append(
+                        fx.Float32(
+                            (l_ == fx.Float32(float("-inf"))).select(
+                                fx.Float32(float("inf")), fmul(l_, LOG2E)
+                            )
+                        )
+                    )
+                lse2.append(lg)
+
+            kbase = kw_lds + ii * ROW
+            sdp(kbase, tok, lse2, dlt)
+            gpu.barrier()
+            acc = ct(acc, ii)
+            # Every wave is done with Q / dO: the next token's land under dQ.
+            gpu.barrier()
+            nxt = ii + fx.Int32(1) < n_i
+            issue_qdo(tok + fx.Int32(1), nxt)
+            o_n = load_o(tok + fx.Int32(1), nxt)
+            dq_pass(kbase, tok)
+            res = yield acc + o_n
+        _rocdl.s_wait_tensorcnt(0)
+
+        # ---- this block's fp32 partial: lane holds window row r*16 + l16, d = dt*16 + hi*8 + [0, 8).
+        rsrc_pt = make_rsrc(tensor_addr(PART) + fx.Int64(bid) * (WR * DV * 4), WR * DV * 4)
+        for r in range_constexpr(NR):
+            for j in range_constexpr(DTW):
+                v = Vec(res[r * DTW + j])
+                off = (r * 16 + l16) * (DV * 4) + ((wave * DTW + j) * 16 + hi * 8) * 4
+                buf_store(v.shuffle(v, [0, 1, 2, 3]), rsrc_pt, off)
+                buf_store(v.shuffle(v, [4, 5, 6, 7]), rsrc_pt, off + 16)
+
+    @flyc.jit
+    def launch_sparse_mla_bwd_gfx1250_swa(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        O: fx.Tensor,  # noqa: E741
+        DO: fx.Tensor,
+        LSE: fx.Tensor,
+        DQ: fx.Tensor,
+        DELTA: fx.Tensor,
+        PART: fx.Tensor,
+        n_tok: fx.Int32,
+        n_prog: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        sparse_mla_bwd_gfx1250_swa_kernel(
+            Q, KV, O, DO, LSE, DQ, DELTA, PART, n_tok, value_attrs={"rocdl.waves_per_eu": 1}
+        ).launch(grid=(fx.Index(n_prog), 1, 1), block=(BLOCK, 1, 1), stream=stream)
+
+    compiled = {}
+
+    def run_(q, kv, o, do, lse, dq, delta, part, stream=None):
+        n_tok = int(q.shape[0])
+        args = (q, kv, o, do, lse, dq, delta, part, n_tok, -(-n_tok // BT) * NHW)
+        fn = compiled.get("fn")
+        if fn is None:
+            fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_bwd_gfx1250_swa, *args, fx.Stream(stream))
+            compiled["fn"] = fn
+        return fn(*args, stream)
+
+    return run_
+
+
+@functools.lru_cache(maxsize=16)
+def build_swa_dkv_reduce(num_heads, block_t=16):
+    """bf16 dKV ``[NKV, 576]`` from the SWA kernel's partials: kv row j sums window row
+    ``j + 127 - b * block_t`` of every block b (and head group) whose window holds it; rope
+    columns are zero. One workgroup per kv row, 4 columns per thread."""
+    NHW, W, BT = num_heads // _SWA_HW, _SWA_W, block_t
+    WR = _swa_rows(BT)
+    NBW = (WR - 1) // BT + 1  # blocks whose window can hold a row
+    BLOCK = DV // 4
+    RZ = (DQK - DV) * 2 // 16
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def swa_dkv_reduce_kernel(PART: fx.Tensor, DKV: fx.Tensor, NKV: fx.Int32, NB: fx.Int32):
+        tid = fx.Int32(fx.thread_idx.x)
+        j = fx.Int32(fx.block_idx.x)
+        v4f = vec_type(4, fx.Float32)
+        rsrc_pt = make_rsrc(tensor_addr(PART), NB * (NHW * WR * DV * 4))
+        b_hi = (j + (W - 1)) // BT
+        acc = [fx.Float32(0.0)] * 4
+        for m in range_constexpr(NBW):
+            b = b_hi - m
+            r = j + (W - 1) - b * BT
+            ok = fx.Int32((b >= fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)))
+            ok = ok & fx.Int32((b < NB).select(fx.Int32(1), fx.Int32(0)))
+            ok = ok & fx.Int32((r < fx.Int32(WR)).select(fx.Int32(1), fx.Int32(0)))
+            for hw in range_constexpr(NHW):
+                off = ((b * NHW + hw) * WR + r) * (DV * 4) + tid * 16
+                off = fx.Int32((ok != fx.Int32(0)).select(off, fx.Int32(0x7FFFFFF0)))
+                v = Vec(buf_load(rsrc_pt, off, v4f))
+                acc = [fadd(acc[e], fx.Float32(v[e])) for e in range_constexpr(4)]
+        rsrc_o = make_rsrc(tensor_addr(DKV) + fx.Int64(j) * (DQK * 2), DQK * 2)
+        buf_store(to_bf16(Vec.from_elements(acc, fx.Float32)).bitcast(fx.Int32), rsrc_o, tid * 8)
+        zero = Vec.filled(4, 0, fx.Int32)
+        buf_store(
+            zero, rsrc_o, fx.Int32((tid < fx.Int32(RZ)).select(DV * 2 + tid * 16, fx.Int32(0x7FFFFFF0)))
+        )
+
+    @flyc.jit
+    def launch_swa_dkv_reduce(
+        PART: fx.Tensor,
+        DKV: fx.Tensor,
+        n_kv: fx.Int32,
+        n_b: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        swa_dkv_reduce_kernel(PART, DKV, n_kv, n_b).launch(
+            grid=(fx.Index(n_kv), 1, 1), block=(BLOCK, 1, 1), stream=stream
+        )
+
+    compiled = {}
+
+    def run_(part, dkv, stream=None):
+        args = (part, dkv, int(dkv.shape[0]), int(part.shape[0]) // NHW)
+        fn = compiled.get("fn")
+        if fn is None:
+            fn = flyc.compile[COMPILE_HINTS](launch_swa_dkv_reduce, *args, fx.Stream(stream))
+            compiled["fn"] = fn
+        return fn(*args, stream)
+
+    return run_
+
+
 @functools.lru_cache(maxsize=None)
 def _num_cus(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
@@ -814,6 +1248,7 @@ def sparse_mla_bwd_gfx1250(
     stream=None,
     interm_bytes=_INTERM_BYTES,
     use_w1=True,
+    use_swa=True,
 ):
     """``(dq, dkv, dsink)``; dkv is shaped like ``kv`` and dsink is ``None`` without a sink.
 
@@ -835,6 +1270,28 @@ def sparse_mla_bwd_gfx1250(
     num_kv = kv2.shape[0]
     dq = torch.empty_like(q)
     delta = torch.empty(T_, H, dtype=torch.float32, device=q.device)
+    dsink = None
+    # cr0 (pure SWA, same test as the forward's closed-form band): no intermediate / inverse.
+    n_part = -(-T_ // _SWA_BT) * (H // _SWA_HW)
+    part_bytes = n_part * _swa_rows(_SWA_BT) * DV * 4
+    if (
+        use_swa
+        and T_ > 0
+        and num_kv == T_
+        and topk == _SWA_W
+        and H % _SWA_HW == 0
+        and kv.dtype == torch.bfloat16
+        and (interm_bytes is None or part_bytes <= interm_bytes)
+    ):
+        part = torch.empty(n_part, _swa_rows(_SWA_BT), DV, dtype=torch.float32, device=q.device)
+        build_sparse_mla_bwd_gfx1250_swa(H, float(scale), block_t=_SWA_BT)(
+            q, kv2, o, do, lse, dq, delta, part, stream=stream
+        )
+        dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
+        build_swa_dkv_reduce(H, block_t=_SWA_BT)(part, dkv, stream=stream)
+        if attn_sink is not None:
+            dsink = -(torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
+        return dq, dkv.view(kv_shape), dsink
     # One workgroup per token and per CU: chunks are whole multiples of the CU count.
     cus = _num_cus(q.device)
     units = -(-T_ // cus)
@@ -866,7 +1323,6 @@ def sparse_mla_bwd_gfx1250(
             )
             keys, inv_ptr, inv_data = _inverted_topk(idx, num_kv)
             dkv_gather_acc(im, keys, inv_ptr, inv_data, dkv_acc, d=DV, seg=_GATHER_SEG)
-    dsink = None
     if attn_sink is not None:
         dsink = -(torch.exp(attn_sink.unsqueeze(0) - lse) * delta).sum(0)
     return dq, dkv_acc.to(kv.dtype).view(kv_shape), dsink
