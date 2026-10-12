@@ -100,3 +100,9 @@
 - Signal: OPUS-style thresholded lazy rescale (ballot + wave-uniform `scf.if`, threshold 8 log2) was neutral; never rescaling at all was only 1.3% faster; forcing the branch every tile cost 2%.
 - Takeaway: measure the bound first — once a wave owns more heads, per-tile softmax/rescale work is amortized over more WMMAs and OPUS's softmax tricks shrink to ~1%. FlyDSL recipe for wave-uniform branches with results: `llvm.call_intrinsic(i32, "llvm.amdgcn.ballot.i32", [i1])` then `scf.IfOp(cond, types, has_else=True)` with `scf.YieldOp` in both regions.
 - Applicability: any gfx1250 attention kernel considering lazy rescale.
+
+### 2026-10-11 18:16 round-20 — ACCEPTED (backward LDS prefetch)
+- Context: fused per-token attention backward on gfx1250, 8 waves / WG (2 waves/SIMD, 512-VGPR cap).
+- Signal: ISA had ~1 `s_wait_dscnt` per WMMA; source-level prefetch 8 + `sched_barrier(0)` every 4 steps gave -4..-5% bwd kernel time on H64 (363 VGPRs) but spilled on H128 (452 VGPRs -> 512 + 9..41 spills, up to 2.5x slower).
+- Takeaway: the round-17 prefetch recipe needs ~64+ free VGPRs; gate it on the register budget per config. Pins without prefetch only constrain the scheduler (-11%), and prefetch without pins is undone by the backend (no gain) — they only work together. Split a big step list into `(load, mma)` steps where shared operands (A fragment for several B, B for several A) are loaded by the first step of their group and kept in a Python dict.
+- Applicability: any gfx1250 FlyDSL WMMA kernel; check `.vgpr_count`/`.vgpr_spill_count` per config before enabling deep prefetch.

@@ -36,6 +36,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -72,7 +73,7 @@ _GATHER_SEG = 256  # CSR entries per gather program
 
 
 @functools.lru_cache(maxsize=64)
-def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=None):
+def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=None, prefetch=None, pin=None):
     H = num_heads
     if H % 32 or 128 % H:
         raise ValueError(f"gfx1250 sparse-MLA backward needs num_heads in (32, 64, 128), got {H}")
@@ -111,6 +112,13 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
     CH = CPR // TPR
     QCH = H * CPR // BLOCK  # staging chunks per thread for Q / dO
     c_log2 = float(scale) * LOG2E
+    # 128 heads already hold ~450 VGPRs (16x512 fp32 dQ^T per wave); prefetched fragments spill
+    # there, and pinned order without prefetch only constrains the scheduler.
+    if prefetch is None:
+        prefetch = 8 if H < 128 else 0
+    if pin is None:
+        pin = 4 if prefetch else 0
+    pin_every = pin if pin > 0 else 1 << 30
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def sparse_mla_bwd_gfx1250_kernel(
@@ -234,19 +242,47 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
         interm_tok = fx.Int64(tok) * fx.Int64(topk * DV * 2)
         rsrc_im = make_rsrc(tensor_addr(INTERM) + interm_tok, topk * DV * 2)
 
+        def frag(addr):
+            return cat(lds_load(addr, v8e), lds_load(addr + 32, v8e))
+
+        def frag_tr(addr, pitch):
+            return cat(lds_load_tr16(addr), lds_load_tr16(addr + 16 * pitch))
+
+        # A step is (load: () -> fragments, mma: fragments -> None); loads run PREFETCH steps
+        # ahead of their WMMAs (the backend does not hoist LDS reads on its own).
+        def run_steps(steps):
+            q = [steps[i][0]() for i in range_constexpr(min(prefetch, len(steps)))]
+            for i in range_constexpr(len(steps)):
+                if const_expr(i + prefetch < len(steps)):
+                    q.append(steps[i + prefetch][0]())
+                steps[i][1](q.pop(0))
+                if const_expr((i + 1) % pin_every == 0):
+                    _rocdl.sched_barrier(0)
+
         def tile_compute(t, buf, dq_acc):
             kbase = kv_lds + buf * TILE_B
             kb_w = kbase + a_lane + kt0 * 16 * ROW
             s = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)]
             dp = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(KTW)]
+            cur = {}
+            steps = []
             for ks in range_constexpr(KS):
-                aq = cat(lds_load(q_row + ks * 64, v8e), lds_load(q_row + ks * 64 + 32, v8e))
-                ad = cat(lds_load(do_row + ks * 64, v8e), lds_load(do_row + ks * 64 + 32, v8e))
                 for kk in range_constexpr(KTW):
-                    o = kb_w + kk * 16 * ROW + ks * 64
-                    bk = cat(lds_load(o, v8e), lds_load(o + 32, v8e))
-                    s[kk] = wmma_bf16(aq, bk, s[kk])
-                    dp[kk] = wmma_bf16(ad, bk, dp[kk])
+
+                    def ld(ks=ks, kk=kk):
+                        bk = frag(kb_w + kk * 16 * ROW + ks * 64)
+                        if const_expr(kk == 0):
+                            return (frag(q_row + ks * 64), frag(do_row + ks * 64), bk)
+                        return (bk,)
+
+                    def mma(fr, kk=kk):
+                        if const_expr(kk == 0):
+                            cur["aq"], cur["ad"] = fr[0], fr[1]
+                        s[kk] = wmma_bf16(cur["aq"], fr[-1], s[kk])
+                        dp[kk] = wmma_bf16(cur["ad"], fr[-1], dp[kk])
+
+                    steps.append((ld, mma))
+            run_steps(steps)
             # P, dS: lane = slot t*BN + kt*16 + l16, element i = head hg*16 + hi*8 + i.
             for kk in range_constexpr(KTW):
                 kt = kt0 + kk
@@ -264,30 +300,53 @@ def build_sparse_mla_bwd_gfx1250(num_heads, topk, scale, block_k=32, d_split=Non
             gpu.barrier()
             # dQ^T[d, own heads] += K^T[d, slot] dS^T[slot, h].
             new = list(dq_acc)
+            steps = []
             for pc in range_constexpr(PC):
-                bb = ds_lds + tr_ds + pc * 32 * SP + hg * 32
-                b = cat(lds_load_tr16(bb), lds_load_tr16(bb + 16 * SP))
                 for j in range_constexpr(DTQ):
-                    ab = kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32
-                    a = cat(lds_load_tr16(ab), lds_load_tr16(ab + 16 * ROW))
-                    new[j] = wmma_bf16(a, b, new[j])
+
+                    def ld(pc=pc, j=j):
+                        a = frag_tr(kbase + tr_lane + pc * 32 * ROW + (dt0 + j) * 32, ROW)
+                        if const_expr(j == 0):
+                            return (frag_tr(ds_lds + tr_ds + pc * 32 * SP + hg * 32, SP), a)
+                        return (a,)
+
+                    def mma(fr, j=j):
+                        if const_expr(j == 0):
+                            cur["b"] = fr[0]
+                        new[j] = wmma_bf16(fr[-1], cur["b"], new[j])
+
+                    steps.append((ld, mma))
             # C^T[d, slot] = Q^T dS + dO^T P over this wave's d tiles.
             for kt in range_constexpr(KT):
-                bs, bp = [], []
                 for hc in range_constexpr(HC):
-                    o = (kt * 16 + l16) * SP + hc * 64 + hi * 16
-                    bs.append(cat(lds_load(ds_lds + o, v8e), lds_load(ds_lds + o + 32, v8e)))
-                    bp.append(cat(lds_load(p_lds + o, v8e), lds_load(p_lds + o + 32, v8e)))
+
+                    def ld(kt=kt, hc=hc):
+                        o = (kt * 16 + l16) * SP + hc * 64 + hi * 16
+                        return (frag(ds_lds + o), frag(p_lds + o))
+
+                    def keep(fr, hc=hc):
+                        cur[("bs", hc)], cur[("bp", hc)] = fr
+
+                    steps.append((ld, keep))
                 for j in range_constexpr(DTW):
                     dt = wave * DTW + j
-                    c = Vec.filled(8, 0.0, fx.Float32)
                     for hc in range_constexpr(HC):
-                        aq = q_lds + tr_lane + hc * 32 * ROW + dt * 32
-                        ad = do_lds + tr_lane + hc * 32 * ROW + dt * 32
-                        c = wmma_bf16(cat(lds_load_tr16(aq), lds_load_tr16(aq + 16 * ROW)), bs[hc], c)
-                        c = wmma_bf16(cat(lds_load_tr16(ad), lds_load_tr16(ad + 16 * ROW)), bp[hc], c)
-                    im_off = (t * BN + kt * 16 + l16) * (DV * 2) + dt * 32 + hi * 16
-                    buf_store(to_bf16(c).bitcast(fx.Int32), rsrc_im, im_off)
+
+                        def ld(hc=hc, dt=dt):
+                            o = tr_lane + hc * 32 * ROW + dt * 32
+                            return (frag_tr(q_lds + o, ROW), frag_tr(do_lds + o, ROW))
+
+                        def mma(fr, kt=kt, hc=hc, dt=dt):
+                            c = Vec.filled(8, 0.0, fx.Float32) if hc == 0 else cur["c"]
+                            c = wmma_bf16(fr[0], cur[("bs", hc)], c)
+                            c = wmma_bf16(fr[1], cur[("bp", hc)], c)
+                            cur["c"] = c
+                            if const_expr(hc == HC - 1):
+                                im_off = (t * BN + kt * 16 + l16) * (DV * 2) + dt * 32 + hi * 16
+                                buf_store(to_bf16(c).bitcast(fx.Int32), rsrc_im, im_off)
+
+                        steps.append((ld, mma))
+            run_steps(steps)
             return new
 
         init = [Vec.filled(8, 0.0, fx.Float32) for _ in range_constexpr(DTQ)]
