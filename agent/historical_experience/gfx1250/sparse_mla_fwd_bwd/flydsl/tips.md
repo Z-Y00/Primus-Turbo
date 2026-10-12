@@ -94,3 +94,9 @@
 - Signal: its softmax runs as a contiguous block with no WMMAs inside (no intra-wave softmax/WMMA overlap, consistent with round 18).
 - Takeaway (candidates, not yet tried): (1) thresholded lazy rescale (FA4-style): `growth = scale*tile_max - m_run`; if `growth <= 8.0` on every lane (`v_cmp_ge` + `s_cmp_eq vcc, exec` + `s_cbranch_vccnz`) keep the stale max and skip alpha + the 128 `v_pk_mul` O rescale — safe since exp2(s - m) <= 2^8; (2) lean exp path: one `v_fma_f32 x, s_scale, -m` per score alternated with `v_exp_f32` (VALU/TRANS co-issue), vs our pk_mul + cndmask + sub + back-to-back exps + v_nop; (3) split barrier: `s_barrier_signal`, the last PV WMMAs from already-loaded registers, then `s_barrier_wait`. OPUS also sets SCHED_MODE 2 (same as our expert mode).
 - Applicability: next steps for the gfx1250 sparse-MLA forward; (1)-(3) apply to any single-wave WMMA attention forward.
+
+### 2026-10-11 18:20 round-19 — REJECTED
+- Context: one-wave/SIMD attention forward with 32 heads per wave (two 16-head groups).
+- Signal: OPUS-style thresholded lazy rescale (ballot + wave-uniform `scf.if`, threshold 8 log2) was neutral; never rescaling at all was only 1.3% faster; forcing the branch every tile cost 2%.
+- Takeaway: measure the bound first — once a wave owns more heads, per-tile softmax/rescale work is amortized over more WMMAs and OPUS's softmax tricks shrink to ~1%. FlyDSL recipe for wave-uniform branches with results: `llvm.call_intrinsic(i32, "llvm.amdgcn.ballot.i32", [i1])` then `scf.IfOp(cond, types, has_else=True)` with `scf.YieldOp` in both regions.
+- Applicability: any gfx1250 attention kernel considering lazy rescale.
