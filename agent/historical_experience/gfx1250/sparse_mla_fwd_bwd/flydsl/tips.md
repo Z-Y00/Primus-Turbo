@@ -169,3 +169,9 @@
 - Signal: ablations with zero-size buffer descriptors (instructions still issued, no traffic): o store off -> 2x faster, q load off -> -11..-15%, kv gather off -> -16%. The o write, not the gather, dominates; the window-in-LDS forward (per-lane row offsets, closed-form mask) recovered the gather share (-11..-13%) only.
 - Takeaway: ablate each memory stream with `num_records = 0` before choosing what to restructure. Re-using one output buffer across timing iterations skews store-heavy kernels by 6-10% (time with fresh allocations, as training does). Per-lane-address fragment loads (`ds_load_b128`, `ds_load_tr16`) make a sliding window a free row shift.
 - Applicability: any attention forward with short rows; any store-heavy kernel benchmark.
+
+### 2026-10-11 22:24 round-32 — ACCEPTED (unrolled tiles vs a loop at the VGPR cap)
+- Context: 1-wave/SIMD attention forward at ~1000 VGPRs (q 256 + O 512), extra kv tiles of a different kind (shared pool) after the window tiles.
+- Signal: unrolling the extra tiles spilled 38..123 VGPRs and the count swung wildly with unrelated edits (prefetch 8/6/4, pins, tile order); one `scf.for` over all tiles (base / mask by wave-uniform select) gave 0 spills on every shape. Conversely, with no extra tiles the 1-iteration loop cost 3% vs unrolled.
+- Takeaway: at the register cap, put heterogeneous tiles into one loop with uniform selects rather than unrolling; keep unrolling only where it already fits. Put shared (token-independent) LDS regions first so their fragment offsets fit the 16-bit ds immediate. To fit two head groups' worth of LDS at 64 heads, use 4 waves as two token lanes sharing the buffers instead of two 2-wave workgroups. The round-30 soffset-for-constant-offset trick costs ~5% on stores when nothing spills — apply it only against an observed spill.
+- Applicability: any hand-pipelined FlyDSL WMMA kernel near 1024 VGPRs.
