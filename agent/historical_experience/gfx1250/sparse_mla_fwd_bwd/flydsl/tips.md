@@ -135,3 +135,8 @@
 - Signal: linear fit over top-k lengths implied a large per-token fixed cost.
 - Takeaway: don't infer fixed cost from a linear fit across compression ratios — per-tile cost changes with the kv pool's cache locality. Count bytes first: the kernel was at ~70% of copy bandwidth, so persistence was flat and `global_prefetch` of the next token (~400 KB/CU) made it 5-13% slower (extra traffic / L2 thrash).
 - Applicability: any "hide the prologue" idea on a kernel that streams per-item inputs once.
+
+### 2026-10-11 20:04 round-26 — ACCEPTED (compile-time split by tiles per token)
+- Context: persistent forward (r23-24) applied to all compression ratios.
+- Takeaway: gate structural changes that target the prologue on tiles-per-token at build time (here NT <= 8) and keep the straight-line kernel for long top-k; wrap the per-token body in a builder-level function so both paths share it. Check every shape against the pre-change kernel, not the geomean — the r23 geomean gain hid a 2-4% flash cr4 regression.
+- Applicability: any kernel specialized per top-k / sequence length where a change helps short and hurts long rows.

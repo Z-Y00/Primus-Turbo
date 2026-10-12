@@ -127,6 +127,11 @@ def _sbuf_load_v8i32(rsrc, byte_off):
     )
 
 
+# Up to this many kv tiles per token, the per-token q load and pipeline fill are exposed:
+# workgroups become persistent and load the next token's q under the last P*V.
+_PERSIST_MAX_TILES = 8
+
+
 @functools.lru_cache(maxsize=None)
 def _num_cus(device):
     return torch.cuda.get_device_properties(device).multi_processor_count
@@ -141,11 +146,13 @@ def _default_config(num_heads, topk):
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250(
-    num_heads, topk, scale, has_sink, idx16=False, hpw=None, waves=None, block_k=None, persist=True
+    num_heads, topk, scale, has_sink, idx16=False, hpw=None, waves=None, block_k=None, persist=None
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
     ``idx16`` packs 16-bit row indices (16 rows per TDM op); only valid when NKV <= 65536.
+    ``persist`` (default: at most ``_PERSIST_MAX_TILES`` kv tiles per token) loops each
+    workgroup over tokens; otherwise one token per workgroup.
     """
     H = num_heads
     d_hpw, d_waves, d_bk = _default_config(H, topk)
@@ -172,6 +179,8 @@ def build_sparse_mla_fwd_gfx1250(
     OPW = BN // RPO // WAVES  # TDM ops per wave per tile (queue depth is 3)
     IW = OPW * (RPO // 8)  # index octets per wave per tile
     c_log2 = float(scale) * LOG2E
+    if persist is None:
+        persist = NT <= _PERSIST_MAX_TILES
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def sparse_mla_fwd_gfx1250_kernel(
@@ -353,8 +362,8 @@ def build_sparse_mla_fwd_gfx1250(
             return m, l, o, p
 
         NQ = G * KS  # q fragments carried across tokens
-        for j, tsm in range(fx.Index(0), fx.Index(n_loc), fx.Index(1), init=q_first + pro[NBUF - 1]):
-            ji = fx.Int32(j)
+
+        def token(ji, tsm):
             tok = tok_of(ji)
             g0 = ji * NT  # stream index of this token's tile 0
             qf = [tsm[i] for i in range_constexpr(NQ)]
@@ -408,12 +417,13 @@ def build_sparse_mla_fwd_gfx1250(
                 st = [res[i] for i in range_constexpr(NS + IW)]
 
             m, l, o, p = unpack_state(st)  # noqa: E741
-            # Every wave is past tile NT-2, whose buffer takes the next token's tile 1; the next
-            # token's q loads into fresh registers (this token's q is dead) under the last P*V.
-            gpu.barrier()
-            issue(g0 + NT + NBUF - 2, [st[NS + i] for i in range_constexpr(IW)])
-            octs_next = load_rows(g0 + NT + NBUF - 1)
-            q_next = load_q(ji + 1)
+            nxt = None
+            if const_expr(persist):
+                # Every wave is past tile NT-2, whose buffer takes the next token's tile 1; the next
+                # token's q loads into fresh registers (this token's q is dead) under the last P*V.
+                gpu.barrier()
+                issue(g0 + NT + NBUF - 2, [st[NS + i] for i in range_constexpr(IW)])
+                nxt = load_q(ji + 1) + load_rows(g0 + NT + NBUF - 1)
             run_steps(pv_steps(lds0 + ((g0 + NT - 1) % NBUF) * TILE_B, p, o))
 
             rsrc_o = make_rsrc(tensor_addr(O) + fx.Int64(tok) * (H * DV * 2), H * DV * 2)
@@ -438,7 +448,13 @@ def build_sparse_mla_fwd_gfx1250(
                 lse = fmul(fadd(mf, log2(l_out)), LN2)
                 # Lanes 16..31 hold the same heads; push their store out of range.
                 buf_store(lse, rsrc_lse, fx.Int32((hi == 0).select(h_lane[g] * 4, fx.Int32(0x7FFFFFF0))))
-            _ = yield q_next + octs_next
+            return nxt
+
+        if const_expr(persist):
+            for j, tsm in range(fx.Index(0), fx.Index(n_loc), fx.Index(1), init=q_first + pro[NBUF - 1]):
+                _ = yield token(fx.Int32(j), tsm)
+        else:
+            token(fx.Int32(0), q_first + pro[NBUF - 1])
         # The over-issued gathers must land before the workgroup's LDS is released.
         _rocdl.s_wait_tensorcnt(0)
 
