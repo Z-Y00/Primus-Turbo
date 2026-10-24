@@ -336,3 +336,8 @@
 ## Rounds 68-69 — ACCEPTED: batching in the cr0 / cr128 window kernels; not with global-memory operands
 - Window forward: batch 6, -5..-7%; cr0 window backward: batch 4, -4..-5%; all bit-exact, no spills.
 - cr128 backward (pool K / K^T fragments read from global memory, not LDS) got 18-36% slower with batching: grouping long-latency VMEM loads into batches exposes their latency, which the per-step stream hid. Gate batching to LDS-fed loops; screen each kernel separately.
+
+## Round 70 — ACCEPTED: at 1024 VGPRs, stage outputs through LDS without holding them, and keep addresses out of VGPRs
+- Diagnose with a loop mnemonic diff vs a sibling kernel: the cr128 bwd had 3.6x the `s_set_vgpr_msb` of cr0 (VGPR bank switching above v255) and 2.7x the `va_vdst` waits for +24% WMMAs.
+- Direct 16 B-per-lane dQ fragment stores cost ~25% of the window backward vs a staged row copy-out. Holding QGW tiles in VGPRs until a row is whole spills at the VGPR limit; store each tile to the LDS stage as it completes instead.
+- Spills of loop-invariant addresses are worse than they look: the scratch reloads wait on loadcnt, which also drains in-flight buffer_loads (here the pool K^T prefetch). 36 spills = +50%. Put per-store constants in instruction immediates and wave-uniform parts in soffset, one lane-varying VGPR per side (4 spills, -3.5%).

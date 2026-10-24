@@ -927,6 +927,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
     pool_la=2,
     bf_hold=True,
     batch=None,
+    qgw=None,
 ):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
@@ -993,11 +994,16 @@ def build_sparse_mla_bwd_gfx1250_swa(
     NPACC = NPT * DTW
     if 2 * NPP > W:
         raise ValueError(f"pool of {pool_p} rows does not fit the window P tile")
-    # Without a pool, dQ goes out through a per-wave stage of 16 heads x QGW d tiles in the window
-    # P tile (dead during the dQ pass): the widest rows that fit. The pool kernel has no VGPRs to
-    # hold the staged tiles (it spills), so it stores dQ fragments directly (QGW = 1).
-    qfits = [gw for gw in (8, 4) if DTQ % gw == 0 and WAVES * 16 * (gw * 32 + 16) <= DS_B]
-    QGW = 1 if POOL or not qfits else qfits[0]
+    # dQ goes out through a per-wave stage of QGW d tiles (the widest that fit; direct fragment
+    # stores when none does, ~25% slower). Without a pool: 16 heads in the window P tile (dead
+    # during the dQ pass), tiles held in VGPRs until a row is whole. The pool kernel has no VGPRs
+    # to hold them (it spills): each tile goes to the stage as it completes, both head groups, in
+    # the window dS tile once every wave holds its dS^T fragments (bf_hold).
+    QS_ROWS = 16 * (G if POOL else 1)
+    qfits = [gw for gw in (8, 4) if DTQ % gw == 0 and WAVES * QS_ROWS * (gw * 32 + 16) <= DS_B]
+    if qgw is None:
+        qgw = qfits[0] if qfits and (bf_hold or not POOL) else 1
+    QGW = qgw
     QSROW = QGW * 32 + 16
     QLPR = QGW * 2  # lanes per staged row (16 B each)
     QRPS = WAVE // QLPR  # rows per buffer_store
@@ -1043,7 +1049,9 @@ def build_sparse_mla_bwd_gfx1250_swa(
         p_lds = ds_lds + DS_B
         dl_lds = p_lds + DS_B
         zr_lds = dl_lds + PPH * HW * 4
-        qstg = p_lds + wave * (16 * QSROW)
+        qstg = (ds_lds if POOL else p_lds) + wave * (QS_ROWS * QSROW)
+        q_ld = qstg + (lane // QLPR) * QSROW + (lane % QLPR) * 16
+        q_st = (lane // QLPR) * (DQK * 2) + (lane % QLPR) * 16
 
         v4i = vec_type(4, fx.Int32)
         v4f = vec_type(4, fx.Float32)
@@ -1327,6 +1335,8 @@ def build_sparse_mla_bwd_gfx1250_swa(
                 return [_frag_tr(base + g * 32, SP) for g in range_constexpr(G)]
 
             bf = [b_frags(pc) for pc in range_constexpr(NS)] if bf_hold else None
+            if const_expr(POOL and QGW > 1):
+                gpu.barrier()
             dq_off = [(hp * 32 + g * 16 + l16) * (DQK * 2) + hi * 16 for g in range_constexpr(G)]
             order = [(j, pc) for j in range_constexpr(DTQ) for pc in range_constexpr(NS)]
             # Pool K^T comes from global memory: its loads run pool_la d tiles ahead.
@@ -1358,18 +1368,30 @@ def build_sparse_mla_bwd_gfx1250_swa(
                                 dq_off[g] + j * 32,
                                 soff=dt0 * 32,
                             )
+                        elif const_expr(pc == NS - 1 and POOL):
+                            o = qstg + (g * 16 + l16) * QSROW + (j % QGW) * 32 + hi * 16
+                            lds_store(to_bf16(cur[(j, g)]), o)
                         elif const_expr(pc == NS - 1):
                             cur[("o", g, j % QGW)] = to_bf16(cur[(j, g)])
                     if const_expr(QGW > 1 and pc == NS - 1 and j % QGW == QGW - 1):
                         # 16 heads x QGW d tiles through the stage, out as rows of QGW * 32 B.
-                        col = (dt0 + j - (QGW - 1)) * 32 + (lane % QLPR) * 16
+                        col = (dt0 + j - (QGW - 1)) * 32
                         for g in range_constexpr(G):
-                            for jj in range_constexpr(QGW):
-                                lds_store(cur[("o", g, jj)], qstg + l16 * QSROW + jj * 32 + hi * 16)
-                            for r in range_constexpr(16 // QRPS):
-                                row = r * QRPS + lane // QLPR
-                                v = lds_load(qstg + row * QSROW + (lane % QLPR) * 16, v4i)
-                                buf_store(v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col)
+                            if const_expr(POOL):
+                                # One lane-varying address each side, the rest in immediates /
+                                # soffset: hoisted per-store address VGPRs spill here.
+                                for r in range_constexpr(16 // QRPS):
+                                    v = lds_load(q_ld + (g * 16 + r * QRPS) * QSROW, v4i)
+                                    soff = (hp * 32 + g * 16 + r * QRPS) * (DQK * 2) + col
+                                    buf_store(v, rsrc_dq, q_st, soff=soff)
+                            else:
+                                col_l = col + (lane % QLPR) * 16
+                                for jj in range_constexpr(QGW):
+                                    lds_store(cur[("o", g, jj)], qstg + l16 * QSROW + jj * 32 + hi * 16)
+                                for r in range_constexpr(16 // QRPS):
+                                    row = r * QRPS + lane // QLPR
+                                    v = lds_load(qstg + row * QSROW + (lane % QLPR) * 16, v4i)
+                                    buf_store(v, rsrc_dq, (hp * 32 + g * 16 + row) * (DQK * 2) + col_l)
 
                 steps.append((ld, mma))
             run(steps)
