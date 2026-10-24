@@ -341,3 +341,8 @@
 - Diagnose with a loop mnemonic diff vs a sibling kernel: the cr128 bwd had 3.6x the `s_set_vgpr_msb` of cr0 (VGPR bank switching above v255) and 2.7x the `va_vdst` waits for +24% WMMAs.
 - Direct 16 B-per-lane dQ fragment stores cost ~25% of the window backward vs a staged row copy-out. Holding QGW tiles in VGPRs until a row is whole spills at the VGPR limit; store each tile to the LDS stage as it completes instead.
 - Spills of loop-invariant addresses are worse than they look: the scratch reloads wait on loadcnt, which also drains in-flight buffer_loads (here the pool K^T prefetch). 36 spills = +50%. Put per-store constants in instruction immediates and wave-uniform parts in soffset, one lane-varying VGPR per side (4 spills, -3.5%).
+
+## Round 71 — ACCEPTED: fold small host-side torch epilogues into an existing reduce launch
+- After round 70 the cr128 backward still spent ~0.03 ms in three tiny torch launches (partial sum over 512 workgroups, fp32 -> bf16 slice copy, rope zero fill). Extra workgroups in the existing `swa_dkv_reduce` grid (kernel-body `if` on the block index) replace them: -3.5% pro / -4.7% flash cr128 bwd.
+- A reduction over many partials per output row needs several workgroups per row (column slices) and many loads in flight per thread (unrolled 16); a serial per-thread loop is latency-bound.
+- Splitting heads differently inside a workgroup does not change dKV accumulator VGPRs: they cover window rows x 512 columns summed over heads, so any wave partition gives rows x 512 / 4 per lane.

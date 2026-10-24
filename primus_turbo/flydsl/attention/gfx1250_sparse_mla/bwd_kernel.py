@@ -1512,58 +1512,107 @@ def build_sparse_mla_bwd_gfx1250_swa(
 
 
 @functools.lru_cache(maxsize=16)
-def build_swa_dkv_reduce(num_heads, block_t=16):
-    """bf16 dKV ``[NKV, 576]`` from the SWA kernel's partials: kv row j sums window row
-    ``j + 127 - b * block_t`` of every block b (and head group) whose window holds it; rope
-    columns are zero. One workgroup per kv row, 4 columns per thread."""
+def build_swa_dkv_reduce(num_heads, block_t=16, pool_p=0):
+    """bf16 dKV ``[NKV + pool_p, 576]`` from the SWA kernel's partials: kv row j < NKV sums window
+    row ``j + 127 - b * block_t`` of every block b (and head group) whose window holds it; rope
+    columns are zero. One workgroup per kv row, 4 columns per thread.
+
+    Pool row p (kv row NKV + p) sums its ``[NPP, 512]`` pool partial over every workgroup of the
+    SWA kernel: PCS workgroups per row, one per column slice, whose thread groups sum interleaved
+    partials (PU loads in flight) and then each other in a fixed order."""
     NHW, W, BT = num_heads // _SWA_HW, _SWA_W, block_t
     WR = _swa_rows(BT)
     NBW = (WR - 1) // BT + 1  # blocks whose window can hold a row
     BLOCK = DV // 4
     RZ = (DQK - DV) * 2 // 16
+    POOL = pool_p > 0
+    NPP = -(-pool_p // 32) * 32
+    PCS = 8
+    PQ = DV // PCS // 4  # column quads per slice
+    PG = BLOCK // PQ  # thread groups
+    PU = 16
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def swa_dkv_reduce_kernel(PART: fx.Tensor, DKV: fx.Tensor, NKV: fx.Int32, NB: fx.Int32):
+    def swa_dkv_reduce_kernel(PART: fx.Tensor, PPART: fx.Tensor, DKV: fx.Tensor, NKV: fx.Int32, NB: fx.Int32):
         tid = fx.Int32(fx.thread_idx.x)
         j = fx.Int32(fx.block_idx.x)
         v4f = vec_type(4, fx.Float32)
-        rsrc_pt = make_rsrc(tensor_addr(PART), NB * (NHW * WR * DV * 4))
-        b_hi = (j + (W - 1)) // BT
-        acc = [fx.Float32(0.0)] * 4
-        for m in range_constexpr(NBW):
-            b = b_hi - m
-            r = j + (W - 1) - b * BT
-            ok = fx.Int32((b >= fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)))
-            ok = ok & fx.Int32((b < NB).select(fx.Int32(1), fx.Int32(0)))
-            ok = ok & fx.Int32((r < fx.Int32(WR)).select(fx.Int32(1), fx.Int32(0)))
-            for hw in range_constexpr(NHW):
-                off = ((b * NHW + hw) * WR + r) * (DV * 4) + tid * 16
-                off = fx.Int32((ok != fx.Int32(0)).select(off, fx.Int32(0x7FFFFFF0)))
-                v = Vec(buf_load(rsrc_pt, off, v4f))
-                acc = [fadd(acc[e], fx.Float32(v[e])) for e in range_constexpr(4)]
-        rsrc_o = make_rsrc(tensor_addr(DKV) + fx.Int64(j) * (DQK * 2), DQK * 2)
-        buf_store(to_bf16(Vec.from_elements(acc, fx.Float32)).bitcast(fx.Int32), rsrc_o, tid * 8)
         zero = Vec.filled(4, 0, fx.Int32)
-        buf_store(
-            zero, rsrc_o, fx.Int32((tid < fx.Int32(RZ)).select(DV * 2 + tid * 16, fx.Int32(0x7FFFFFF0)))
-        )
+        if const_expr(POOL):
+            arena = fx.SharedAllocator(static=False)
+            arena.allocate(BLOCK * 16)
+            red = fx.Int32(fx.Int64(fx.ptrtoint(arena.base_ptr)))
+        if j < NKV:
+            rsrc_pt = make_rsrc(tensor_addr(PART), NB * (NHW * WR * DV * 4))
+            b_hi = (j + (W - 1)) // BT
+            acc = [fx.Float32(0.0)] * 4
+            for m in range_constexpr(NBW):
+                b = b_hi - m
+                r = j + (W - 1) - b * BT
+                ok = fx.Int32((b >= fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)))
+                ok = ok & fx.Int32((b < NB).select(fx.Int32(1), fx.Int32(0)))
+                ok = ok & fx.Int32((r < fx.Int32(WR)).select(fx.Int32(1), fx.Int32(0)))
+                for hw in range_constexpr(NHW):
+                    off = ((b * NHW + hw) * WR + r) * (DV * 4) + tid * 16
+                    off = fx.Int32((ok != fx.Int32(0)).select(off, fx.Int32(0x7FFFFFF0)))
+                    v = Vec(buf_load(rsrc_pt, off, v4f))
+                    acc = [fadd(acc[e], fx.Float32(v[e])) for e in range_constexpr(4)]
+            rsrc_o = make_rsrc(tensor_addr(DKV) + fx.Int64(j) * (DQK * 2), DQK * 2)
+            buf_store(to_bf16(Vec.from_elements(acc, fx.Float32)).bitcast(fx.Int32), rsrc_o, tid * 8)
+            buf_store(
+                zero, rsrc_o, fx.Int32((tid < fx.Int32(RZ)).select(DV * 2 + tid * 16, fx.Int32(0x7FFFFFF0)))
+            )
+        if const_expr(POOL):
+            if j >= NKV:
+                p = (j - NKV) // PCS
+                col = ((j - NKV) % PCS) * (PQ * 4) + (tid % PQ) * 4
+                grp = tid // PQ
+                n_part = NB * NHW
+                rsrc_pp = make_rsrc(tensor_addr(PPART), n_part * (NPP * DV * 4))
+                n_it = (n_part + (PG * PU - 1)) // (PG * PU)
+                init = [fx.Float32(0.0)] * 4
+                for it, st in range(fx.Index(0), fx.Index(n_it), fx.Index(1), init=init):
+                    a = [st[e] for e in range_constexpr(4)]
+                    vs = []
+                    for u in range_constexpr(PU):
+                        b = (fx.Int32(it) * PU + u) * PG + grp
+                        off = (b * NPP + p) * (DV * 4) + col * 4
+                        off = fx.Int32((b < n_part).select(off, fx.Int32(0x7FFFFFF0)))
+                        vs.append(Vec(buf_load(rsrc_pp, off, v4f)))
+                    for v in vs:
+                        a = [fadd(a[e], fx.Float32(v[e])) for e in range_constexpr(4)]
+                    res = yield a
+                lds_store(Vec.from_elements([res[e] for e in range_constexpr(4)], fx.Float32), red + tid * 16)
+                gpu.barrier()
+                s = [fx.Float32(0.0)] * 4
+                for g in range_constexpr(PG):
+                    v = lds_load(red + (g * PQ + tid % PQ) * 16, v4f)
+                    s = [fadd(s[e], fx.Float32(v[e])) for e in range_constexpr(4)]
+                rsrc_o = make_rsrc(tensor_addr(DKV) + fx.Int64(NKV + p) * (DQK * 2), DQK * 2)
+                off = fx.Int32((grp == fx.Int32(0)).select(col * 2, fx.Int32(0x7FFFFFF0)))
+                buf_store(to_bf16(Vec.from_elements(s, fx.Float32)).bitcast(fx.Int32), rsrc_o, off)
+                zoff = fx.Int32((tid < fx.Int32(RZ)).select(DV * 2 + tid * 16, fx.Int32(0x7FFFFFF0)))
+                zoff = fx.Int32(((j - NKV) % PCS == fx.Int32(0)).select(zoff, fx.Int32(0x7FFFFFF0)))
+                buf_store(zero, rsrc_o, zoff)
 
     @flyc.jit
     def launch_swa_dkv_reduce(
         PART: fx.Tensor,
+        PPART: fx.Tensor,
         DKV: fx.Tensor,
         n_kv: fx.Int32,
         n_b: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        swa_dkv_reduce_kernel(PART, DKV, n_kv, n_b).launch(
-            grid=(fx.Index(n_kv), 1, 1), block=(BLOCK, 1, 1), stream=stream
+        swa_dkv_reduce_kernel(PART, PPART, DKV, n_kv, n_b).launch(
+            grid=(fx.Index(n_kv + pool_p * PCS), 1, 1), block=(BLOCK, 1, 1), stream=stream
         )
 
     compiled = {}
 
-    def run_(part, dkv, stream=None):
-        args = (part, dkv, int(dkv.shape[0]), int(part.shape[0]) // NHW)
+    def run_(part, dkv, ppart=None, stream=None):
+        ppart = part if ppart is None else ppart
+        args = (part, ppart, dkv, int(dkv.shape[0]) - pool_p, int(part.shape[0]) // NHW)
         fn = compiled.get("fn")
         if fn is None:
             fn = flyc.compile[COMPILE_HINTS](launch_swa_dkv_reduce, *args, fx.Stream(stream))
@@ -1680,10 +1729,7 @@ def sparse_mla_bwd_gfx1250(
             H, float(scale), block_t=_SWA_BT, pool_p=max(pool_p, 0), pool_cr=T_ // pool_p if pool_p > 0 else 0
         )(q, kv2, o, do, lse, dq, delta, part, kvt, ppart, stream=stream)
         dkv = torch.empty(num_kv, DQK, dtype=kv.dtype, device=q.device)
-        build_swa_dkv_reduce(H, block_t=_SWA_BT)(part, dkv[:T_], stream=stream)
-        if pool_p > 0:
-            dkv[T_:, :DV] = ppart[:, :pool_p].sum(0)
-            dkv[T_:, DV:] = 0
+        build_swa_dkv_reduce(H, block_t=_SWA_BT, pool_p=max(pool_p, 0))(part, dkv, ppart, stream=stream)
         if attn_sink is not None:
             dsink = sparse_mla_dsink(attn_sink, lse, delta)
         return dq, dkv.view(kv_shape), dsink
