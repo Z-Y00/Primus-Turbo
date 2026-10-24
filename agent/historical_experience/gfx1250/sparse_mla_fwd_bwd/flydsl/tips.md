@@ -328,3 +328,7 @@
 - Signal: FlyDSL 0.3.4.1 (LLVM 24, expert scheduling) puts `va_vdst(0)` before every ds_load that overwrites a register a WMMA read. A per-step operand stream (queue of 8) hit it ~110 times per 256-WMMA tile; the dense gfx1250 flash / MLA forwards, which load each phase's operands in bulk (`L32 | W32`), get 4-5 per loop on the same compiler.
 - Fix: load batch b+1 (8 fragments) into other registers while batch b's WMMAs run, sched_barrier only at batch edges -> one reload switch per batch. Forward -10% (pro cr4 4K), bit-exact, waits 114 -> 69.
 - Takeaway: when a compiler rule costs per register-reuse transition, compare the ISA op sequence (`tmp/isa_seq.py`) with a kernel that is unaffected; the fix is structural (fewer, larger reuse transitions), not source reordering. Size the batch by VGPRs: 2 x BATCH fragments live; past the budget it spills and runs 2x slower.
+
+## Round 67 — ACCEPTED: the same operand batching in the backward main kernel
+- Batch 4 steps (backward steps load 1-5 fragments each, so its batches are smaller than the forward's 8): bwd -6% at pro cr4 4K, bit-exact, and 48 fewer VGPRs than the prefetch-8 stream. Batch 8 spills.
+- Takeaway: pick the batch by fragments per batch, not steps; screen a range interleaved (3..6 were within noise) and prefer the one with the lowest VGPR count.

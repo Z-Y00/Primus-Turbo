@@ -464,8 +464,23 @@ def _frag_tr(addr, pitch):
     return cat(lds_load_tr16(addr), lds_load_tr16(addr + 16 * pitch))
 
 
-def _run_steps(steps, prefetch, pin):
-    """Run ``(load, mma)`` steps with loads ``prefetch`` steps ahead, ``sched_barrier`` every ``pin``."""
+def _run_steps(steps, prefetch, pin, batch=0):
+    """Run ``(load, mma)`` steps with loads ``prefetch`` steps ahead, ``sched_barrier`` every ``pin``.
+
+    ``batch > 0``: batch b's mmas run while batch b+1's loads go to other registers, with
+    ``sched_barrier`` only at batch edges. LLVM 24 waits ``va_vdst(0)`` before a ds_load that
+    overwrites a register some WMMA read; batching makes that once per batch, not per step."""
+    if const_expr(batch > 0):
+        n = len(steps)
+        cur = [steps[i][0]() for i in range_constexpr(min(batch, n))]
+        for b0 in range_constexpr(0, n, batch):
+            nxt = [steps[i][0]() for i in range_constexpr(b0 + batch, min(b0 + 2 * batch, n))]
+            fx.rocdl.sched_barrier(0)
+            for j in range_constexpr(len(cur)):
+                steps[b0 + j][1](cur[j])
+            fx.rocdl.sched_barrier(0)
+            cur = nxt
+        return
     q = [steps[i][0]() for i in range_constexpr(min(prefetch, len(steps)))]
     for i in range_constexpr(len(steps)):
         if const_expr(i + prefetch < len(steps)):
@@ -489,7 +504,7 @@ def _w1_block_k(num_heads):
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_bwd_gfx1250_w1(
-    num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None
+    num_heads, topk, scale, block_k=None, prefetch=8, pin=None, ahead=256, ct_resident=None, batch=4
 ):
     """One wave per SIMD (4 waves), 32 heads per wave; the kv tiles arrive by TDM gather.
 
@@ -501,7 +516,11 @@ def build_sparse_mla_bwd_gfx1250_w1(
     leaves the causally masked picks as trailing -1, about half the slots at T = 4096.
 
     After its last tile, a workgroup prefetches into L2 the Q / dO / O / indices / lse of token
-    ``tok + ahead`` (one workgroup per CU: the token that takes over this CU next)."""
+    ``tok + ahead`` (one workgroup per CU: the token that takes over this CU next).
+
+    ``batch``: LDS operands load in batches of that many steps (see ``_run_steps``); 4 beats
+    3 / 5 / 6 within noise at the fewest VGPRs, 8 spills. 0 restores the ``prefetch`` / ``pin``
+    stream."""
     H = num_heads
     WAVES = 4
     HP = H // 32  # 32-head pairs
@@ -692,7 +711,7 @@ def build_sparse_mla_bwd_gfx1250_w1(
         rsrc_im = make_rsrc(tensor_addr(INTERM) + fx.Int64(tok) * fx.Int64(topk * DV * 2), topk * DV * 2)
 
         def run(steps):
-            _run_steps(steps, prefetch, pin_every)
+            _run_steps(steps, prefetch, pin_every, batch)
 
         def tile_compute(t, buf, dq):
             kbase = kv_lds + buf * TILE_B
