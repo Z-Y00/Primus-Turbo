@@ -323,3 +323,8 @@
 ## The 1-wave/SIMD forward loop is not LDS-read-bound (after round 65)
 - Halving K or V^T fragment reads with the WMMA count kept (reuse a fragment for the next step's different B operand / accumulator) changed nothing; removing the in-loop TDM gathers saved 7% though nothing waited on them (TDM LDS writes + random rows). Don't restructure for fewer LDS reads (e.g. d-split PV across waves); look at gather traffic and issue/hazard stalls.
 - Ablation pitfall: a gather where every slot reads one row turns into an L2 hotspot (2x slower); use distinct L2-hot rows to separate "memory source" from "TDM/LDS write" cost.
+
+## Round 66 — ACCEPTED: batch LDS operand loads to dodge LLVM 24's WMMA-source reload wait
+- Signal: FlyDSL 0.3.4.1 (LLVM 24, expert scheduling) puts `va_vdst(0)` before every ds_load that overwrites a register a WMMA read. A per-step operand stream (queue of 8) hit it ~110 times per 256-WMMA tile; the dense gfx1250 flash / MLA forwards, which load each phase's operands in bulk (`L32 | W32`), get 4-5 per loop on the same compiler.
+- Fix: load batch b+1 (8 fragments) into other registers while batch b's WMMAs run, sched_barrier only at batch edges -> one reload switch per batch. Forward -10% (pro cr4 4K), bit-exact, waits 114 -> 69.
+- Takeaway: when a compiler rule costs per register-reuse transition, compare the ISA op sequence (`tmp/isa_seq.py`) with a kernel that is unaffected; the fix is structural (fewer, larger reuse transitions), not source reordering. Size the batch by VGPRs: 2 x BATCH fragments live; past the budget it spills and runs 2x slower.

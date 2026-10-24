@@ -27,8 +27,8 @@ so the softmax is in-lane, and V^T comes from ``ds_load_tr16_b128`` reads of the
 The top-k latent rows are gathered into a 3-stage LDS ring by the Tensor Data Mover (gather
 mode: 8 x i32 or 16 x i16 row indices per op, read with scalar loads); every wave issues its
 share of each tile. The loop is software-pipelined: iteration t computes the scores of tile
-t+1 interleaved with the P*V of tile t, LDS operands are loaded several WMMAs ahead, and
-``sched_barrier`` pins that order against the machine scheduler.
+t+1 interleaved with the P*V of tile t, LDS operands are loaded a batch of WMMA steps ahead, and
+``sched_barrier`` pins the batch boundaries against the machine scheduler.
 
 The cr0 / cr128 bands (every token's top-k is its 128-row sliding window, plus for cr128 a
 causal pool of T / 128 compressed rows) have their own kernel: a workgroup owns a block of
@@ -85,8 +85,12 @@ DQK = 576  # q / kv row length (latent + zero rope pad)
 COMPILE_HINTS = {"llvm_options": {"amdgpu-expert-scheduling-mode": True}}
 
 NBUF = 3  # TDM ring stages; deeper rings lose to the extra LDS write traffic
-PREFETCH = 8  # LDS operand loads run this many WMMA steps ahead
-PIN = 4  # sched_barrier every PIN steps
+PREFETCH = 8  # cr0 / cr128 kernel: LDS operand loads run this many WMMA steps ahead
+PIN = 4  # cr0 / cr128 kernel: sched_barrier every PIN steps
+# Top-k kernel: LDS operands load in batches of BATCH steps, one batch ahead (2 * BATCH fragments
+# live; 8 fits ~1008 VGPRs, 12 spills). Under expert scheduling LLVM 24 adds va_vdst(0) before a
+# ds_load that overwrites a WMMA's A operand; batching cuts those waits (114 -> 69 per tile).
+BATCH = 8
 _RESCALE_LOG2 = 8.0  # cr4 path: lag of the running max (log2 units) before O is rescaled
 # TDM group-1 dword 0: 2-byte elements, pad 4 dwords after every 256 (one 512-elem row)
 _TDM_G1_CFG = (1 << 16) | (1 << 20) | (7 << 22) | (3 << 25)
@@ -409,14 +413,18 @@ def build_sparse_mla_fwd_gfx1250(
             return steps
 
         def run_steps(steps):
-            q = [steps[i][0]() for i in range_constexpr(min(PREFETCH, len(steps)))]
-            for i in range_constexpr(len(steps)):
-                a = q.pop(0)
-                if const_expr(i + PREFETCH < len(steps)):
-                    q.append(steps[i + PREFETCH][0]())
-                steps[i][1](a)
-                if const_expr((i + 1) % PIN == 0):
-                    fx.rocdl.sched_barrier(0)
+            # Batch b's WMMAs run while batch b+1's operands load into other registers, so a
+            # reload overwrites registers some WMMA read once per batch, not once per step: LLVM
+            # 24 puts a va_vdst(0) before each such load (see BATCH).
+            n = len(steps)
+            cur = [steps[i][0]() for i in range_constexpr(min(BATCH, n))]
+            for b0 in range_constexpr(0, n, BATCH):
+                nxt = [steps[i][0]() for i in range_constexpr(b0 + BATCH, min(b0 + 2 * BATCH, n))]
+                fx.rocdl.sched_barrier(0)
+                for j in range_constexpr(len(cur)):
+                    steps[b0 + j][1](cur[j])
+                fx.rocdl.sched_barrier(0)
+                cur = nxt
 
         def softmax(s, valid, m_run, l_run):
             vals = []
