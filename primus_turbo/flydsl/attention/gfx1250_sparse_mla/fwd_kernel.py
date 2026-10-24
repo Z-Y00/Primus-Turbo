@@ -85,8 +85,8 @@ DQK = 576  # q / kv row length (latent + zero rope pad)
 COMPILE_HINTS = {"llvm_options": {"amdgpu-expert-scheduling-mode": True}}
 
 NBUF = 3  # TDM ring stages; deeper rings lose to the extra LDS write traffic
-PREFETCH = 8  # cr0 / cr128 kernel: LDS operand loads run this many WMMA steps ahead
-PIN = 4  # cr0 / cr128 kernel: sched_barrier every PIN steps
+PREFETCH = 8  # cr0 / cr128 kernel with batch=0: LDS operand loads run this many WMMA steps ahead
+PIN = 4  # cr0 / cr128 kernel with batch=0: sched_barrier every PIN steps
 # Top-k kernel: LDS operands load in batches of BATCH steps, one batch ahead (2 * BATCH fragments
 # live; 8 fits ~1008 VGPRs, 12 spills). Under expert scheduling LLVM 24 adds va_vdst(0) before a
 # ds_load that overwrites a WMMA's A operand; batching cuts those waits (114 -> 69 per tile).
@@ -207,6 +207,32 @@ def _default_config(num_heads, topk):
     waves = min(num_heads // hpw, 4)
     block_k = 64 if waves == 4 and topk % 64 == 0 else 32
     return hpw, waves, block_k
+
+
+def _run_steps(steps, batch, prefetch=0, pin=0):
+    """Run ``(load, mma)`` steps. ``batch > 0``: batch b's WMMAs run while batch b+1's operands
+    load into other registers, ``sched_barrier`` at batch edges, so a reload overwrites registers
+    some WMMA read once per batch, not once per step (LLVM 24 puts a va_vdst(0) before each such
+    load; see BATCH). ``batch == 0``: loads ``prefetch`` steps ahead, ``sched_barrier`` every ``pin``."""
+    n = len(steps)
+    if const_expr(batch > 0):
+        cur = [steps[i][0]() for i in range_constexpr(min(batch, n))]
+        for b0 in range_constexpr(0, n, batch):
+            nxt = [steps[i][0]() for i in range_constexpr(b0 + batch, min(b0 + 2 * batch, n))]
+            fx.rocdl.sched_barrier(0)
+            for j in range_constexpr(len(cur)):
+                steps[b0 + j][1](cur[j])
+            fx.rocdl.sched_barrier(0)
+            cur = nxt
+        return
+    q = [steps[i][0]() for i in range_constexpr(min(prefetch, n))]
+    for i in range_constexpr(n):
+        a = q.pop(0)
+        if const_expr(i + prefetch < n):
+            q.append(steps[i + prefetch][0]())
+        steps[i][1](a)
+        if const_expr((i + 1) % pin == 0):
+            fx.rocdl.sched_barrier(0)
 
 
 @functools.lru_cache(maxsize=64)
@@ -413,18 +439,7 @@ def build_sparse_mla_fwd_gfx1250(
             return steps
 
         def run_steps(steps):
-            # Batch b's WMMAs run while batch b+1's operands load into other registers, so a
-            # reload overwrites registers some WMMA read once per batch, not once per step: LLVM
-            # 24 puts a va_vdst(0) before each such load (see BATCH).
-            n = len(steps)
-            cur = [steps[i][0]() for i in range_constexpr(min(BATCH, n))]
-            for b0 in range_constexpr(0, n, BATCH):
-                nxt = [steps[i][0]() for i in range_constexpr(b0 + BATCH, min(b0 + 2 * BATCH, n))]
-                fx.rocdl.sched_barrier(0)
-                for j in range_constexpr(len(cur)):
-                    steps[b0 + j][1](cur[j])
-                fx.rocdl.sched_barrier(0)
-                cur = nxt
+            _run_steps(steps, BATCH)
 
         def softmax(s, valid, m_run, l_run):
             vals = []
@@ -667,7 +682,7 @@ _LDS_MAX = 320 * 1024
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250_swa(
-    num_heads, scale, has_sink, block_t=16, block_k=None, pool_p=0, pool_cr=0, prefetch=PREFETCH
+    num_heads, scale, has_sink, block_t=16, block_k=None, pool_p=0, pool_cr=0, prefetch=PREFETCH, batch=6
 ):
     """Launcher for the cr0 / cr128 bands; see ``sparse_mla_fwd_gfx1250``.
 
@@ -679,6 +694,9 @@ def build_sparse_mla_fwd_gfx1250_swa(
 
     Four waves of 32 heads; with fewer than 128 heads the head groups repeat over token lanes
     (wave pairs on alternate tokens of the block) that share the window.
+
+    ``batch``: LDS operands load in batches of that many steps (``_run_steps``); 6 beats 4 / 8
+    without spills. 0 restores the ``prefetch`` / ``PIN`` stream.
     """
     H = num_heads
     hpw = 32
@@ -832,14 +850,7 @@ def build_sparse_mla_fwd_gfx1250_swa(
             return steps
 
         def run_steps(steps):
-            q = [steps[i][0]() for i in range_constexpr(min(prefetch, len(steps)))]
-            for i in range_constexpr(len(steps)):
-                a = q.pop(0)
-                if const_expr(i + prefetch < len(steps)):
-                    q.append(steps[i + prefetch][0]())
-                steps[i][1](a)
-                if const_expr((i + 1) % PIN == 0):
-                    fx.rocdl.sched_barrier(0)
+            _run_steps(steps, batch, prefetch, PIN)
 
         def softmax(s, valid, m_run, l_run):
             nkt = len(s)

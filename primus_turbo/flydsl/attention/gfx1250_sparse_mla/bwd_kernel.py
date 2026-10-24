@@ -926,6 +926,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
     pool_cr=0,
     pool_la=2,
     bf_hold=True,
+    batch=0,
 ):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
@@ -1073,7 +1074,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
         dt0 = ds * DTQ
 
         def run(steps):
-            _run_steps(steps, prefetch, pin_every)
+            _run_steps(steps, prefetch, pin_every, batch)
 
         def sdp(kbase, tok, lse2):
             # Window S / dP -> (P, dP) per (g, kk): lane = slot kt*16 + l16, element i = head row.
