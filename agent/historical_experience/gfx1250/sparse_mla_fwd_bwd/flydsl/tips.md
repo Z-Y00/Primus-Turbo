@@ -298,3 +298,28 @@
 ## Ablating a store also deletes its producers (round 56)
 - Removing a result store (e.g. the dQ fragment `buf_store`) lets the compiler drop every WMMA and load that only fed it. The window-bwd "no dq store -20%" ablations (rounds 36-42) measured "no dQ at all". Ablate stores by issuing them to an out-of-range offset (traffic gone, issue kept) or by folding the results into one running sum stored once (stores gone, compute kept).
 - cr128 window bwd: rowsum(P * dP) over window + pool slots replaces the O * dO delta (as cr0, round 44) — no O prefetch (64 VGPRs), no delta phase, -10..-11% bwd. Order matters at 1024 VGPRs: computing the small pool S / dP first (32 VGPRs of P / dP held) beat window-first (128 held) by 18%.
+
+## Side streams under a kernel that holds every CU (round 59)
+- A side-stream kernel only runs where the main kernel leaves CU slots (1 WG/CU with full LDS / VGPRs leaves none mid-chunk), so "overlapped" work costs about its standalone time as main-kernel slowdown plus tail. Size the side work standalone and cut it like exposed work; many small torch elementwise kernels are the worst case (each waits for slots: 6 key-building ops took 340 us beside w1 vs ~20 us alone).
+- Several CSR inverses over slices of one index map come from one stable sort with composite keys `slice * num_rows + row` (int16 while it fits): each slice's row pointers are a host-side view of one searchsorted, no host sync; give the consumer row / entry base offsets.
+- Ablation check: count WMMAs in the ablated ISA. Reusing one loaded fragment for several chains made identical chains the compiler merged (208 of 320 WMMAs left, -21% instead of the real -7%).
+
+## Fuse torch elementwise chains on a starved side stream (round 60)
+- Beside a kernel that holds every CU, each small torch launch waits for a CU slot, so a chain of six elementwise ops cost 340 us for ~20 us of work. A single Triton kernel did it in 25 us (pro cr4 4K step -0.9%).
+- Next on the same stream: torch.sort's iota (`fill_reverse_indices`), `searchsorted` and the int64 -> int32 index cast each cost ~90-110 us there; a direct histogram + scan CSR would remove them.
+
+## Know when the side chain leaves the critical path (round 62)
+- After rounds 59-61 the sort chain beside w1 chunk 0 ends at ~490 us, well inside chunk 0. Cutting searchsorted 95 -> 15 us changed nothing (+0.2%). Before trimming a side-stream kernel, check in the timeline that its end gates something (the next chunk's gather or the tail).
+
+## Persistence at ~950 VGPRs: the carried state costs more than the hidden prologue (rounds 63-64)
+- Phase stamps of the 1-token-per-WG cr4 forward: ~9.4K of 63K cycles/token wait for the first kv gathers and q; reordering the prologue only moves the wait (TDM wait -> barrier).
+- A persistent ragged version (ring index advanced by each token's own tile count; next token's tiles 0/1 issued after the loop's last barrier, gathers complete in issue order so a stray gather into a free buffer is harmless) hid the prologue, but carrying q (256 VGPRs) through the token loop sent the build to 1024 VGPRs + spills and the tile loop to +23% cycles (s_set_vgpr_msb 983 vs 658): check the per-tile cycles of the same code at grid = T to separate codegen from runtime. Reloading q per token recovered most of the loop but lost the gain to the q latency.
+- Tools: tmp/fwd_abl2.py (patched-source ablations + per-wave stamps incl. inter-token gaps), tmp/fwd_isa2.py (ISA stats per builder kwargs), tmp/isa_blocks.py / tmp/isa_block_diff.py (per-basic-block counts and mnemonic diffs).
+
+## L2 prefetch transfers to the forward; interleave A/B timings (round 65)
+- One-token-per-WG forward at 1 WG/CU: `global_prefetch` (SCOPE_DEV) of token tok - NPROG's q rows + indices after the last tile cut the prologue 9.7K -> 5.9K cycles, fwd -3.1% (pro cr4 4K). Skip it at 2 WGs/CU (flash): the sibling hides the prologue and the prefetch only adds traffic (+4%).
+- Timing two kernels back to back in one process: the first one timed read 1.5-4% slow (A/A check), small shapes ±15%. Interleave (ABBA...) and take medians before trusting a few-percent screen.
+
+## The 1-wave/SIMD forward loop is not LDS-read-bound (after round 65)
+- Halving K or V^T fragment reads with the WMMA count kept (reuse a fragment for the next step's different B operand / accumulator) changed nothing; removing the in-loop TDM gathers saved 7% though nothing waited on them (TDM LDS writes + random rows). Don't restructure for fewer LDS reads (e.g. d-split PV across waves); look at gather traffic and issue/hazard stalls.
+- Ablation pitfall: a gather where every slot reads one row turns into an L2 hotspot (2x slower); use distinct L2-hot rows to separate "memory source" from "TDM/LDS write" cost.
