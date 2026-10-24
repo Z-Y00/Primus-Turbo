@@ -19,14 +19,14 @@ import triton.language as tl
 
 
 @triton.jit
-def _sum_entries(Interm, InvData, s, t, D: tl.constexpr, BLOCK_K: tl.constexpr):
+def _sum_entries(Interm, InvData, ent_base, s, t, D: tl.constexpr, BLOCK_K: tl.constexpr):
     offs_d = tl.arange(0, D)
     offs_k = tl.arange(0, BLOCK_K)
     acc = tl.zeros([D], dtype=tl.float32)
     for e0 in range(s, t, BLOCK_K):
         e = e0 + offs_k
         m = e < t
-        ent = tl.load(InvData + e, mask=m, other=0).to(tl.int64)
+        ent = tl.load(InvData + e, mask=m, other=ent_base).to(tl.int64) - ent_base
         rows = tl.load(Interm + ent[:, None] * D + offs_d[None, :], mask=m[:, None], other=0.0)
         acc += tl.sum(rows.to(tl.float32), axis=0)
     return acc
@@ -48,13 +48,14 @@ def _row_of(InvPtr, x, num_kv, LOG_KV: tl.constexpr):
 @triton.jit
 def _dkv_gather_main(
     Interm,  # [rows, D] bf16
-    Keys,  # [E] sorted kv row per entry (-1 = invalid, first)
-    InvPtr,  # [num_kv + 1] int32
-    InvData,  # [E] int32 interm row per entry
+    Keys,  # [E] sorted key per entry (row_base + kv row; -1 = invalid, first)
+    InvPtr,  # [num_kv + 1] int32 positions in Keys / InvData of this call's rows
+    InvData,  # [E] int32 / int64 ent_base + interm row per entry
     Acc,  # [num_kv, stride_acc] fp32
     Side,  # [num_blocks, 2, D] fp32
-    E,
     num_kv,
+    row_base,
+    ent_base,
     stride_acc,
     D: tl.constexpr,
     SEG: tl.constexpr,
@@ -70,21 +71,24 @@ def _dkv_gather_main(
         if p1 - p0 <= SEG:
             a_ptr = Acc + pid.to(tl.int64) * stride_acc + offs_d
             a = tl.load(a_ptr)
-            tl.store(a_ptr, a + _sum_entries(Interm, InvData, p0, p1, D, ROW_BK))
+            tl.store(a_ptr, a + _sum_entries(Interm, InvData, ent_base, p0, p1, D, ROW_BK))
     else:
+        # Blocks of SEG entries from this call's first entry (inv_ptr[0]) to its last.
         b = pid - num_kv
-        b0 = b * SEG
-        b1 = tl.minimum(b0 + SEG, E)
-        lo = tl.maximum(b0, tl.load(InvPtr))
+        lo = tl.load(InvPtr) + b * SEG
+        b0 = lo
+        b1 = tl.minimum(b0 + SEG, tl.load(InvPtr + num_kv))
         if lo < b1:
-            r = tl.load(Keys + lo).to(tl.int32)
+            r = tl.load(Keys + lo).to(tl.int32) - row_base
             p0 = tl.load(InvPtr + r)
             p1 = tl.load(InvPtr + r + 1)
             # Visit only the block's non-empty rows: with chunked tokens the kv rows touched by
             # a chunk can leave long runs of empty rows (e.g. between the window and the pool).
             while p0 < b1:
                 if p1 - p0 > SEG:
-                    acc = _sum_entries(Interm, InvData, tl.maximum(p0, lo), tl.minimum(p1, b1), D, BLOCK_K)
+                    acc = _sum_entries(
+                        Interm, InvData, ent_base, tl.maximum(p0, lo), tl.minimum(p1, b1), D, BLOCK_K
+                    )
                     if (p0 >= b0) & (p1 <= b1):
                         a_ptr = Acc + r.to(tl.int64) * stride_acc + offs_d
                         tl.store(a_ptr, tl.load(a_ptr) + acc)
@@ -106,12 +110,34 @@ def _dkv_gather_main(
 
 
 @triton.jit
+def _chunk_keys_kernel(Idx, Keys, n, chunk_entries, num_kv, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    r = tl.load(Idx + offs, mask=m, other=-1)
+    key = tl.where(r >= 0, r + (offs // chunk_entries) * num_kv, -1)
+    tl.store(Keys + offs, key.to(Keys.dtype.element_ty), mask=m)
+
+
+def chunk_keys(topk_indices, num_kv, chunk, dtype, block=1024):
+    """Flat sort keys of a ``[tokens, topk]`` map: ``c * num_kv + row`` for a valid entry of
+    token chunk ``c`` (``chunk`` tokens each), -1 for an invalid one."""
+    n = topk_indices.numel()
+    keys = torch.empty(n, dtype=dtype, device=topk_indices.device)
+    if n:
+        _chunk_keys_kernel[(triton.cdiv(n, block),)](
+            topk_indices, keys, n, chunk * topk_indices.shape[1], num_kv, BLOCK=block
+        )
+    return keys
+
+
+@triton.jit
 def _dkv_gather_fixup(Acc, Side, InvPtr, stride_acc, D: tl.constexpr, SEG: tl.constexpr):
     r = tl.program_id(0)
+    base = tl.load(InvPtr)
     p0 = tl.load(InvPtr + r)
     p1 = tl.load(InvPtr + r + 1)
-    bf = p0 // SEG
-    bl = (p1 - 1) // SEG
+    bf = (p0 - base) // SEG
+    bl = (p1 - 1 - base) // SEG
     if (p1 - p0 > SEG) & (bl > bf):
         offs_d = tl.arange(0, D)
         a_ptr = Acc + r.to(tl.int64) * stride_acc + offs_d
@@ -121,11 +147,30 @@ def _dkv_gather_fixup(Acc, Side, InvPtr, stride_acc, D: tl.constexpr, SEG: tl.co
         tl.store(a_ptr, a)
 
 
-def dkv_gather_acc(interm, keys, inv_ptr, inv_data, acc, d=512, seg=256, row_bk=32, block_k=32, num_warps=4):
+def dkv_gather_acc(
+    interm,
+    keys,
+    inv_ptr,
+    inv_data,
+    acc,
+    d=512,
+    seg=256,
+    row_bk=32,
+    block_k=32,
+    num_warps=4,
+    num_kv=None,
+    max_entries=None,
+    row_base=0,
+    ent_base=0,
+):
     """``acc[k, :d] += sum of interm rows listed for kv row k`` (CSR from a stable sort: ``keys``
-    are the sorted kv rows, ``inv_ptr`` the row pointers, ``inv_data`` the interm rows)."""
-    E = inv_data.numel()
-    num_kv = inv_ptr.numel() - 1
+    are the sorted kv rows, ``inv_ptr`` the row pointers, ``inv_data`` the interm rows).
+
+    A slice of a larger CSR works without a host sync: pass ``inv_ptr`` starting at this call's
+    first row, ``num_kv`` rows, ``max_entries`` >= its entry count, and the ``row_base`` /
+    ``ent_base`` its keys / interm rows are offset by."""
+    num_kv = inv_ptr.numel() - 1 if num_kv is None else num_kv
+    E = inv_data.numel() if max_entries is None else max_entries
     if E == 0 or num_kv == 0:
         return
     nb = triton.cdiv(E, seg)
@@ -137,8 +182,9 @@ def dkv_gather_acc(interm, keys, inv_ptr, inv_data, acc, d=512, seg=256, row_bk=
         inv_data,
         acc,
         side,
-        E,
         num_kv,
+        row_base,
+        ent_base,
         acc.stride(0),
         D=d,
         SEG=seg,

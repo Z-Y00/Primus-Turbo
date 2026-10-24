@@ -11,7 +11,7 @@
 # not the MIT license that covers the rest of Primus-Turbo (see LICENSE).
 ###############################################################################
 
-"""Register-level primitives shared by the gfx1250 (wave32, WMMA) attention kernels.
+"""Register-level primitives shared by the gfx1250 (wave32, WMMA) sparse-MLA kernels.
 
 Measured fragment layout of ``v_wmma_f32_16x16x32_bf16`` (D = A @ B, A is 16x32, B is 32x16),
 with ``l16 = lane % 16`` and ``hi = lane // 16``:

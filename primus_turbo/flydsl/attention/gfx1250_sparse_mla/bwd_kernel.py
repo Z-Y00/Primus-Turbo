@@ -54,7 +54,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from primus_turbo.flydsl.attention.sparse_mla_fwd_gfx1250 import (
+from .fwd_kernel import (
     COMPILE_HINTS,
     DQK,
     DV,
@@ -62,7 +62,7 @@ from primus_turbo.flydsl.attention.sparse_mla_fwd_gfx1250 import (
     _sbuf_load_v8i32,
     _tdm_gather,
 )
-from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
+from .helper import (
     CPOL_NT,
     LOG2E,
     WAVE,
@@ -1546,7 +1546,22 @@ def _inverted_topk(topk_indices, num_kv):
     keys, inv_data = torch.sort(flat, stable=True)
     bounds = torch.arange(num_kv + 1, device=keys.device, dtype=keys.dtype)
     inv_ptr = torch.searchsorted(keys, bounds, out_int32=True)
-    return keys, inv_ptr, inv_data.to(torch.int32)
+    return keys, inv_ptr, inv_data
+
+
+def _inverted_topk_chunks(topk_indices, num_kv, chunk):
+    """``_inverted_topk`` of every ``chunk``-token slice from one sort: the key of a valid entry
+    is ``c * num_kv + kv row`` for its chunk ``c``, so chunk ``c``'s rows are
+    ``inv_ptr[c * num_kv : (c + 1) * num_kv + 1]`` (in the same stable order as a per-chunk sort)
+    and ``inv_data`` holds flat ``(tok, slot)`` indices of the whole map."""
+    from primus_turbo.triton.attention.sparse_mla_dkv_gather import chunk_keys
+
+    n_chunks = -(-topk_indices.shape[0] // chunk)
+    dt = torch.int16 if n_chunks * num_kv < torch.iinfo(torch.int16).max else torch.int32
+    keys, inv_data = torch.sort(chunk_keys(topk_indices, num_kv, chunk, dt), stable=True)
+    bounds = torch.arange(n_chunks * num_kv + 1, device=keys.device, dtype=keys.dtype)
+    inv_ptr = torch.searchsorted(keys, bounds, out_int32=True)
+    return keys, inv_ptr, inv_data
 
 
 def sparse_mla_bwd_gfx1250(
@@ -1649,6 +1664,13 @@ def sparse_mla_bwd_gfx1250(
             run = build_sparse_mla_bwd_gfx1250(H, topk, float(scale))
         main = torch.cuda.current_stream(q.device) if stream is None else stream
         side = _side_stream(q.device)
+        # The main kernel holds every CU, so side-stream work is not free: when the chunk keys fit
+        # int16, one sort for all chunks costs about half of the per-chunk sorts.
+        joint = 1 < n_chunks and n_chunks * num_kv < torch.iinfo(torch.int16).max
+        if joint:
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                keys, inv_ptr_all, inv_data = _inverted_topk_chunks(topk_indices, num_kv, chunk)
         freed = [None] * len(interms)
         for c, t0 in enumerate(range(0, T_, chunk)):
             t1 = min(t0 + chunk, T_)
@@ -1661,8 +1683,23 @@ def sparse_mla_bwd_gfx1250(
             run(*args, *((ntile[t0:t1],) if w1 else ()), stream=main)
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                keys, inv_ptr, inv_data = _inverted_topk(idx, num_kv)
-                dkv_gather_acc(im, keys, inv_ptr, inv_data, dkv_acc, d=DV, seg=_GATHER_SEG)
+                if joint:
+                    dkv_gather_acc(
+                        im,
+                        keys,
+                        inv_ptr_all[c * num_kv :],
+                        inv_data,
+                        dkv_acc,
+                        d=DV,
+                        seg=_GATHER_SEG,
+                        num_kv=num_kv,
+                        max_entries=(t1 - t0) * topk,
+                        row_base=c * num_kv,
+                        ent_base=t0 * topk,
+                    )
+                else:
+                    keys, inv_ptr, inv_data = _inverted_topk(idx, num_kv)
+                    dkv_gather_acc(im, keys, inv_ptr, inv_data, dkv_acc, d=DV, seg=_GATHER_SEG)
                 freed[b] = torch.cuda.Event()
                 freed[b].record(side)
         main.wait_stream(side)

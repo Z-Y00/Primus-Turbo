@@ -49,7 +49,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
-from primus_turbo.flydsl.utils.attn_helper_gfx1250 import (
+from .helper import (
     LN2,
     LOG2E,
     WAVE,
@@ -91,6 +91,7 @@ _RESCALE_LOG2 = 8.0  # cr4 path: lag of the running max (log2 units) before O is
 # TDM group-1 dword 0: 2-byte elements, pad 4 dwords after every 256 (one 512-elem row)
 _TDM_G1_CFG = (1 << 16) | (1 << 20) | (7 << 22) | (3 << 25)
 ROW = DV * 2 + 16  # LDS row pitch (bytes) the padding above produces
+_PF_L2 = (2 << 3) | 1  # global_prefetch cache policy: SCOPE_DEV (L2, not the WGP cache), non-speculative
 
 
 def _v_i32(vals):
@@ -162,6 +163,16 @@ def _highest_lane_p1(pred):
     return fx.Int32(32) - lz
 
 
+def _l2_prefetch(base, nbytes, tid, block):
+    """Prefetch ``nbytes`` at ``base`` into L2 (SCOPE_DEV, non-speculative), one 128 B line per
+    lane per instruction."""
+    for k in range_constexpr(-(-nbytes // (block * 128))):
+        off = (tid + k * block) * 128
+        off = fx.Int32((off < fx.Int32(nbytes)).select(off, fx.Int32(nbytes - 128)))
+        ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), _raw(base + fx.Int64(off))).result
+        llvm.call_intrinsic(None, "llvm.amdgcn.global.prefetch", [ptr, _raw(fx.Int32(_PF_L2))], [], [])
+
+
 def _sbuf_load_v8i32(rsrc, byte_off):
     """Eight consecutive i32 of a buffer into SGPRs (the TDM index operands must be scalar)."""
     rsrc = rsrc if isinstance(rsrc, ir.Value) else rsrc.result
@@ -196,13 +207,24 @@ def _default_config(num_heads, topk):
 
 @functools.lru_cache(maxsize=64)
 def build_sparse_mla_fwd_gfx1250(
-    num_heads, topk, scale, has_sink, idx16=False, hpw=None, waves=None, block_k=None, persist=None
+    num_heads,
+    topk,
+    scale,
+    has_sink,
+    idx16=False,
+    hpw=None,
+    waves=None,
+    block_k=None,
+    persist=None,
+    l2_prefetch=True,
 ):
     """Launcher for fixed (H, topk, scale, sink); see ``sparse_mla_fwd_gfx1250``.
 
     ``idx16`` packs 16-bit row indices (16 rows per TDM op); only valid when NKV <= 65536.
     ``persist`` (default: at most ``_PERSIST_MAX_TILES`` kv tiles per token) loops each
-    workgroup over tokens; otherwise one token per workgroup.
+    workgroup over tokens; otherwise one token per workgroup, which after its last tile
+    prefetches into L2 (``l2_prefetch``) the q rows and indices of the token that takes over its
+    slot next. Only at one workgroup per CU: with two, the sibling already hides the prologue.
     """
     H = num_heads
     d_hpw, d_waves, d_bk = _default_config(H, topk)
@@ -524,6 +546,13 @@ def build_sparse_mla_fwd_gfx1250(
 
             m, l, o, p = unpack_state(st)  # noqa: E741
             nxt = None
+            if const_expr(not persist and l2_prefetch and WAVES == 4):
+                # Tokens launch last first and NPROG workgroups fill the GPU: token tok - NPROG
+                # takes over this slot next. Warm L2 with its q rows and indices.
+                nx = tok - NPROG
+                nx = fx.Int32((nx >= fx.Int32(0)).select(nx, tok))
+                _l2_prefetch(tensor_addr(Q) + fx.Int64(nx) * (H * DQK * 2), H * DQK * 2, tid, BLOCK)
+                _l2_prefetch(tensor_addr(TOPK) + fx.Int64(nx) * (topk * 4), topk * 4, tid, BLOCK)
             if const_expr(persist):
                 # Every wave is past tile NT-2, whose buffer takes the next token's tile 1; the next
                 # token's q loads into fresh registers (this token's q is dead) under the last P*V.
@@ -587,19 +616,33 @@ def build_sparse_mla_fwd_gfx1250(
         n_tok: fx.Int32,
         NKV: fx.Int32,
         n_prog: fx.Int32,
+        n_grid: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         sparse_mla_fwd_gfx1250_kernel(
             Q, KV, TOPK, SINK, O, LSE, NKV, n_tok, n_prog, value_attrs={"rocdl.waves_per_eu": 1}
-        ).launch(grid=(fx.Index(n_prog), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
+        ).launch(grid=(fx.Index(n_grid), H // HB, 1), block=(BLOCK, 1, 1), stream=stream)
 
     compiled = {}
 
     def run(q, kv, topk_indices, sink, o, lse, stream=None):
         n_tok = int(q.shape[0])
-        # One wave per SIMD: 4 // WAVES workgroups per CU, each looping over its tokens.
-        n_prog = min(n_tok, _num_cus(q.device) * (4 // WAVES)) if persist else n_tok
-        args = (q, kv, topk_indices, o if sink is None else sink, o, lse, n_tok, int(kv.shape[0]), n_prog)
+        # One wave per SIMD: 4 // WAVES workgroups per CU (persistent: each loops over its tokens;
+        # otherwise the L2 prefetch distance).
+        n_prog = min(n_tok, _num_cus(q.device) * (4 // WAVES))
+        n_grid = n_prog if persist else n_tok
+        args = (
+            q,
+            kv,
+            topk_indices,
+            o if sink is None else sink,
+            o,
+            lse,
+            n_tok,
+            int(kv.shape[0]),
+            n_prog,
+            n_grid,
+        )
         fn = compiled.get("fn")
         if fn is None:
             fn = flyc.compile[COMPILE_HINTS](launch_sparse_mla_fwd_gfx1250, *args, fx.Stream(stream))
