@@ -926,7 +926,7 @@ def build_sparse_mla_bwd_gfx1250_swa(
     pool_cr=0,
     pool_la=2,
     bf_hold=True,
-    batch=0,
+    batch=None,
 ):
     """cr0 backward (pure SWA, top-k = the 128-row window ``[t-127, t]`` in slot order).
 
@@ -942,7 +942,10 @@ def build_sparse_mla_bwd_gfx1250_swa(
     so their K / K^T fragments come from global memory (``KVT`` is the pool's K^T); pool dS / P
     take the window P tile's LDS once the window C^T is done, pool C^T accumulates over the block
     in VGPRs (one ``[NPP, 512]`` partial per workgroup in ``PPART``) and dQ runs over the window
-    and pool slots in one pass."""
+    and pool slots in one pass.
+
+    ``batch`` (see ``_run_steps``): 4 without a pool (cr0 -5..-6%); 0 (the ``prefetch`` / ``pin``
+    stream) with one, where batching is 18-36% slower at 4K."""
     H, HW, W, BT = num_heads, _SWA_HW, _SWA_W, block_t
     if H % HW:
         raise ValueError(f"SWA backward needs num_heads % {HW} == 0, got {H}")
@@ -981,6 +984,8 @@ def build_sparse_mla_bwd_gfx1250_swa(
     # The pool accumulators take ~128 VGPRs: shallower prefetch.
     if prefetch is None:
         prefetch = 3 if POOL else 4
+    if batch is None:
+        batch = 0 if POOL else 4
     NPP = -(-pool_p // 32) * 32  # pool slots processed (dQ steps of 32)
     NPT = NPP // 16
     KTWP = NPT // DS

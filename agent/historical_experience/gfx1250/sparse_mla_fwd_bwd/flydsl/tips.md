@@ -332,3 +332,7 @@
 ## Round 67 — ACCEPTED: the same operand batching in the backward main kernel
 - Batch 4 steps (backward steps load 1-5 fragments each, so its batches are smaller than the forward's 8): bwd -6% at pro cr4 4K, bit-exact, and 48 fewer VGPRs than the prefetch-8 stream. Batch 8 spills.
 - Takeaway: pick the batch by fragments per batch, not steps; screen a range interleaved (3..6 were within noise) and prefer the one with the lowest VGPR count.
+
+## Rounds 68-69 — ACCEPTED: batching in the cr0 / cr128 window kernels; not with global-memory operands
+- Window forward: batch 6, -5..-7%; cr0 window backward: batch 4, -4..-5%; all bit-exact, no spills.
+- cr128 backward (pool K / K^T fragments read from global memory, not LDS) got 18-36% slower with batching: grouping long-latency VMEM loads into batches exposes their latency, which the per-step stream hid. Gate batching to LDS-fed loops; screen each kernel separately.
