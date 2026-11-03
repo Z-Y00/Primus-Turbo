@@ -33,19 +33,74 @@ the softmax denominator.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr
+from flydsl._mlir.extras import types as T
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.flex_attention.block_info import BlockInfo
 from primus_turbo.flydsl.flex_attention.block_sparsity import broadcast_heads, subtile_factors
 from primus_turbo.flydsl.flex_attention.combine import flash_attn_combine
+from primus_turbo.flydsl.flex_attention.fp8 import dequantize_fp8, to_native_fp8
 from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LOG2E, Softmax
 
 MFMA_M = 32
-K_STEP = 8  # MFMA 32x32x8: four elements per lane per operand
 MAX_AUX_TENSORS = 4
+FP8_DTYPES = ("fp8_e4m3", "fp8_e5m2")
+
+
+def _k_step(dtype: str) -> int:
+    """MFMA reduction depth: 32x32x8 for 16-bit inputs, 32x32x16 for fp8."""
+    return 16 if dtype in FP8_DTYPES else 8
+
+
+def _elem_type(dtype: str, fp8_ocp: bool):
+    if dtype == "bf16":
+        return fx.BFloat16
+    if dtype == "fp16":
+        return fx.Float16
+    if dtype == "fp8_e4m3":
+        return fx.Float8E4M3FN if fp8_ocp else fx.Float8E4M3FNUZ
+    return fx.Float8E5M2 if fp8_ocp else fx.Float8E5M2FNUZ
+
+
+def _arch_has_ocp_fp8() -> bool:
+    import torch
+
+    return "gfx95" in torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+
+
+def _fp8_v_row(r):
+    """LDS row of V-tile row ``r`` for fp8: swap bits 2 and 3 within each 16 keys.
+
+    A lane's fp8 B fragment holds 8 consecutive k (``8 * (lane // 32) + i``), but its
+    probabilities sit in accumulator rows ``4 * (lane // 32) + {0..3}`` and
+    ``8 + 4 * (lane // 32) + {0..3}``. Permuting V's keys the same way lets P feed the
+    PV product unchanged.
+    """
+    return r + fx.Int32(4) * ((r // fx.Int32(4)) % fx.Int32(2) - (r // fx.Int32(8)) % fx.Int32(2))
+
+
+def _to_elem(values, elem, dtype: str):
+    """fp32 values -> a vector of ``elem``. fp8 goes through the packed hardware
+    conversion (arch-native format; plain ``truncf`` to fp8 has no lowering)."""
+    if dtype not in FP8_DTYPES:
+        return Vec.from_elements(values, fx.Float32).to(elem)
+    cvt = rocdl.cvt_pk_bf8_f32 if dtype == "fp8_e5m2" else rocdl.cvt_pk_fp8_f32
+    words = []
+    for w in range(len(values) // 4):
+        lo = cvt(T.i32(), values[4 * w], values[4 * w + 1], fx.Int32(0), False)
+        words.append(cvt(T.i32(), values[4 * w + 2], values[4 * w + 3], lo, True))
+    return Vec.from_elements(words, fx.Int32).bitcast(elem)
+
+
+def _descales(fp8, q_descale, k_descale, v_descale, batch, kv_head):
+    """``(q * k descale, v descale)`` for this (batch, kv head), FA3/FA4 semantics."""
+    if not fp8:
+        return None, None
+    at = lambda t: fx.Float32(fx.slice(fx.rocdl.make_buffer_tensor(t), (batch, None))[kv_head])  # noqa: E731
+    return at(q_descale) * at(k_descale), at(v_descale)
 
 
 def _min(a, b):
@@ -92,12 +147,25 @@ class FlashAttentionForward:
         sparse_block_size: tuple | None = None,
         paged_kv: bool = False,
         split_kv: bool = False,
+        fp8_ocp: bool | None = None,
     ):
-        if dtype not in ("bf16", "fp16"):
-            raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
+        if dtype not in ("bf16", "fp16") + FP8_DTYPES:
+            raise ValueError(f"dtype must be bf16, fp16, fp8_e4m3 or fp8_e5m2, got {dtype}")
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        if head_dim % K_STEP or head_dim_v % MFMA_M:
-            raise ValueError(f"need head_dim % {K_STEP} == 0 and head_dim_v % {MFMA_M} == 0")
+        k_step = _k_step(dtype)
+        if head_dim % k_step or head_dim_v % MFMA_M:
+            raise ValueError(f"need head_dim % {k_step} == 0 and head_dim_v % {MFMA_M} == 0")
+        # FP8 runs natively in the GPU's format: FNUZ on gfx942, OCP on gfx950.
+        self.fp8_ocp = _arch_has_ocp_fp8() if dtype in FP8_DTYPES and fp8_ocp is None else bool(fp8_ocp)
+        self.input_dtype = dtype
+        # FlyDSL 0.3.4.1 has no e5m2 FNUZ type, so on gfx942 e5m2 inputs are dequantized
+        # (exactly; only the descale multiply rounds) and run through the bf16 kernel.
+        self.dequant_e5m2 = dtype == "fp8_e5m2" and not self.fp8_ocp
+        if self.dequant_e5m2:
+            if paged_kv:
+                raise NotImplementedError("paged KV with fp8 e5m2 needs gfx950 (no e5m2 FNUZ in FlyDSL)")
+            dtype = "bf16"
+        self.fp8 = dtype in FP8_DTYPES
         if tile_n % MFMA_M:
             raise ValueError(f"tile_n must be a multiple of {MFMA_M}")
         if is_causal and is_local:
@@ -134,8 +202,9 @@ class FlashAttentionForward:
         self.has_full_blocks = block_sparse and has_full_blocks
         self.sparse_block_size = sparse_block_size
         self.q_subtile, self.kv_subtile = subtile_factors(sparse_block_size, self.tile_m, tile_n)
+        pack = 16 if self.fp8 else 8
         for d in (head_dim, head_dim_v):
-            if (tile_n * d // 8) % self.num_threads:
+            if (tile_n * d // pack) % self.num_threads:
                 raise ValueError(f"KV tile {tile_n}x{d} does not split evenly over {self.num_threads} threads")
         self.launcher = self._build()
 
@@ -143,9 +212,14 @@ class FlashAttentionForward:
         D, DV, TN = self.head_dim, self.head_dim_v, self.tile_n
         NT, TM = self.num_threads, self.tile_m
         Q_PER_KV = self.qhead_per_kvhead
-        elem = fx.BFloat16 if self.dtype == "bf16" else fx.Float16
-        k_iters = TN * D // 8 // NT
-        v_iters = TN * DV // 8 // NT
+        fp8, dtype = self.fp8, self.dtype
+        elem = _elem_type(dtype, self.fp8_ocp)
+        KS = _k_step(self.dtype)  # reduction depth of one MFMA
+        KPL = KS // 2  # k per lane in an A / B fragment
+        PACK = 16 if fp8 else 8  # elements per 128-bit global / LDS access
+        out_elem = fx.BFloat16 if fp8 else elem
+        k_iters = TN * D // PACK // NT
+        v_iters = TN * DV // PACK // NT
         block_info = BlockInfo(TM, TN, self.is_causal, self.is_local)
         is_causal, is_local = self.is_causal, self.is_local
         varlen_q, varlen_k = self.varlen_q, self.varlen_k
@@ -155,7 +229,7 @@ class FlashAttentionForward:
         block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
         Q_SUB, KV_SUB = self.q_subtile, self.kv_subtile
         paged_kv, split_kv = self.paged_kv, self.split_kv
-        o_elem = fx.Float32 if split_kv else elem
+        o_elem = fx.Float32 if split_kv else out_elem
 
         @fx.struct
         class SharedStorage:
@@ -183,6 +257,9 @@ class FlashAttentionForward:
             FullCnt: fx.Tensor,
             FullIdx: fx.Tensor,
             PageTable: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
             page_size: fx.Int32,
             num_splits: fx.Int32,
             seqlen_q_static: fx.Int32,
@@ -200,11 +277,11 @@ class FlashAttentionForward:
             split_idx = fx.Int32(fx.block_idx.z) % num_splits
             kv_head = head // fx.Int32(Q_PER_KV)
 
-            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, K_STEP, elem))
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, KS, elem))
             tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
             thr_mma = tiled_mma.get_slice(lane)
             # Coordinate views: an element's value is its own (row, col) index.
-            b_coords = thr_mma.partition_B(fx.make_view(0, fx.make_layout((MFMA_M, K_STEP), (1, MFMA_M))))
+            b_coords = thr_mma.partition_B(fx.make_view(0, fx.make_layout((MFMA_M, KS), (1, MFMA_M))))
             c_rows = thr_mma.partition_C(fx.make_view(0, fx.make_layout((MFMA_M, MFMA_M), (1, 0))))
             c_cols = thr_mma.partition_C(fx.make_view(0, fx.make_layout((MFMA_M, MFMA_M), (0, 1))))
 
@@ -216,13 +293,18 @@ class FlashAttentionForward:
 
             copy_g128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem)
             copy_g64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
-            # Split-KV partial outputs are fp32: four elements are 128 bits.
-            copy_o = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32) if split_kv else copy_g64
+            # Four output elements per store: 16-bit O, or the fp32 split-KV partial O.
+            copy_o = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b() if split_kv else fx.rocdl.BufferCopy64b(), o_elem
+            )
             copy_s128 = fx.make_copy_atom(fx.UniversalCopy128b(), elem)
             copy_s64 = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
-            copy_s16 = fx.make_copy_atom(fx.UniversalCopy16b(), elem)
+            # V^T reads are one element each (strided by DV in LDS).
+            copy_s1 = fx.make_copy_atom(fx.UniversalCopy8b() if fp8 else fx.UniversalCopy16b(), elem)
             copy_k = fx.make_tiled_copy_A(copy_s64, tiled_mma).get_slice(lane)
-            copy_vt = fx.make_tiled_copy_A(copy_s16, tiled_mma).get_slice(lane)
+            copy_vt = fx.make_tiled_copy_A(copy_s1, tiled_mma).get_slice(lane)
+            qk_descale, v_descale = _descales(fp8, QDescale, KDescale, VDescale, batch, kv_head)
+            score_scale = softmax_scale * qk_descale if fp8 else softmax_scale
 
             q_t = fx.rocdl.make_buffer_tensor(Q)
             k_t = fx.rocdl.make_buffer_tensor(K)
@@ -231,11 +313,11 @@ class FlashAttentionForward:
             lse_t = fx.rocdl.make_buffer_tensor(LSE)
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, K_STEP))
-            k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(8, 1))
+            k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, KS))
+            k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(PACK, 1))
             # V^T view of the row-major [TN, DV] V tile: (d, key) with strides (1, DV).
-            vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, K_STEP))
-            v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(8, 1))
+            vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, KS))
+            v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(PACK, 1))
 
             seqlen = SeqlenInfo.create(
                 batch,
@@ -283,18 +365,20 @@ class FlashAttentionForward:
                 last_key = seqlen.seqlen_k - fx.Int32(1)
                 for it in range_constexpr(k_iters):
                     linear = fx.Int32(it * NT) + tid
-                    key = _min(kv_base + linear // fx.Int32(D // 8), last_key)
-                    src = fx.logical_divide(kv_side_row(k_t, key), fx.make_layout(8, 1))
-                    reg = fx.make_rmem_tensor(8, elem)
-                    fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // 8))), reg)
+                    key = _min(kv_base + linear // fx.Int32(D // PACK), last_key)
+                    src = fx.logical_divide(kv_side_row(k_t, key), fx.make_layout(PACK, 1))
+                    reg = fx.make_rmem_tensor(PACK, elem)
+                    fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // PACK))), reg)
                     fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, linear)))
                 for it in range_constexpr(v_iters):
                     linear = fx.Int32(it * NT) + tid
-                    key = _min(kv_base + linear // fx.Int32(DV // 8), last_key)
-                    src = fx.logical_divide(kv_side_row(v_t, key), fx.make_layout(8, 1))
-                    reg = fx.make_rmem_tensor(8, elem)
-                    fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(DV // 8))), reg)
-                    fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, linear)))
+                    row, col = linear // fx.Int32(DV // PACK), linear % fx.Int32(DV // PACK)
+                    key = _min(kv_base + row, last_key)
+                    src = fx.logical_divide(kv_side_row(v_t, key), fx.make_layout(PACK, 1))
+                    reg = fx.make_rmem_tensor(PACK, elem)
+                    fx.copy(copy_g128, fx.slice(src, (None, col)), reg)
+                    lds_row = _fp8_v_row(row) if fp8 else row
+                    fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, lds_row * fx.Int32(DV // PACK) + col)))
 
             def sparse_n_block(idx_row, j):
                 """Kernel tile of the ``j``-th entry of a block list, sparse blocks split in KV_SUB."""
@@ -310,7 +394,7 @@ class FlashAttentionForward:
                 scores, keep = [], []
                 for half in range_constexpr(TN // MFMA_M):
                     acc = zero16
-                    for ks in range_constexpr(D // K_STEP):
+                    for ks in range_constexpr(D // KS):
                         tile = fx.slice(k_lds_tiles, (None, None, half, ks))
                         a_frag = thr_mma.make_fragment_A(tile)
                         fx.copy(copy_s64, copy_k.partition_S(tile), copy_k.retile(a_frag))
@@ -318,7 +402,7 @@ class FlashAttentionForward:
                     acc = Vec(acc)
                     for j in range_constexpr(16):
                         kv_pos = kv_base + fx.Int32(half * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[j]))
-                        score = _apply_score_mod(score_mod, acc[j] * softmax_scale, batch, head, q_pos, kv_pos, mask)
+                        score = _apply_score_mod(score_mod, acc[j] * score_scale, batch, head, q_pos, kv_pos, mask)
                         scores.append(score * fx.Float32(LOG2E))
                         keep.append(mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod))
 
@@ -326,14 +410,16 @@ class FlashAttentionForward:
                 rescale_vec = Vec.from_elements([rescale], fx.Float32).broadcast_to(16)
                 o_acc = [Vec(o) * rescale_vec for o in o_acc]
                 for half in range_constexpr(TN // MFMA_M):
-                    for g in range_constexpr(MFMA_M // K_STEP):
-                        first = half * 16 + 4 * g
+                    for g in range_constexpr(MFMA_M // KS):
+                        # Accumulator groups of 4 in order; for fp8 two groups make one
+                        # fragment, matching V's permuted rows (``_fp8_v_row``).
+                        first = half * 16 + KPL * g
                         p_frag = fx.make_fragment_like(b_coords, elem)
-                        p_frag.store(Vec.from_elements(probs[first : first + 4], fx.Float32).to(elem))
+                        p_frag.store(_to_elem(probs[first : first + KPL], elem, dtype))
                         for c in range_constexpr(DV // MFMA_M):
-                            tile = fx.slice(vt_lds_tiles, (None, None, c, half * (MFMA_M // K_STEP) + g))
+                            tile = fx.slice(vt_lds_tiles, (None, None, c, half * (MFMA_M // KS) + g))
                             a_frag = thr_mma.make_fragment_A(tile)
-                            fx.copy(copy_s16, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
+                            fx.copy(copy_s1, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
                             o_acc[c] = mfma(a_frag, p_frag, o_acc[c])
                 return new_max, new_sum, o_acc
 
@@ -349,11 +435,11 @@ class FlashAttentionForward:
 
                 # ---- Q: B fragments for every reduction step, register-resident ----
                 q_k0 = fx.Int32(fx.get_scalar(b_coords[0])) // fx.Int32(MFMA_M)  # this lane's first k in a step
-                q_packs = fx.logical_divide(q_side_row(q_t, q_row, head), fx.make_layout(4, 1))
+                q_packs = fx.logical_divide(q_side_row(q_t, q_row, head), fx.make_layout(KPL, 1))
                 q_frags = []
-                for ks in range_constexpr(D // K_STEP):
-                    reg = fx.make_rmem_tensor(4, elem)
-                    fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * K_STEP) + q_k0) // fx.Int32(4))), reg)
+                for ks in range_constexpr(D // KS):
+                    reg = fx.make_rmem_tensor(KPL, elem)
+                    fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * KS) + q_k0) // fx.Int32(KPL))), reg)
                     frag = fx.make_fragment_like(b_coords, elem)
                     frag.store(Vec(reg.load()))
                     q_frags.append(frag)
@@ -394,7 +480,8 @@ class FlashAttentionForward:
                 inv_sum, lse = Softmax.finalize(
                     fx.Float32(results[0]), fx.Float32(results[1]), _sink_log2(has_sink, Sink, head)
                 )
-                inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
+                o_scale = inv_sum * v_descale if fp8 else inv_sum
+                inv_vec = Vec.from_elements([o_scale], fx.Float32).broadcast_to(16)
                 if q_pos < seqlen.seqlen_q:
                     o_packs = fx.logical_divide(out_row(q_row), fx.make_layout(4, 1))
                     for c in range_constexpr(DV // MFMA_M):
@@ -429,6 +516,9 @@ class FlashAttentionForward:
             FullCnt: fx.Tensor,
             FullIdx: fx.Tensor,
             PageTable: fx.Tensor,
+            QDescale: fx.Tensor,
+            KDescale: fx.Tensor,
+            VDescale: fx.Tensor,
             page_size: fx.Int32,
             num_splits: fx.Int32,
             seqlen_q_static: fx.Int32,
@@ -443,7 +533,7 @@ class FlashAttentionForward:
         ):
             kernel(
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
-                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, page_size, num_splits,
+                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, QDescale, KDescale, VDescale, page_size, num_splits,
                 seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
             ).launch(grid=(num_m_blocks, num_heads, batch * num_splits), block=(NT, 1, 1), stream=stream)
 
@@ -469,6 +559,9 @@ class FlashAttentionForward:
         block_sparse_tensors=None,
         page_table=None,
         num_splits=1,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
         stream=None,
     ):
         """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
@@ -483,6 +576,16 @@ class FlashAttentionForward:
             raise ValueError("page_table does not match how this kernel was built")
         if num_splits != 1 and not self.split_kv:
             raise ValueError("num_splits > 1 needs a kernel built with split_kv=True")
+        descales = ()
+        out_dtype = torch.bfloat16 if self.fp8 or self.dequant_e5m2 else q.dtype  # FA4: fp8 writes bf16
+        if self.dequant_e5m2:
+            q, k, v = dequantize_fp8(
+                q, k, v, (q_descale, k_descale, v_descale), self.qhead_per_kvhead, cu_seqlens_q, cu_seqlens_k
+            )
+        elif self.fp8:
+            q, k, v, descales = to_native_fp8(q, k, v, (q_descale, k_descale, v_descale), self.dtype, self.fp8_ocp)
+        elif any(d is not None for d in (q_descale, k_descale, v_descale)):
+            raise ValueError("q/k/v_descale are for fp8 inputs")
         if (cu_seqlens_q is not None) != self.varlen_q or (cu_seqlens_k is not None) != self.varlen_k:
             raise ValueError("cu_seqlens_q / cu_seqlens_k do not match how this kernel was built")
         if (seqused_q is not None) != self.has_seqused_q or (seqused_k is not None) != self.has_seqused_k:
@@ -521,7 +624,7 @@ class FlashAttentionForward:
             out = torch.empty((num_splits, *out_shape), dtype=torch.float32, device=q.device)
             lse = torch.empty((num_splits, *lse_shape), dtype=torch.float32, device=q.device)
         if out is None:
-            out = torch.empty(out_shape, dtype=q.dtype, device=q.device)
+            out = torch.empty(out_shape, dtype=out_dtype, device=q.device)
         if lse is None:
             lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
         placeholder = lse
@@ -546,7 +649,8 @@ class FlashAttentionForward:
             *aux_slots,
             learnable_sink if learnable_sink is not None else placeholder,
             *sparse_slots,
-            page_table if page_table is not None else placeholder, page_size, int(num_splits),
+            page_table if page_table is not None else placeholder,
+            *(descales or (placeholder,) * 3), page_size, int(num_splits),
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
@@ -554,7 +658,7 @@ class FlashAttentionForward:
         if not self.split_kv:
             return out, lse
         # Partial LSE is [splits, *lse_shape]; combine takes FA4's [splits, ..., S, H].
-        out, lse_c = flash_attn_combine(out, lse.transpose(-1, -2), out=final_out, out_dtype=q.dtype)
+        out, lse_c = flash_attn_combine(out, lse.transpose(-1, -2), out=final_out, out_dtype=out_dtype)
         lse_c = lse_c.transpose(-1, -2)
         if final_lse is None:
             return out, lse_c.contiguous()
