@@ -1165,6 +1165,46 @@ def test_attention_fp8(batch, dtype, config, causal):
     assert value_grad_snr > 20, "value_grad_snr too low"
 
 
+@pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("return_lse", [False, True])
+def test_attention_fp8_strided_layout(qkv_format, causal, return_lse):
+    device = "cuda"
+    torch.manual_seed(1234)
+    batch, seqlen, num_head_q, num_head_kv, head_dim = 2, 1024, 16, 4, 128
+
+    def make(num_head):
+        # Logical [b, s, h, d] with qkv_format storage, as callers such as Megatron pass sbhd views.
+        if qkv_format == "sbhd":
+            t = torch.randn(seqlen, batch, num_head, head_dim, device=device).transpose(0, 1)
+        elif qkv_format == "bhsd":
+            t = torch.randn(batch, num_head, seqlen, head_dim, device=device).transpose(1, 2)
+        else:
+            t = torch.randn(batch, seqlen, num_head, head_dim, device=device)
+        return t.to(torch.bfloat16).requires_grad_()
+
+    query, key, value = make(num_head_q), make(num_head_kv), make(num_head_kv)
+    grad_out = torch.randn(batch, seqlen, num_head_q, head_dim, device=device, dtype=torch.bfloat16)
+    query_ref, key_ref, value_ref = (t.detach().contiguous().requires_grad_() for t in (query, key, value))
+
+    sm_scale = head_dim ** (-0.5)
+    o_ref = attention_vanilla_forward_pytorch_ref_impl(query_ref, key_ref, value_ref, sm_scale, causal)
+    o_ref.backward(grad_out)
+    o = flash_attn_fp8_func(query, key, value, softmax_scale=sm_scale, causal=causal, return_lse=return_lse)
+    if return_lse:
+        o, lse = o
+        assert lse.dtype == torch.float32 and lse.shape[:2] == (batch, num_head_q)
+    o.backward(grad_out)
+    torch.cuda.synchronize()
+
+    assert o.shape == o_ref.shape
+    assert _infer_qkv_format(o, o, o) == qkv_format
+    assert compute_snr(o_ref, o) > 20, "out_snr too low"
+    assert compute_snr(query_ref.grad, query.grad) > 20, "query_grad_snr too low"
+    assert compute_snr(key_ref.grad, key.grad) > 20, "key_grad_snr too low"
+    assert compute_snr(value_ref.grad, value.grad) > 20, "value_grad_snr too low"
+
+
 @pytest.mark.parametrize("batch", [4])
 @pytest.mark.parametrize("config", test_cases)
 @pytest.mark.parametrize("causal", [True, False])
@@ -1282,6 +1322,70 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
     assert dv_snr > 15, "value_grad_snr too low"
 
 
+@pytest.mark.skipif(not (torch.cuda.is_available() and is_gfx950()), reason="FlyDSL attention is gfx950-only")
+# Hq*D of 5*128 and 6*64 is 128 mod 256: one row of it only tiles a 16-thread reduce work-group.
+@pytest.mark.parametrize(
+    "head_dim,num_head_q,num_head_kv", [(64, 8, 1), (128, 8, 1), (64, 6, 6), (128, 5, 5)]
+)
+# The dQ reduce folds q rows in pairs sharing one band range: an odd Sq makes a pair straddle
+# two batches (B*Sq odd asserted, otherwise it read unwritten rows) and an odd causal offset
+# hands the second row a band the first lacks (it lost its diagonal term). Full causal only: a
+# window whose offset is off the 64-row grid is a separate, known backward issue.
+@pytest.mark.parametrize(
+    "batch,seqlen_q,seqlen_kv", [(1, 1001, 1001), (2, 1001, 1001), (2, 1023, 1024), (2, 1022, 1025)]
+)
+def test_flydsl_attention_backward_odd_rows(batch, seqlen_q, seqlen_kv, head_dim, num_head_q, num_head_kv):
+    """dQ against an fp32 backward from the kernel's own O and LSE, row by row: a lost
+    diagonal band costs a row 0.1-0.7 of the median row norm but the tensor only ~4 dB of SNR."""
+    device = "cuda"
+    torch.manual_seed(42)
+    group = num_head_q // num_head_kv
+    scale = head_dim ** (-0.5)
+    # sbhd storage, handed to the op as its [b, s, h, d] view
+    query = torch.randn((seqlen_q, batch, num_head_q, head_dim), device=device, dtype=torch.bfloat16)
+    key = torch.randn((seqlen_kv, batch, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    value = torch.randn((seqlen_kv, batch, num_head_kv, head_dim), device=device, dtype=torch.bfloat16)
+    grad_out = torch.randn((seqlen_q, batch, num_head_q, head_dim), device=device, dtype=torch.bfloat16)
+    query.requires_grad_()
+
+    GlobalBackendManager.set_attn_backend(BackendType.FLYDSL, PrecisionType.BF16_FP16_FP32)
+    try:
+        out, lse = flash_attn_func(
+            query.permute(1, 0, 2, 3),
+            key.permute(1, 0, 2, 3),
+            value.permute(1, 0, 2, 3),
+            softmax_scale=scale,
+            causal=True,
+            return_lse=True,
+        )
+    finally:
+        GlobalBackendManager.set_attn_backend(None, PrecisionType.BF16_FP16_FP32)
+    out.backward(grad_out.permute(1, 0, 2, 3))
+
+    # [B, H, S, D]; bottom-right causal: row i sees keys j <= i + (Skv - Sq).
+    qh = query.detach().float().permute(1, 2, 0, 3)
+    kh = key.float().permute(1, 2, 0, 3).repeat_interleave(group, 1)
+    vh = value.float().permute(1, 2, 0, 3).repeat_interleave(group, 1)
+    oh = out.detach().float().permute(0, 2, 1, 3)
+    doh = grad_out.float().permute(1, 2, 0, 3)
+    i = torch.arange(seqlen_q, device=device)[:, None] + (seqlen_kv - seqlen_q)
+    j = torch.arange(seqlen_kv, device=device)[None, :]
+    p = torch.exp(qh @ kh.transpose(-1, -2) * scale - lse.float()[..., None]).masked_fill(j > i, 0.0)
+    ds = p * (doh @ vh.transpose(-1, -2) - (doh * oh).sum(-1, keepdim=True))
+    dq_ref = ds @ kh * scale
+    dq = query.grad.float().permute(1, 2, 0, 3)
+
+    assert torch.isfinite(dq).all(), "non-finite dq"
+    # Normalised by the median row. A row seeing only a few keys has near-zero dQ and carries the
+    # kernel's bf16-rounded scaled-Q floor at up to ~0.08 of that, so the bound starts at 64 keys,
+    # where the fixed kernel stays under 0.035 and a lost band shows 0.12 or more.
+    keys_seen = torch.arange(seqlen_q, device=device) + (seqlen_kv - seqlen_q) + 1
+    row_err = (dq - dq_ref).norm(dim=-1) / dq_ref.norm(dim=-1).median()
+    row_err = torch.where(keys_seen >= 64, row_err, torch.zeros_like(row_err))
+    worst = tuple(int(x) for x in torch.unravel_index(row_err.argmax(), row_err.shape))
+    assert row_err.max() < 6e-2, f"dq row err {row_err.max():.4g} at (b, h, q) {worst}"
+
+
 @pytest.mark.parametrize("qkv_format", ["bshd", "sbhd", "bhsd"])
 def test_attention_fake_kernel_strides(qkv_format):
     """Verify that torch.compile sees correct output strides for every qkv_format.
@@ -1325,7 +1429,7 @@ def test_attention_fake_kernel_strides(qkv_format):
 
 
 # ============================================================================
-# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X).
+# DeepSeek-V4 single-latent sparse-MLA attention (flydsl, gfx950/MI355X and gfx1250/MI455X).
 # ============================================================================
 
 # Fixed dims: kv_lora_rank (single latent, K == V) + rope pad; SWA local window.
@@ -1383,7 +1487,8 @@ def _build_sparse_mla(cr, num_heads, seqlen, pool, topk_pool, seed=0):
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and is_gfx950()), reason="sparse-MLA (flydsl) is gfx950-only"
+    not (torch.cuda.is_available() and (is_gfx950() or is_gfx1250())),
+    reason="sparse-MLA (flydsl) is gfx950 / gfx1250 only",
 )
 @pytest.mark.parametrize("seqlen", [512, 1024, 2048])
 @pytest.mark.parametrize("variant", ["flash", "pro"])

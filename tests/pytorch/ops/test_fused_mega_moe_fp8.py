@@ -59,6 +59,9 @@ from primus_turbo.flydsl.mega.fp8.symm_buffer import (  # noqa: E402
 from primus_turbo.pytorch.kernels.fused_mega_moe import (  # noqa: E402
     advance_weight_generation,
 )
+from primus_turbo.pytorch.kernels.fused_mega_moe.mega_moe_fp8_weights import (  # noqa: E402
+    fp8_padded_dims,
+)
 from primus_turbo.pytorch.ops.moe.fused_mega_moe import GLUActivation  # noqa: E402
 from primus_turbo.pytorch.ops.moe.fused_mega_moe_fp8 import (  # noqa: E402
     fused_mega_moe_fp8_stage1,
@@ -89,9 +92,8 @@ skip_unless_mxfp8 = unittest.skipUnless(
 )
 
 
-@instantiate_parametrized_tests
-class FusedMegaMoEFp8Test(MultiProcContinuousTest):
-    """EP8 accuracy for the staged mxfp8 op vs turbo DeepEP; PG comes up once per class."""
+class _StagedFp8Harness:
+    """The staged mxfp8 op vs turbo DeepEP on one EP8 shape; shared by the test classes below."""
 
     @classmethod
     def backend_str(cls) -> str:
@@ -102,13 +104,183 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         return torch.device("cuda", self.rank)
 
     def _metrics(self, actual, ref):
-        """SNR (dB) and cosine vs ref, reduced MIN so the weakest rank governs the EP group."""
+        """SNR (dB) and cosine vs ref, reduced MIN so the weakest rank governs the EP group.
+
+        A rank whose experts received nothing has an all-zero reference wgrad, where SNR and cosine
+        are undefined; it must then be exactly zero too, and scores (inf, 1) or (-inf, 0)."""
+        if not bool((ref != 0).any()):
+            exact = not bool((actual != 0).any())
+            m = torch.tensor([float("inf") if exact else float("-inf"), float(exact)], device=self.device)
+            dist.all_reduce(m, op=dist.ReduceOp.MIN)
+            return float(m[0]), float(m[1])
         cos = torch.nn.functional.cosine_similarity(
             actual.float().flatten(), ref.float().flatten(), dim=0, eps=1e-12
         )
         m = torch.tensor([compute_snr(ref, actual), float(cos)], device=self.device)
         dist.all_reduce(m, op=dist.ReduceOp.MIN)
         return float(m[0]), float(m[1])
+
+    def _hot_rank0_routing(self, num_tokens, num_experts, num_topk, hot_topk):
+        """``hot_topk`` of every token's picks among rank 0's experts, the rest among the others'.
+
+        Weights are the routing softmax over all experts gathered at the picks, as ``generate_inputs``
+        draws them, so only the placement differs from the balanced tests."""
+        epr = num_experts // self.world_size
+        g = torch.Generator(device=self.device).manual_seed(5150 + self.rank)
+        hot = torch.rand(num_tokens, epr, generator=g, device=self.device).argsort(-1)[:, :hot_topk]
+        cold = torch.rand(num_tokens, num_experts - epr, generator=g, device=self.device).argsort(-1)
+        topk_idx = torch.cat([hot, epr + cold[:, : num_topk - hot_topk]], -1)
+        probs = torch.randn(num_tokens, num_experts, generator=g, device=self.device).softmax(-1)
+        return topk_idx.to(torch.int64), probs.gather(1, topk_idx).to(torch.float32)
+
+    def _staged_forward_backward(
+        self,
+        hidden,
+        inter,
+        num_experts,
+        num_topk,
+        num_tokens,
+        activation=None,
+        l1_gain=1.0,
+        hot_topk=None,
+        with_bias=False,
+    ):
+        torch.cuda.set_device(self.device)
+        torch.manual_seed(42 + self.rank)
+        group = dist.group.WORLD
+
+        x, l1_weight, l2_weight, topk_idx, topk_weight = generate_inputs(
+            self.rank,
+            self.world_size,
+            num_tokens=num_tokens,
+            hidden=hidden,
+            inter=inter,
+            num_experts=num_experts,
+            num_topk=num_topk,
+            device=self.device,
+            l1_gain=l1_gain,
+        )
+        if hot_topk is not None:
+            topk_idx, topk_weight = self._hot_rank0_routing(num_tokens, num_experts, num_topk, hot_topk)
+        fc1_bias = fc2_bias = None
+        if with_bias:
+            g = torch.Generator(device=self.device).manual_seed(4321 + self.rank)
+            epr = num_experts // self.world_size
+            fc1_bias = torch.randn((epr, 2 * inter), generator=g, device=self.device).bfloat16()
+            fc2_bias = torch.randn((epr, hidden), generator=g, device=self.device).bfloat16()
+        # the op runs an off-grid shape zero-padded, on a symm buffer of the padded dims
+        padded_hidden, padded_inter = fp8_padded_dims(hidden, inter)
+        symm = get_symm_buffer_for_mega_moe(
+            group,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=num_tokens,
+            num_topk=num_topk,
+            hidden=padded_hidden,
+            intermediate_hidden=padded_inter,
+            use_mxfp8=True,
+        )
+        try:
+            _gy = torch.randn(x.shape, device=x.device, dtype=torch.float32)
+            grad_y = (_gy / (_gy.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16()
+
+            # the shape Primus' MegaMoEFP8Experts.forward runs: w1, stage1, w2, stage2
+            x_m = x.detach().requires_grad_(True)
+            l1_m = l1_weight.detach().requires_grad_(True)
+            l2_m = l2_weight.detach().requires_grad_(True)
+            tw_m = topk_weight.detach().requires_grad_(True)
+            l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x_m, topk_idx, tw_m, l1_m, group)
+            # every row-indexed tensor spans the rows dispatched here, at least one block
+            rows = max(int(handle[10][-1]), 256)
+            self.assertEqual(
+                {l1_out.shape[0], dwib.shape[0], handle[12].shape[0], handle[13].shape[0]}, {rows}
+            )
+            if hot_topk is not None and self.rank == 0:
+                old_pool = 2 * num_tokens * num_topk + num_experts // self.world_size * 256
+                self.assertGreaterEqual(rows, self.world_size * num_tokens * hot_topk)
+                self.assertGreater(rows, old_pool)
+            b1_m, b2_m = (
+                None if b is None else b.detach().requires_grad_(True) for b in (fc1_bias, fc2_bias)
+            )
+            bias_m = [b for b in (b1_m, b2_m) if b is not None]
+            y_m = fused_mega_moe_fp8_stage2(
+                l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation, b1_m, b2_m
+            )
+            dx_m, dl1_m, dl2_m, dtw_m, *dbias_m = torch.autograd.grad(
+                y_m, [x_m, l1_m, l2_m, tw_m, *bias_m], grad_y
+            )
+            torch.cuda.synchronize()
+            group.barrier()
+
+            x_t = x.detach().requires_grad_(True)
+            l1_t = l1_weight.detach().requires_grad_(True)
+            l2_t = l2_weight.detach().requires_grad_(True)
+            tw_t = topk_weight.detach().requires_grad_(True)
+            # f32 bias leaves, as the bf16 suite's reference wants them
+            b1_t, b2_t = (
+                None if b is None else b.detach().float().requires_grad_(True) for b in (fc1_bias, fc2_bias)
+            )
+            bias_t = [b for b in (b1_t, b2_t) if b is not None]
+            y_t = baseline_reference(
+                group,
+                x_t,
+                topk_idx,
+                tw_t,
+                l1_t,
+                l2_t,
+                num_experts=num_experts,
+                num_topk=num_topk,
+                activation=activation,
+                fc1_bias=b1_t,
+                fc2_bias=b2_t,
+            )
+            dx_t, dl1_t, dl2_t, dtw_t, *dbias_t = torch.autograd.grad(
+                y_t, [x_t, l1_t, l2_t, tw_t, *bias_t], grad_y
+            )
+            torch.cuda.synchronize()
+            group.barrier()
+
+            bias_tags = [
+                tag for tag, b in (("dfc1_bias", fc1_bias), ("dfc2_bias", fc2_bias)) if b is not None
+            ]
+            results = [
+                ("forward", y_m, y_t),
+                ("dx", dx_m, dx_t),
+                ("dl1_weight", dl1_m, dl1_t),
+                ("dl2_weight", dl2_m, dl2_t),
+                ("dtw", dtw_m, dtw_t),
+                # a bias grad is small enough for compute_snr's 1e-12 noise floor to cap it; unit-norm it
+                *(
+                    (
+                        tag,
+                        a.float() / r.float().norm().clamp_min(1e-30),
+                        r.float() / r.float().norm().clamp_min(1e-30),
+                    )
+                    for tag, a, r in zip(bias_tags, dbias_m, dbias_t)
+                ),
+            ]
+        finally:
+            symm.destroy()
+
+        measured = [(tag, *self._metrics(a, r)) for tag, a, r in results]
+        if self.rank == 0:
+            act_name = "silu" if activation is None else repr(activation)
+            route = "balanced" if hot_topk is None else f"{hot_topk}/{num_topk} picks on rank 0"
+            print(f"\n{'=' * 72}")
+            print(
+                f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens} act={act_name}"
+                f" route={route}"
+            )
+            print(f"{'=' * 72}")
+            for tag, snr, cos in measured:
+                print(f"  {tag:<12}: min SNR = {snr:7.2f} dB  min cos = {cos:.5f}", flush=True)
+        for tag, snr, cos in measured:
+            self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
+            self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{tag}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+
+
+@instantiate_parametrized_tests
+class FusedMegaMoEFp8Test(_StagedFp8Harness, MultiProcContinuousTest):
+    """EP8 accuracy for the staged mxfp8 op vs turbo DeepEP; PG comes up once per class."""
 
     @skip_unless_mxfp8
     @skip_if_lt_x_gpu(8)
@@ -164,90 +336,43 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
             activation=GLUActivation.swigluoai(),
         )
 
-    def _staged_forward_backward(
-        self, hidden, inter, num_experts, num_topk, num_tokens, activation=None, l1_gain=1.0
-    ):
-        torch.cuda.set_device(self.device)
-        torch.manual_seed(42 + self.rank)
-        group = dist.group.WORLD
-
-        x, l1_weight, l2_weight, topk_idx, topk_weight = generate_inputs(
-            self.rank,
-            self.world_size,
-            num_tokens=num_tokens,
-            hidden=hidden,
-            inter=inter,
-            num_experts=num_experts,
-            num_topk=num_topk,
-            device=self.device,
-            l1_gain=l1_gain,
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    @parametrize(
+        "hidden, inter, num_experts, num_topk, num_tokens",
+        [
+            (2880, 2880, 32, 4, 8192),  # GPT-OSS-20B
+            (2880, 2880, 128, 4, 8192),  # GPT-OSS-120B
+        ],
+    )
+    def test_staged_forward_backward_gptoss(self, hidden, inter, num_experts, num_topk, num_tokens):
+        """GPT-OSS: swigluoai, biased experts, and hidden = intermediate = 2880, off the fp8 kernels'
+        grid, so the op runs it zero-padded to 3072. At this suite's L1 output (see the swigluoai test
+        for why not a clamp-heavy one) the padding is exact: 8 x MI355X, EP8, bias-free, it measures
+        fwd 22.7, dx 21.9, dW1 22.4, dW2 23.3, dtw 23.5 dB -- the DSv3 shape's figures."""
+        self._staged_forward_backward(
+            hidden,
+            inter,
+            num_experts,
+            num_topk,
+            num_tokens,
+            activation=GLUActivation.swigluoai(),
+            with_bias=True,
         )
-        symm = get_symm_buffer_for_mega_moe(
-            group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_tokens,
-            num_topk=num_topk,
-            hidden=hidden,
-            intermediate_hidden=inter,
-            use_mxfp8=True,
-        )
-        try:
-            _gy = torch.randn(x.shape, device=x.device, dtype=torch.float32)
-            grad_y = (_gy / (_gy.norm() + 1e-12) * _GRAD_OUT_NORM).bfloat16()
 
-            # the shape Primus' MegaMoEFP8Experts.forward runs: w1, stage1, w2, stage2
-            x_m = x.detach().requires_grad_(True)
-            l1_m = l1_weight.detach().requires_grad_(True)
-            l2_m = l2_weight.detach().requires_grad_(True)
-            tw_m = topk_weight.detach().requires_grad_(True)
-            l1_out, dwib, handle, state = fused_mega_moe_fp8_stage1(x_m, topk_idx, tw_m, l1_m, group)
-            y_m = fused_mega_moe_fp8_stage2(
-                l1_out, dwib, handle, state, topk_idx, tw_m, l2_m, group, activation
-            )
-            dx_m, dl1_m, dl2_m, dtw_m = torch.autograd.grad(y_m, [x_m, l1_m, l2_m, tw_m], grad_y)
-            torch.cuda.synchronize()
-            group.barrier()
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_imbalanced_routing(self):
+        """Rank 0 receives 3x, then 8x, the average rows, far past the old ``pool_mult=2`` pool.
 
-            x_t = x.detach().requires_grad_(True)
-            l1_t = l1_weight.detach().requires_grad_(True)
-            l2_t = l2_weight.detach().requires_grad_(True)
-            tw_t = topk_weight.detach().requires_grad_(True)
-            y_t = baseline_reference(
-                group,
-                x_t,
-                topk_idx,
-                tw_t,
-                l1_t,
-                l2_t,
-                num_experts=num_experts,
-                num_topk=num_topk,
-                activation=activation,
-            )
-            dx_t, dl1_t, dl2_t, dtw_t = torch.autograd.grad(y_t, [x_t, l1_t, l2_t, tw_t], grad_y)
-            torch.cuda.synchronize()
-            group.barrier()
-
-            results = [
-                ("forward", y_m, y_t),
-                ("dx", dx_m, dx_t),
-                ("dl1_weight", dl1_m, dl1_t),
-                ("dl2_weight", dl2_m, dl2_t),
-                ("dtw", dtw_m, dtw_t),
-            ]
-        finally:
-            symm.destroy()
-
-        measured = [(tag, *self._metrics(a, r)) for tag, a, r in results]
-        if self.rank == 0:
-            act_name = "silu" if activation is None else repr(activation)
-            print(f"\n{'=' * 72}")
-            print(f"[staged fp8 mega MoE vs turbo DeepEP]  EP{self.world_size} T={num_tokens} act={act_name}")
-            print(f"{'=' * 72}")
-            for tag, snr, cos in measured:
-                print(f"  {tag:<12}: min SNR = {snr:7.2f} dB  min cos = {cos:.5f}", flush=True)
-        for tag, snr, cos in measured:
-            self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{tag}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
-            self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{tag}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+        That pool silently dropped the rows past its capacity; this one must land every one of
+        them, which the accuracy gate against DeepEP sees directly: a dropped row is a missing
+        expert term in y and a missing token in dW. At 8x every pick is on rank 0, whose 528K rows
+        put l1 past 4 GiB and the fp8 pool, the L2 output and the colwise wgrad operands past 2 GiB,
+        so every one of them must be addressed in 64-bit; the other ranks' experts receive nothing,
+        and their wgrads must be exactly zero."""
+        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=3)
+        self._staged_forward_backward(7168, 2048, 256, 8, 8192, hot_topk=8)
 
     @skip_unless_mxfp8
     @skip_if_lt_x_gpu(8)
@@ -390,6 +515,19 @@ class FusedMegaMoEFp8Test(MultiProcContinuousTest):
         for name, snr, cos in results:
             self.assertGreaterEqual(snr, _SNR_FLOOR_DB, f"[{name}] SNR {snr:.2f} dB < {_SNR_FLOOR_DB}")
             self.assertGreaterEqual(cos, _COSINE_FLOOR, f"[{name}] cosine {cos:.5f} < {_COSINE_FLOOR}")
+
+
+class FusedMegaMoEFp8LongSequenceTest(_StagedFp8Harness, MultiProcContinuousTest):
+    """A second token count needs its own class: compiling the combine for one in the process that
+    ``FusedMegaMoEFp8Test`` runs in trips a FlyDSL trace error (see its multi-layer test)."""
+
+    @skip_unless_mxfp8
+    @skip_if_lt_x_gpu(8)
+    def test_long_sequence(self):
+        """40960 tokens per rank under balanced routing: the combine buffer (topk slots of H + H/32
+        bytes per token) and every rank's l1 pass 2 GiB, so the combine's PUSH and reduce must
+        address their slots, and the row-indexed stages their rows, in 64-bit."""
+        self._staged_forward_backward(7168, 2048, 256, 8, 40960)
 
 
 if __name__ == "__main__":

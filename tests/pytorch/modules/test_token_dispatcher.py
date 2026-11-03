@@ -17,6 +17,7 @@ from torch.testing._internal.common_utils import (
 )
 
 import primus_turbo.pytorch as turbo
+from primus_turbo.pytorch.core.backend import BackendType
 from primus_turbo.pytorch.kernels.moe.moe_dispatch_combine_impl import (
     set_buffer_global_config,
 )
@@ -74,6 +75,14 @@ def _build_tp_groups(tp_size):
     return ep_group, tp_group, tp_ep_group
 
 
+def _fail_on_all_ranks(errors):
+    """Vote before raising: a one-rank assert would hang the others in the next collective."""
+    flag = torch.tensor([1 if errors else 0], dtype=torch.int32, device="cuda")
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    if flag.item():
+        raise AssertionError("; ".join(errors) if errors else f"rank {dist.get_rank()}: another rank failed")
+
+
 def _run_dispatch_combine(
     rank,
     ep_group,
@@ -92,6 +101,7 @@ def _run_dispatch_combine(
     tp_size=1,
     routing_map=None,
     token_indices=None,
+    permute_backend=BackendType.TURBO,
 ):
     """Core dispatch-combine logic shared by all test variants."""
     if tp_size > 1:
@@ -113,6 +123,7 @@ def _run_dispatch_combine(
         pad_multiple=pad_multiple,
         expert_capacity_factor=expert_capacity_factor,
         deepep_use_comm_stream=deepep_use_comm_stream,
+        permute_backend=permute_backend,
     )
 
     hidden_states = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
@@ -128,23 +139,124 @@ def _run_dispatch_combine(
     permuted_local_hidden_states, tokens_per_expert, permuted_probs = dispatcher.token_dispatch(
         hidden_states, probs, routing_map=routing_map, indices=token_indices
     )
+    num_permuted_rows = permuted_local_hidden_states.shape[0]
 
     permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
     permuted_local_hidden_states = permuted_local_hidden_states.to(ans.dtype)
 
     restored_hidden_states = dispatcher.token_combine(permuted_local_hidden_states)
 
-    assert torch.allclose(restored_hidden_states, ans), (
-        "Restored hidden states do not match original hidden states"
-    )
+    errors = []
+    if not torch.allclose(restored_hidden_states, ans):
+        errors.append(f"rank {rank}: restored hidden states do not match original hidden states")
 
     torch.autograd.backward(restored_hidden_states, hidden_states)
-    assert torch.allclose(hidden_states.grad, ans), "Gradient does not match original hidden states"
+    if not torch.allclose(hidden_states.grad, ans):
+        errors.append(f"rank {rank}: gradient does not match original hidden states")
 
     expected_device = "cuda" if deepep_use_cuda_num_tokens_per_expert else "cpu"
-    assert tokens_per_expert.device.type == expected_device, (
-        f"Expected tokens_per_expert on {expected_device}, got {tokens_per_expert.device.type}"
+    if tokens_per_expert.device.type != expected_device:
+        errors.append(
+            f"rank {rank}: expected tokens_per_expert on {expected_device}, "
+            f"got {tokens_per_expert.device.type}"
+        )
+
+    if pad_multiple > 0 and not (tokens_per_expert % pad_multiple == 0).all():
+        errors.append(
+            f"rank {rank}: tokens_per_expert not aligned to pad_multiple={pad_multiple}: "
+            f"{tokens_per_expert.tolist()}"
+        )
+    # Counts must describe the permuted layout; capacity modes size by the cap.
+    if deepep_num_worst_tokens == 0 and permute_max_token_num == 0:
+        if int(tokens_per_expert.sum()) != num_permuted_rows:
+            errors.append(
+                f"rank {rank}: tokens_per_expert sums to {int(tokens_per_expert.sum())} but "
+                f"permute produced {num_permuted_rows} rows"
+            )
+
+    _fail_on_all_ranks(errors)
+    return tokens_per_expert
+
+
+class _StubExpert(torch.autograd.Function):
+    """Records its input and output gradient untouched; emits a fixed output."""
+
+    @staticmethod
+    def forward(ctx, x, out, record):
+        ctx.record = record
+        record["input"] = x
+        return out.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        ctx.record["grad"] = grad
+        return torch.zeros(grad.shape, dtype=torch.bfloat16, device=grad.device), None, None
+
+
+def _run_fp8_permute(rank, ep_group, pad_multiple, deepep_num_worst_tokens):
+    """FP8 permute / un-permute grad through the dispatcher match quantizing the bf16 ones."""
+    from primus_turbo.pytorch.core.low_precision import (
+        ScalingGranularity,
+        float8_e4m3,
+        float8_e5m2,
     )
+    from primus_turbo.pytorch.core.quantized_tensor import QuantizedTensor
+
+    dispatcher = turbo.modules.DeepEPTokenDispatcher(
+        NUM_EXPERTS,
+        ROUTER_TOPK,
+        ep_group,
+        pad_multiple=pad_multiple,
+        deepep_num_worst_tokens=deepep_num_worst_tokens,
+        deepep_use_cuda_num_tokens_per_expert=True,
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    hidden_states = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda", generator=gen)
+    probs = torch.rand((NUM_TOKENS, NUM_EXPERTS), dtype=torch.float32, device="cuda", generator=gen)
+    grad_out = torch.randn((NUM_TOKENS, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda", generator=gen)
+
+    def run(fp8):
+        record = {}
+        h = hidden_states.clone().requires_grad_(True)
+        x, token_probs = dispatcher._pre_dispatch(h, probs)
+        x, dispatched_probs = dispatcher._exec_dispatch(x, token_probs)
+        permuted, tokens_per_expert, _ = dispatcher._post_dispatch(
+            x, dispatched_probs, quantize_dtype=float8_e4m3 if fp8 else None
+        )
+        out = torch.ones(permuted.shape, dtype=torch.bfloat16, device="cuda")
+        y = _StubExpert.apply(permuted, out, record)
+        y = dispatcher._pre_combine(y, grad_quantize_dtype=float8_e5m2 if fp8 else None)
+        dispatcher._post_combine(dispatcher._exec_combine(y)).backward(grad_out)
+        return record, tokens_per_expert
+
+    ref, ref_tpe = run(False)
+    got, tpe = run(True)
+
+    errors = []
+
+    def same(q, ref_tensor, dtype, group_lens):
+        want = QuantizedTensor.quantize(
+            ref_tensor.detach(),
+            dtype,
+            ScalingGranularity.TENSORWISE,
+            axis=-1,
+            group_lens=group_lens,
+            pad_align_last=128,
+        )
+        return (
+            isinstance(q, QuantizedTensor)
+            and q.shape == want.shape
+            and torch.equal(q.qdata.view(torch.uint8), want.qdata.view(torch.uint8))
+            and torch.equal(q.scale_inv, want.scale_inv)
+        )
+
+    if not torch.equal(tpe, ref_tpe):
+        errors.append(f"rank {rank}: tokens_per_expert differs")
+    elif not same(got["input"], ref["input"], float8_e4m3, ref_tpe):
+        errors.append(f"rank {rank}: FP8 permuted tokens differ from quantized bf16 permute")
+    if not same(got["grad"], ref["grad"], float8_e5m2, None):
+        errors.append(f"rank {rank}: FP8 expert-output grad differs from quantized bf16 grad")
+    _fail_on_all_ranks(errors)
 
 
 @instantiate_parametrized_tests
@@ -176,7 +288,10 @@ class TestTokenDispatcher(MultiProcContinuousTest):
     @parametrize("backend", _get_backends())
     @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
     @parametrize("expert_capacity_factor", [None, 0.5])
-    def test_basic(self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor):
+    @parametrize("permute_backend", ["TURBO", "TRITON"])
+    def test_basic(
+        self, backend, deepep_use_cuda_num_tokens_per_expert, expert_capacity_factor, permute_backend
+    ):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -184,6 +299,7 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 dist.group.WORLD,
                 deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 expert_capacity_factor=expert_capacity_factor,
+                permute_backend=BackendType[permute_backend],
             )
 
     # ------------------------------------------------------------------
@@ -192,7 +308,8 @@ class TestTokenDispatcher(MultiProcContinuousTest):
 
     @parametrize("backend", _get_backends())
     @parametrize("permute_max_token_num", [0, NUM_TOKENS * 8 * ROUTER_TOPK])
-    def test_worst_tokens(self, backend, permute_max_token_num):
+    @parametrize("permute_backend", ["TURBO", "TRITON"])
+    def test_worst_tokens(self, backend, permute_max_token_num, permute_backend):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
@@ -201,21 +318,35 @@ class TestTokenDispatcher(MultiProcContinuousTest):
                 deepep_use_cuda_num_tokens_per_expert=True,
                 deepep_num_worst_tokens=NUM_TOKENS * 8,
                 permute_max_token_num=permute_max_token_num,
+                permute_backend=BackendType[permute_backend],
             )
 
     # ------------------------------------------------------------------
-    # pad_multiple > 0 (requires deepep_use_cuda_num_tokens_per_expert)
+    # Tensorwise-FP8 permute output / un-permute grad
+    # ------------------------------------------------------------------
+
+    @parametrize("backend", _get_backends())
+    @parametrize("pad_multiple", [0, 16])
+    @parametrize("deepep_num_worst_tokens", [0, NUM_TOKENS * 8])
+    def test_fp8_permute(self, backend, pad_multiple, deepep_num_worst_tokens):
+        self._bind_device()
+        with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
+            _run_fp8_permute(self.rank, dist.group.WORLD, pad_multiple, deepep_num_worst_tokens)
+
+    # ------------------------------------------------------------------
+    # pad_multiple > 0
     # ------------------------------------------------------------------
 
     @parametrize("backend", _get_backends())
     @parametrize("pad_multiple", [128, 256])
-    def test_pad_multiple(self, backend, pad_multiple):
+    @parametrize("deepep_use_cuda_num_tokens_per_expert", [False, True])
+    def test_pad_multiple(self, backend, pad_multiple, deepep_use_cuda_num_tokens_per_expert):
         self._bind_device()
         with patch.dict(os.environ, {"PRIMUS_TURBO_MOE_DISPATCH_COMBINE_BACKEND": backend}):
             _run_dispatch_combine(
                 self.rank,
                 dist.group.WORLD,
-                deepep_use_cuda_num_tokens_per_expert=True,
+                deepep_use_cuda_num_tokens_per_expert=deepep_use_cuda_num_tokens_per_expert,
                 pad_multiple=pad_multiple,
             )
 

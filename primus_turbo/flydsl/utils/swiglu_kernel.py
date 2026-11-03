@@ -27,18 +27,17 @@ import flydsl.expr as fx
 import flydsl.expr.math as fmath
 import torch
 from flydsl._mlir.dialects import vector as _vector
-from flydsl.expr.buffer_ops import (
-    _unwrap_value,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource,
-)
 from flydsl.expr.primitive import get_dyn_shared
 from flydsl.expr.primitive import ptrtoint as _fly_ptrtoint
 
 from primus_turbo.flydsl.mega.tune_utils import (
     Config,
     autotune,
+)
+from primus_turbo.flydsl.utils.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource,
 )
 from primus_turbo.flydsl.utils.glu_activation import (
     GLUActivation,
@@ -74,7 +73,31 @@ def _add_const(x, c, vtype):
     return x if c == 0.0 else fx.arith.addf(x, fx.arith.constant_vector(c, vtype))
 
 
-def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: int, act: tuple):
+def _load_gate_up(acc_rsrc, bias_rsrc, t2e_rsrc, m, row_base, col, I: int, BM: int, f32v):
+    """The row's fc1 output halves in f32; with an expert bias (``bias_rsrc``) added before any clamp,
+    the order Megatron's fc1 (TE GroupedLinear with ``skip_bias_add=False``) applies it in."""
+    gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16)
+    up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16)
+    gate, up = fx.arith.extf(f32v, gate), fx.arith.extf(f32v, up)
+    if bias_rsrc is not None:
+        # every pool block belongs to one expert
+        bias_base = buffer_load(t2e_rsrc, m // fx.Int32(BM), vec_width=1, dtype=fx.T.i32) * fx.Int32(2 * I)
+        gate = fx.arith.addf(
+            gate,
+            fx.arith.extf(f32v, buffer_load(bias_rsrc, bias_base + col, vec_width=_VEC, dtype=fx.T.bf16)),
+        )
+        up = fx.arith.addf(
+            up,
+            fx.arith.extf(
+                f32v, buffer_load(bias_rsrc, bias_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16)
+            ),
+        )
+    return gate, up
+
+
+def _make_swiglu(
+    I: int, with_scale: bool, BM: int, grid_x: int, block_threads: int, act: tuple, with_bias: bool = False
+):
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
     cols_per_block = _VEC * block_threads
@@ -83,9 +106,16 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
     partial_tail = I % cols_per_block != 0
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def swiglu_kernel(ACC1: fx.Tensor, ACT: fx.Tensor, SCALE: fx.Tensor, NUM_TILE_BLOCKS: fx.Tensor):
-        f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
-        bf16v = fx.T.VectorType.get([_VEC], fx.T.bf16())
+    def swiglu_kernel(
+        ACC1: fx.Tensor,
+        ACT: fx.Tensor,
+        SCALE: fx.Tensor,
+        NUM_TILE_BLOCKS: fx.Tensor,
+        BIAS: fx.Tensor,
+        TILE_TO_EXPERT: fx.Tensor,
+    ):
+        f32v = fx.T.vec(_VEC, fx.T.f32)
+        bf16v = fx.T.vec(_VEC, fx.T.bf16)
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         col = block_index_y * fx.Int32(cols_per_block) + thread_index * fx.Int32(_VEC)
@@ -93,6 +123,8 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
         acc_rsrc = create_buffer_resource(ACC1, max_size=True)
         act_rsrc = create_buffer_resource(ACT, max_size=True)
         scale_rsrc = create_buffer_resource(SCALE, max_size=True) if with_scale else None
+        bias_rsrc = create_buffer_resource(BIAS, max_size=True) if with_bias else None
+        t2e_rsrc = create_buffer_resource(TILE_TO_EXPERT, max_size=True) if with_bias else None
         g_lo, g_hi = _bound(gate_lo, f32v), _bound(gate_hi, f32v)
         u_lo, u_hi = _bound(-up_clamp, f32v), _bound(up_clamp, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
@@ -102,20 +134,19 @@ def _make_swiglu(I: int, with_scale: bool, BM: int, grid_x: int, block_threads: 
             # i32 offset: assumes M*two_I < 2^31 elements (holds for all EP pool sizes).
             row_base = m * fx.Int32(two_I)
             if not partial_tail or col < fx.Int32(I):
-                gate = buffer_load(acc_rsrc, row_base + col, vec_width=_VEC, dtype=fx.T.bf16())
-                up = buffer_load(acc_rsrc, row_base + fx.Int32(I) + col, vec_width=_VEC, dtype=fx.T.bf16())
-                g = _clampv(fx.arith.extf(f32v, gate), g_lo, g_hi)
-                u = _add_const(_clampv(fx.arith.extf(f32v, up), u_lo, u_hi), glu_offset, f32v)
+                gate, up = _load_gate_up(acc_rsrc, bias_rsrc, t2e_rsrc, m, row_base, col, I, BM, f32v)
+                g = _clampv(gate, g_lo, g_hi)
+                u = _add_const(_clampv(up, u_lo, u_hi), glu_offset, f32v)
                 denom = fx.arith.addf(one, fmath.exp(fx.arith.mulf(_mul_const(g, alpha, f32v), neg1)))
                 act = fx.arith.mulf(fx.arith.divf(g, denom), u)
                 if with_scale:
-                    sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                    sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32)
                     act = fx.arith.mulf(act, _vector.broadcast(f32v, sc))
                 buffer_store(fx.arith.trunc_f(bf16v, act), act_rsrc, m * fx.Int32(I) + col)
 
         # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); unused tail skipped.
         m_real = buffer_load(
-            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32
         ) * fx.Int32(BM)
         m = block_index_x
         while m < m_real:
@@ -134,6 +165,7 @@ def _make_swiglu_bwd(
     with_gate: bool,
     with_act_w: bool,
     act: tuple,
+    with_bias: bool = False,
 ):
     alpha, glu_offset, gate_lo, gate_hi, up_clamp = act
     two_I = 2 * I
@@ -156,13 +188,15 @@ def _make_swiglu_bwd(
         NUM_TILE_BLOCKS: fx.Tensor,
         GRAD_GATE: fx.Tensor,
         ACT_W: fx.Tensor,
+        BIAS: fx.Tensor,
+        TILE_TO_EXPERT: fx.Tensor,
     ):
-        f32v = fx.T.VectorType.get([_VEC], fx.T.f32())
-        bf16v = fx.T.VectorType.get([_VEC], fx.T.bf16())
+        f32v = fx.T.vec(_VEC, fx.T.f32)
+        bf16v = fx.T.vec(_VEC, fx.T.bf16)
         thread_index = fx.thread_idx.x
         block_index_x, block_index_y, _ = fx.block_idx
         # LDS scratch for cross-warp gate reduction (one f32 slot per warp).
-        lds_base = _unwrap_value(_fly_ptrtoint(get_dyn_shared())) if with_gate else None
+        lds_base = fx.as_ir_value(_fly_ptrtoint(get_dyn_shared())) if with_gate else None
 
         dact_rsrc = create_buffer_resource(DACT, max_size=True)
         acc_rsrc = create_buffer_resource(ACC1, max_size=True)
@@ -170,6 +204,8 @@ def _make_swiglu_bwd(
         scale_rsrc = create_buffer_resource(SCALE, max_size=True) if with_scale else None
         grad_gate_rsrc = create_buffer_resource(GRAD_GATE, max_size=True) if with_gate else None
         act_w_rsrc = create_buffer_resource(ACT_W, max_size=True) if with_act_w else None
+        bias_rsrc = create_buffer_resource(BIAS, max_size=True) if with_bias else None
+        t2e_rsrc = create_buffer_resource(TILE_TO_EXPERT, max_size=True) if with_bias else None
         g_lo, g_hi = _bound(gate_lo, f32v), _bound(gate_hi, f32v)
         u_lo, u_hi = _bound(-up_clamp, f32v), _bound(up_clamp, f32v)
         one = fx.arith.constant_vector(1.0, f32v)
@@ -185,19 +221,13 @@ def _make_swiglu_bwd(
             # into. The value is discarded either way -- the stores below are guarded
             # and the gate contribution is zeroed.
             ld_col = fx.arith.select(in_bounds, col, fx.Int32(0)) if guard else col
-            gate = fx.arith.extf(
-                f32v, buffer_load(acc_rsrc, row_base + ld_col, vec_width=_VEC, dtype=fx.T.bf16())
-            )
-            up = fx.arith.extf(
-                f32v,
-                buffer_load(acc_rsrc, row_base + fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16()),
-            )
+            gate, up = _load_gate_up(acc_rsrc, bias_rsrc, t2e_rsrc, m, row_base, ld_col, I, BM, f32v)
             d = fx.arith.extf(
-                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16())
+                f32v, buffer_load(dact_rsrc, m * fx.Int32(I) + ld_col, vec_width=_VEC, dtype=fx.T.bf16)
             )
             d_raw = d
             if with_scale:
-                sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                sc = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32)
                 d = fx.arith.mulf(d, _vector.broadcast(f32v, sc))
 
             gc = _clampv(gate, g_lo, g_hi)
@@ -221,7 +251,7 @@ def _make_swiglu_bwd(
                 buffer_store(dgate, dacc_rsrc, row_base + col)
                 buffer_store(dup, dacc_rsrc, row_base + fx.Int32(I) + col)
                 if with_act_w:
-                    sc_w = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32())
+                    sc_w = buffer_load(scale_rsrc, m, vec_width=1, dtype=fx.T.f32)
                     act_w_v = fx.arith.mulf(fx.arith.mulf(s, uo), _vector.broadcast(f32v, sc_w))
                     buffer_store(fx.arith.trunc_f(bf16v, act_w_v), act_w_rsrc, m * fx.Int32(I) + col)
 
@@ -231,7 +261,7 @@ def _make_swiglu_bwd(
                     # OOB lanes read garbage; zero them so the row sum stays clean.
                     contrib = fx.arith.select(in_bounds, contrib, zero)
                 gate_parts.append(
-                    fx.arith.ArithValue(_vector.reduction(fx.T.f32(), _vector.CombiningKind.ADD, contrib))
+                    fx.arith.ArithValue(_vector.reduction(fx.T.f32, _vector.CombiningKind.ADD, contrib))
                 )
 
         def compute_row(m):
@@ -255,12 +285,12 @@ def _make_swiglu_bwd(
                 fx.gpu.barrier()
                 if thread_index == fx.Int32(0):
                     total = fx.arith.ArithValue(
-                        ld(lds_base, fx.Int32(0), scope="workgroup", space=3, dtype=fx.T.f32())
+                        ld(lds_base, fx.Int32(0), scope="workgroup", space=3, dtype=fx.T.f32)
                     )
                     for w in range(1, n_warps):
                         total = total.addf(
                             fx.arith.ArithValue(
-                                ld(lds_base, fx.Int32(w), scope="workgroup", space=3, dtype=fx.T.f32())
+                                ld(lds_base, fx.Int32(w), scope="workgroup", space=3, dtype=fx.T.f32)
                             )
                         )
                     buffer_store(total, grad_gate_rsrc, m)
@@ -275,7 +305,7 @@ def _make_swiglu_bwd(
 
         # grid-stride over real pool rows only (NUM_TILE_BLOCKS * BM); skip the unused tail.
         m_real = buffer_load(
-            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32()
+            create_buffer_resource(NUM_TILE_BLOCKS, max_size=True), 0, vec_width=1, dtype=fx.T.i32
         ) * fx.Int32(BM)
         m = block_index_x
         while m < m_real:
@@ -290,7 +320,7 @@ def _make_swiglu_bwd(
         Config(grid_x=grid_x, block_threads=block_threads)
         for grid_x, block_threads in itertools.product((1024, 2048, 4096), (256, 512))
     ],
-    key=["I", "with_scale", "BM"],
+    key=["I", "with_scale", "BM", "with_bias"],
 )
 @flyc.jit
 def _compiled_swiglu(
@@ -298,18 +328,21 @@ def _compiled_swiglu(
     ACT,
     SCALE,
     NUM_TILE_BLOCKS,
+    BIAS,
+    TILE_TO_EXPERT,
     I: fx.Constexpr[int],
     with_scale: fx.Constexpr[int],
     BM: fx.Constexpr[int],
     activation: fx.Constexpr[tuple],
+    with_bias: fx.Constexpr[int],
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     cols_per_block = _VEC * block_threads
     n_col_tiles = (I + cols_per_block - 1) // cols_per_block
-    kernel = _make_swiglu(I, bool(with_scale), BM, grid_x, block_threads, activation)
-    kernel(ACC1, ACT, SCALE, NUM_TILE_BLOCKS).launch(
+    kernel = _make_swiglu(I, bool(with_scale), BM, grid_x, block_threads, activation, bool(with_bias))
+    kernel(ACC1, ACT, SCALE, NUM_TILE_BLOCKS, BIAS, TILE_TO_EXPERT).launch(
         grid=(grid_x, n_col_tiles, 1),
         block=(block_threads, 1, 1),
         stream=stream,
@@ -322,7 +355,7 @@ def _compiled_swiglu(
         for grid_x, block_threads in itertools.product((2048, 4096), (256, 512))
     ],
     rep=5,
-    key=["I", "with_scale", "BM", "with_gate", "with_act_w"],
+    key=["I", "with_scale", "BM", "with_gate", "with_act_w", "with_bias"],
 )
 @flyc.jit
 def _compiled_swiglu_bwd(
@@ -333,12 +366,15 @@ def _compiled_swiglu_bwd(
     NUM_TILE_BLOCKS,
     GRAD_GATE,
     ACT_W,
+    BIAS,
+    TILE_TO_EXPERT,
     I: fx.Constexpr[int],
     with_scale: fx.Constexpr[int],
     BM: fx.Constexpr[int],
     with_gate: fx.Constexpr[int],
     with_act_w: fx.Constexpr[int],
     activation: fx.Constexpr[tuple],
+    with_bias: fx.Constexpr[int],
     grid_x: fx.Constexpr[int],
     block_threads: fx.Constexpr[int],
     stream: fx.Stream,
@@ -354,11 +390,12 @@ def _compiled_swiglu_bwd(
         bool(with_gate),
         bool(with_act_w),
         activation,
+        bool(with_bias),
     )
     grid_y = 1 if with_gate else n_col_tiles
     # One f32 LDS slot per warp for cross-warp gate reduction.
     smem = (block_threads // _WARP) * 4 if with_gate else 0
-    kernel(DACT, ACC1, DACC1, SCALE, NUM_TILE_BLOCKS, GRAD_GATE, ACT_W).launch(
+    kernel(DACT, ACC1, DACC1, SCALE, NUM_TILE_BLOCKS, GRAD_GATE, ACT_W, BIAS, TILE_TO_EXPERT).launch(
         grid=(grid_x, grid_y, 1),
         block=(block_threads, 1, 1),
         stream=stream,
@@ -374,13 +411,18 @@ def swiglu_backward_flydsl_kernel(
     return_gate: bool = False,
     return_act_w: bool = False,
     activation: GLUActivation | None = None,
+    bias: torch.Tensor | None = None,
+    tile_to_expert: torch.Tensor | None = None,
 ):
+    """``bias`` [E_local, 2I] is the experts' fc1 bias, added to ``x`` before the activation; row m
+    takes the bias of expert ``tile_to_expert[m // 256]``. ``dx`` is then also the bias gradient."""
     M, two_I = x.shape
     assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
     I = two_I // 2
     assert dact.size(1) == I, f"dact[...,I] vs x[...,2I] mismatch: {dact.shape} {x.shape}"
     if return_act_w:
         assert scale is not None, "return_act_w needs scale (the per-row routing weight)"
+    with_bias = _check_bias(bias, tile_to_expert, two_I)
     x = x.contiguous()
     dact = dact.contiguous()
     dx = torch.empty((M, two_I), dtype=torch.bfloat16, device=x.device)
@@ -397,12 +439,15 @@ def swiglu_backward_flydsl_kernel(
         NUM_TILE_BLOCKS=ntb_d,
         GRAD_GATE=grad_gate,
         ACT_W=act_w,
+        BIAS=bias.contiguous() if with_bias else x,
+        TILE_TO_EXPERT=tile_to_expert if with_bias else ntb_d,
         I=I,
         with_scale=int(with_scale),
         BM=_POOL_BLOCK_M,
         with_gate=int(return_gate),
         with_act_w=int(return_act_w),
         activation=activation_constexpr(activation),
+        with_bias=int(with_bias),
         stream=torch.cuda.current_stream(),
     )
     if return_gate and return_act_w:
@@ -420,12 +465,16 @@ def swiglu_flydsl_kernel(
     scale: torch.Tensor | None = None,
     stream=None,
     activation: GLUActivation | None = None,
+    bias: torch.Tensor | None = None,
+    tile_to_expert: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """``bias`` / ``tile_to_expert``: the experts' fc1 bias, see :func:`swiglu_backward_flydsl_kernel`."""
     if stream is None:
         stream = torch.cuda.current_stream()
     M, two_I = x.shape
     assert two_I % 2 == 0, f"x last dim must be even (gate||up), got {two_I}"
     I = two_I // 2
+    with_bias = _check_bias(bias, tile_to_expert, two_I)
     act = torch.empty((M, I), dtype=torch.bfloat16, device=x.device)
     with_scale = scale is not None
     scale_d = scale if with_scale else x
@@ -435,10 +484,25 @@ def swiglu_flydsl_kernel(
         ACT=act,
         SCALE=scale_d,
         NUM_TILE_BLOCKS=ntb_d,
+        BIAS=bias.contiguous() if with_bias else x,
+        TILE_TO_EXPERT=tile_to_expert if with_bias else ntb_d,
         I=I,
         with_scale=int(with_scale),
         BM=_POOL_BLOCK_M,
         activation=activation_constexpr(activation),
+        with_bias=int(with_bias),
         stream=stream,
     )
     return act
+
+
+def _check_bias(bias, tile_to_expert, two_I) -> bool:
+    if bias is None:
+        return False
+    assert tile_to_expert is not None, "an expert bias needs the handle's tile_to_expert"
+    assert bias.dim() == 2 and bias.size(1) == two_I, (
+        f"bias must be [E_local, {two_I}], got {tuple(bias.shape)}"
+    )
+    assert bias.dtype == torch.bfloat16, f"bias must be bf16, got {bias.dtype}"
+    assert tile_to_expert.dtype == torch.int32, f"tile_to_expert must be int32, got {tile_to_expert.dtype}"
+    return True

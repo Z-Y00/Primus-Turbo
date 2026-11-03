@@ -125,6 +125,8 @@ TORCH_LIBRARY(primus_turbo_cpp_extension, m) {
           "Tensor? permuted_probs, Tensor? output_probs, Tensor row_id_map, "
           "Tensor num_dispatched_tokens_tensor, int num_local_experts, int hidden_size, "
           "bool with_probs, int probs_stride=0) -> ()");
+    m.def("permute_routed_amax(Tensor tokens, Tensor row_id_map, "
+          "Tensor num_dispatched_token_tensor, int num_local_experts) -> Tensor");
 
     // ********* Grouped Gemm *********
     m.def("ck_grouped_gemm(Tensor a, Tensor b, Tensor group_lens, Tensor group_offs, bool transA, "
@@ -225,6 +227,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, CUDA, m) {
     m.impl("permute_preprocessing", permute_preprocessing);
     m.impl("permute", permute);
     m.impl("unpermute", unpermute);
+    m.impl("permute_routed_amax", permute_routed_amax);
 
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm);
@@ -291,6 +294,7 @@ TORCH_LIBRARY_IMPL(primus_turbo_cpp_extension, Meta, m) {
     m.impl("permute_preprocessing", permute_preprocessing_meta);
     m.impl("permute", permute_meta);
     m.impl("unpermute", unpermute_meta);
+    m.impl("permute_routed_amax", permute_routed_amax_meta);
 
     // ********* Grouped Gemm *********
     m.impl("ck_grouped_gemm", ck_grouped_gemm_meta);
@@ -312,6 +316,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_max_nvl_chunked_recv_tokens")  = DEFAULT_NUM_MAX_XGMI_CHUNKED_RECV_TOKENS,
              py::arg("num_max_rdma_chunked_send_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_SEND_TOKENS,
              py::arg("num_max_rdma_chunked_recv_tokens") = DEFAULT_NUM_MAX_RDMA_CHUNKED_RECV_TOKENS)
+        // Readable from Python: the FlyDSL intranode backend launches its kernels from there.
+        .def_readonly("num_sms", &primus_turbo::deep_ep::Config::num_sms)
+        .def_readonly("num_max_nvl_chunked_send_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_nvl_chunked_send_tokens)
+        .def_readonly("num_max_nvl_chunked_recv_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_nvl_chunked_recv_tokens)
+        .def_readonly("num_max_rdma_chunked_send_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_rdma_chunked_send_tokens)
+        .def_readonly("num_max_rdma_chunked_recv_tokens",
+                      &primus_turbo::deep_ep::Config::num_max_rdma_chunked_recv_tokens)
         .def("get_nvl_buffer_size_hint", &primus_turbo::deep_ep::Config::get_nvl_buffer_size_hint)
         .def("get_rdma_buffer_size_hint",
              &primus_turbo::deep_ep::Config::get_rdma_buffer_size_hint);

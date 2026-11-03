@@ -8,7 +8,7 @@ This page shows usage of **Primus-Turbo**.
   - [1.1 Gemm](#11-gemm)
   - [1.2 Attention](#12-attention)
   - [1.3 Grouped Gemm](#13-grouped-gemm)
-  - [1.4 Mega MoE](#14-mega-moe)
+  - [1.4 MegaMoE](#14-megamoe)
 - [2. Modules](#2-modules)
   - [2.1 Linear](#21-linear)
 - [3. Low-Precision](#3-low-precision)
@@ -199,12 +199,12 @@ print(c)
 print(c.shape) # [128, 256]
 ```
 
-### 1.4 Mega MoE
+### 1.4 MegaMoE
 
 `fused_mega_moe` is an EP intra-node MoE op that fuses communication with the grouped GEMM
 (`dispatch_grouped_gemm` + `grouped_gemm_combine`). It is a single autograd op; the per-shape
 communication buffer is allocated once and cached internally. See
-[README_Mega_MoE](./README_Mega_MoE.md) for the design and performance.
+[MegaMoE](./mega_moe.md) for the design and performance.
 
 > **Hardware requirements:** `gfx950` (not supported on `gfx1250`), intra-node expert parallelism
 > (one rank per GPU).
@@ -529,7 +529,9 @@ print(c.shape)  # [128, 256]
 
 ## 4. DeepEP
 
-We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows:
+We added some new params for DeepEP buffer and dispatch. The normal kernels can be used in model training as the below example code shows.
+
+The intranode kernels default to `flydsl_v2` on MI455X (gfx1250) and to `cpp` on MI300 / MI355; see [Intranode backend](../primus_turbo/pytorch/deep_ep/README.md#intranode-backend) for the known issues on MI455X. `flydsl_v2` keeps the whole batch in its buffer, so size the buffer from the tokens per rank as `get_buffer` below does (`turbo.ops.moe_dispatch` does this by itself).
 
 ```python
 import torch
@@ -547,8 +549,9 @@ Buffer.set_num_sms(24)
 
 
 # You may call this function at the framework initialization
+# `num_max_tokens_per_rank`: the most tokens a rank dispatches at once, the same value on every rank
 def get_buffer(group: dist.ProcessGroup,
-               hidden_bytes: int) -> Buffer:
+               hidden_bytes: int, num_max_tokens_per_rank: int, num_topk: int) -> Buffer:
     global _buffer
 
     # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
@@ -556,6 +559,9 @@ def get_buffer(group: dist.ProcessGroup,
     for config in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
         num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
         num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+    # `flydsl_v2` holds the whole batch; the hint is 0 for the ring backends (`cpp`, `flydsl`)
+    num_nvl_bytes = max(Buffer.get_token_buffer_size_hint(num_max_tokens_per_rank, hidden_bytes,
+                                                          group.size(), num_topk), num_nvl_bytes)
 
     # Allocate a buffer if not existed or not enough buffer size.
     # Set ``PRIMUS_TURBO_EP_FORCE_CURRENT_STREAM=1`` to force dispatch/combine kernels

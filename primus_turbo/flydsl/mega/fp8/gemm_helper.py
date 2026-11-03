@@ -28,13 +28,13 @@ from flydsl.compiler.ast_rewriter import (
     ReplaceIfWithDispatch,
 )
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.buffer_ops import buffer_store, create_buffer_resource
 from flydsl.expr.typing import AddressSpace, PointerType, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 
+from primus_turbo.flydsl.utils import buffer_ops as _buffer_ops
+from primus_turbo.flydsl.utils.buffer_ops import buffer_store, create_buffer_resource
 from primus_turbo.flydsl.utils.prims import (
     _DPP_QUAD_SWAP1,
     _as_index,
@@ -119,13 +119,9 @@ def make_fp8_buffer_tensor_rebased(arg_i8, fp8_ir_t, base_elems, num_records_byt
     base = _readfirstlane_i32(base + arith.index_cast(T.i64, base_elems))
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
     # global int8 ptr at the shifted addr -> int8 BufferDesc fat ptr -> recast fp8.
     base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
-    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
-    buf_ptr = fx.make_ptr(
-        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
-    )
+    buf_ptr = fx.rocdl.make_buffer_ptr(base_ptr, num_records_bytes=nrec)
     lay = fx.make_layout(0x40000000, 1)  # 1D flat; HW bounds via num_records
     iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
     f8_buf_ptr_ty = fx.PointerType.get(
@@ -161,12 +157,8 @@ def make_bf16_buffer_tensor_rebased(arg, bf16_ir_t, base_bytes, num_records_byte
     base = _readfirstlane_i32(base + base_off)
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
     nrec = fx.Int64(_readfirstlane_i32(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
     base_ptr = fx.inttoptr(fx.PointerType.get(elem_ty=T.i8, address_space=1, alignment=16), base)
-    i8_buf_ty = fx.PointerType.get(elem_ty=T.i8, address_space=TargetAddressSpace.BufferDesc, alignment=16)
-    buf_ptr = fx.make_ptr(
-        i8_buf_ty, [base_ptr, fx.Int16(0).ir_value(), nrec.ir_value(), fx.Int32(flags).ir_value()]
-    )
+    buf_ptr = fx.rocdl.make_buffer_ptr(base_ptr, num_records_bytes=nrec)
     lay = fx.make_layout(0x40000000, 1)
     iter_i8 = fx.get_iter(fx.make_view(buf_ptr, lay))
     bf_buf_ptr_ty = fx.PointerType.get(
@@ -192,21 +184,12 @@ def make_bf16_rebased_rsrc(arg, base_elems, num_records_bytes):
     """Return a raw !llvm.ptr<8> buffer SRD whose base = arg's base advanced by
     ``base_elems`` bf16 elements (2 bytes), in 64-bit, bounded by ``num_records_bytes``.
     For buffers > 4GB (e.g. pro-cr4 interm 4.8GB) where a flat entry*D_V element offset
-    overflows the 32-bit voffset. Mirrors BufferResourceDescriptor.from_memref's
-    MakeBufferRsrcOp construction but with a rebased base. Pass directly to
-    buffer_load/buffer_store as `rsrc` (with dtype=bf16)."""
+    overflows the 32-bit voffset. Pass directly to buffer_load/buffer_store as `rsrc`
+    (with dtype=bf16)."""
     base = arith.index_cast(T.i64, _buffer_ops.extract_base_index(arg))
     base = base + arith.index_cast(T.i64, base_elems) * fx.Int64(2)
     nr = arith.minui(arith.index_cast(T.index, num_records_bytes), arith.index(0xFFFFFFFF))
-    nrec = _raw(fx.Int64(arith.index_cast(T.i64, nr)))
-    flags = _buffer_ops._get_buffer_flags()
-    llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-    base_ptr = _llvm.IntToPtrOp(llvm_ptr_ty, _raw(base)).result
-    rsrc_ty = ir.Type.parse("!llvm.ptr<8>")
-    stride_val = _buffer_ops._create_i16_constant(0)
-    flags_val = _buffer_ops._create_i32_constant(flags)
-    rsrc = rocdl.MakeBufferRsrcOp(rsrc_ty, base_ptr, stride_val, nrec, flags_val).result
-    return rsrc
+    return _buffer_ops.create_buffer_resource_from_addr(base, num_records_bytes=arith.index_cast(T.i64, nr))
 
 
 def lds_row_swizzle(row, chunks):
@@ -599,7 +582,7 @@ class ScaleS2R:
     GROUP_ROWS = 64
     GROUP_TILES = GROUP_ROWS // 16
 
-    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None):
+    def __init__(self, sp_tensor, dim, K, n_tiles, pack=1, k128p=None, row0=None):
         # Sub-tiles are contiguous per lane, so one buffer_load covers them only while a wave
         # stays inside a single group; n_tiles past GROUP_TILES would straddle two.
         assert n_tiles in (1, 2, 4), f"ScaleS2R n_tiles must sub-divide {self.GROUP_TILES}, got {n_tiles}"
@@ -608,17 +591,30 @@ class ScaleS2R:
         self.K128p = ceildiv(self.K128, self.PACK) if k128p is None else k128p
         self.n_tiles = n_tiles
         self.lane = fx.thread_idx.x % 64  # == (lane//16)*16 + lane%16
+        self.row0 = row0
+        group_bytes = self.K128p * 64 * self.GROUP_TILES * 4  # int32 records per 64-row group
+        if row0 is not None:
+            # ``row0`` (a GROUP_ROWS multiple, e.g. the tile's first row) bases the descriptor at
+            # its group in 64-bit, so a plane past 4 GiB stays reachable with 32-bit offsets.
+            self.rsrc = make_row_band_resource(
+                _buffer_ops.extract_base_index(sp_tensor),
+                row0 // self.GROUP_ROWS,
+                (dim + self.GROUP_ROWS - 1) // self.GROUP_ROWS,
+                group_bytes,
+                1,
+            )
+            return
         # cdiv (not floor): a non-GROUP_ROWS-multiple ``dim`` (general M) still needs the
         # partial last 64-row group resident so its valid rows read real scales; the
         # group's OOB rows were preshuffle-masked to 0 and StoreC drops their output.
-        nbytes = ceildiv(dim, self.GROUP_ROWS) * self.K128p * 64 * self.GROUP_TILES * 4  # int32 records
+        nbytes = ceildiv(dim, self.GROUP_ROWS) * group_bytes
         self.rsrc = _buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
 
     def load(self, base, k, kbase=0):
         """base: runtime global row/col base for this (region, wave). Returns n_tiles i32
         (packed dword for K-group kbase + k//PACK; caller selects byte k%PACK via MFMA
         op_sel). ``kbase``: packed-K base of the group's own region (0 = global packing)."""
-        grp = base // self.GROUP_ROWS
+        grp = (base if self.row0 is None else base - self.row0) // self.GROUP_ROWS
         idx = ((grp * self.K128p + k // self.PACK + kbase) * 64 + self.lane) * self.GROUP_TILES
         if self.n_tiles != self.GROUP_TILES:  # a full-group wave always starts at sub-tile 0
             idx = idx + (base % self.GROUP_ROWS) // 16  # first dword of the sub-tile it owns
@@ -1532,7 +1528,7 @@ def make_value_attrs(waves_per_eu, agpr_alloc, fwg):
             alloc = f"0,{-agpr_alloc}"
         else:
             alloc = f"{agpr_alloc},{agpr_alloc}"
-        d["passthrough"] = [
+        d["llvm.passthrough"] = [
             ["amdgpu-agpr-alloc", alloc],
             ["amdgpu-mfma-vgpr-form", "false"],
         ]
