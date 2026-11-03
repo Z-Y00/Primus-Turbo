@@ -58,10 +58,20 @@ class Softmax:
         return probs, new_max, row_sum * rescale + tile_sum, rescale
 
     @staticmethod
-    def finalize(row_max, row_sum):
-        """``(1 / row_sum, lse)`` with the LSE in natural log; an empty row gives a zero
-        output scale and ``-inf``."""
-        has_keys = row_sum > _f32(0.0)
-        inv_sum = has_keys.select(_f32(1.0) / row_sum, _f32(0.0))
-        lse = has_keys.select((row_max + fx.math.log2(row_sum)) * _f32(LN2), _f32(float("-inf")))
-        return inv_sum, lse
+    def finalize(row_max, row_sum, sink_log2=None):
+        """``(output scale, lse)`` with the LSE in natural log.
+
+        ``sink_log2`` (a learnable sink logit times log2(e)) adds one more softmax term
+        with no value vector, as in FA4: it joins the denominator and the LSE but not O.
+        An empty row then gives O = 0 and LSE = the sink; without a sink, O = 0 and
+        LSE = -inf.
+        """
+        if sink_log2 is None:
+            has_keys = row_sum > _f32(0.0)
+            scale = has_keys.select(_f32(1.0) / row_sum, _f32(0.0))
+            lse = has_keys.select((row_max + fx.math.log2(row_sum)) * _f32(LN2), _f32(float("-inf")))
+            return scale, lse
+        new_max = _max(row_max, sink_log2)
+        rescale = fx.math.exp2(row_max - new_max)
+        total = row_sum * rescale + fx.math.exp2(sink_log2 - new_max)
+        return rescale / total, (new_max + fx.math.log2(total)) * _f32(LN2)

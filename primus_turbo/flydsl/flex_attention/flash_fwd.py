@@ -23,6 +23,12 @@ With ``cu_seqlens_q`` the query side is packed instead -- q / out ``[Tq, H, D]``
 ``[Hq, Tq]`` -- and likewise k / v with ``cu_seqlens_k``. ``seqused_q`` / ``seqused_k``
 override the per-sequence lengths. Shapes and strides are read at runtime, so one
 compiled kernel serves every length.
+
+Mods follow FA4 (see ``mods.py``): ``score_mod`` gets the score times ``softmax_scale``
+and runs before the change to base 2; ``mask_mod`` is and-ed into the causal / window /
+length mask. Both are traced into the kernel and may read up to ``MAX_AUX_TENSORS``
+aux tensors. ``learnable_sink`` (fp32 ``[Hq]``) adds one value-less logit per head to
+the softmax denominator.
 """
 
 import flydsl.compiler as flyc
@@ -37,10 +43,25 @@ from primus_turbo.flydsl.flex_attention.softmax import LOG2E, Softmax
 
 MFMA_M = 32
 K_STEP = 8  # MFMA 32x32x8: four elements per lane per operand
+MAX_AUX_TENSORS = 4
 
 
 def _min(a, b):
     return (a < b).select(a, b)
+
+
+# Static dispatch lives outside the kernel body: the AST rewriter turns an ``if`` there
+# into branch closures that do not see the kernel's other locals.
+def _apply_score_mod(score_mod, score, batch, head, q_pos, kv_pos, mask: AttentionMask):
+    if score_mod is None:
+        return score
+    return score_mod(score, batch, head, mask.clamp_q(q_pos), mask.clamp_kv(kv_pos), mask.seqlen, mask.aux_tensors)
+
+
+def _sink_log2(has_sink, sink, head):
+    if not has_sink:
+        return None
+    return fx.Float32(fx.rocdl.make_buffer_tensor(sink)[head]) * fx.Float32(LOG2E)
 
 
 class FlashAttentionForward:
@@ -60,6 +81,10 @@ class FlashAttentionForward:
         varlen_k: bool = False,
         has_seqused_q: bool = False,
         has_seqused_k: bool = False,
+        score_mod=None,
+        mask_mod=None,
+        num_aux_tensors: int = 0,
+        has_learnable_sink: bool = False,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -70,6 +95,12 @@ class FlashAttentionForward:
             raise ValueError(f"tile_n must be a multiple of {MFMA_M}")
         if is_causal and is_local:
             raise ValueError("pass causal with a left window as is_local with window_right = 0")
+        if not 0 <= num_aux_tensors <= MAX_AUX_TENSORS:
+            raise ValueError(f"at most {MAX_AUX_TENSORS} aux tensors, got {num_aux_tensors}")
+        self.score_mod = score_mod
+        self.mask_mod = mask_mod
+        self.num_aux_tensors = num_aux_tensors
+        self.has_learnable_sink = has_learnable_sink
         self.dtype = dtype
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
@@ -100,6 +131,8 @@ class FlashAttentionForward:
         is_causal, is_local = self.is_causal, self.is_local
         varlen_q, varlen_k = self.varlen_q, self.varlen_k
         has_seqused_q, has_seqused_k = self.has_seqused_q, self.has_seqused_k
+        score_mod, mask_mod = self.score_mod, self.mask_mod
+        num_aux, has_sink = self.num_aux_tensors, self.has_learnable_sink
 
         @fx.struct
         class SharedStorage:
@@ -117,6 +150,11 @@ class FlashAttentionForward:
             CuSeqlensK: fx.Tensor,
             SeqUsedQ: fx.Tensor,
             SeqUsedK: fx.Tensor,
+            Aux0: fx.Tensor,
+            Aux1: fx.Tensor,
+            Aux2: fx.Tensor,
+            Aux3: fx.Tensor,
+            Sink: fx.Tensor,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             softmax_scale: fx.Float32,
@@ -175,7 +213,10 @@ class FlashAttentionForward:
                 seqused_q=fx.rocdl.make_buffer_tensor(SeqUsedQ) if has_seqused_q else None,
                 seqused_k=fx.rocdl.make_buffer_tensor(SeqUsedK) if has_seqused_k else None,
             )
-            mask = AttentionMask(seqlen, is_causal, is_local, window_left, window_right)
+            aux_tensors = tuple(fx.rocdl.make_buffer_tensor(t) for t in (Aux0, Aux1, Aux2, Aux3)[:num_aux])
+            mask = AttentionMask(
+                seqlen, is_causal, is_local, window_left, window_right, mask_mod, batch, head, aux_tensors
+            )
 
             # Helpers defined in the kernel body are AST-rewritten along with it: an
             # ``if`` becomes branch closures, so a ``return`` inside one would only leave
@@ -225,7 +266,8 @@ class FlashAttentionForward:
                     acc = Vec(acc)
                     for j in range_constexpr(16):
                         kv_pos = kv_base + fx.Int32(half * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[j]))
-                        scores.append(acc[j] * softmax_scale * fx.Float32(LOG2E))
+                        score = _apply_score_mod(score_mod, acc[j] * softmax_scale, batch, head, q_pos, kv_pos, mask)
+                        scores.append(score * fx.Float32(LOG2E))
                         keep.append(mask.keep(q_pos, kv_pos))
 
                 probs, new_max, new_sum, rescale = Softmax.online_softmax(row_max, row_sum, scores, keep)
@@ -272,7 +314,9 @@ class FlashAttentionForward:
                     results = yield [row_max, row_sum] + o_acc
 
                 # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
-                inv_sum, lse = Softmax.finalize(fx.Float32(results[0]), fx.Float32(results[1]))
+                inv_sum, lse = Softmax.finalize(
+                    fx.Float32(results[0]), fx.Float32(results[1]), _sink_log2(has_sink, Sink, head)
+                )
                 inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
                 if q_pos < seqlen.seqlen_q:
                     o_packs = fx.logical_divide(q_side_row(o_t, q_row, head), fx.make_layout(4, 1))
@@ -302,6 +346,11 @@ class FlashAttentionForward:
             CuSeqlensK: fx.Tensor,
             SeqUsedQ: fx.Tensor,
             SeqUsedK: fx.Tensor,
+            Aux0: fx.Tensor,
+            Aux1: fx.Tensor,
+            Aux2: fx.Tensor,
+            Aux3: fx.Tensor,
+            Sink: fx.Tensor,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32,
@@ -314,7 +363,7 @@ class FlashAttentionForward:
         ):
             kernel(
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
-                seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                Aux0, Aux1, Aux2, Aux3, Sink, seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
             ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -334,6 +383,8 @@ class FlashAttentionForward:
         seqused_q=None,
         seqused_k=None,
         max_seqlen_q=None,
+        aux_tensors=(),
+        learnable_sink=None,
         stream=None,
     ):
         """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
@@ -344,6 +395,11 @@ class FlashAttentionForward:
             raise ValueError("cu_seqlens_q / cu_seqlens_k do not match how this kernel was built")
         if (seqused_q is not None) != self.has_seqused_q or (seqused_k is not None) != self.has_seqused_k:
             raise ValueError("seqused_q / seqused_k do not match how this kernel was built")
+        aux_tensors = tuple(aux_tensors or ())
+        if len(aux_tensors) != self.num_aux_tensors:
+            raise ValueError(f"kernel built for {self.num_aux_tensors} aux tensors, got {len(aux_tensors)}")
+        if (learnable_sink is not None) != self.has_learnable_sink:
+            raise ValueError("learnable_sink does not match how this kernel was built")
         if self.varlen_q:
             total_q, num_heads, _ = q.shape
             batch = cu_seqlens_q.numel() - 1
@@ -358,6 +414,9 @@ class FlashAttentionForward:
         if lse is None:
             lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
         placeholder = lse
+        if learnable_sink is not None:
+            learnable_sink = learnable_sink.to(torch.float32).contiguous()
+        aux_slots = aux_tensors + (placeholder,) * (MAX_AUX_TENSORS - len(aux_tensors))
         num_m_blocks = max((seqlen_q + self.tile_m - 1) // self.tile_m, 1)
         stream = torch.cuda.current_stream() if stream is None else stream
         self.launcher(
@@ -366,6 +425,8 @@ class FlashAttentionForward:
             cu_seqlens_k if cu_seqlens_k is not None else placeholder,
             seqused_q if seqused_q is not None else placeholder,
             seqused_k if seqused_k is not None else placeholder,
+            *aux_slots,
+            learnable_sink if learnable_sink is not None else placeholder,
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
