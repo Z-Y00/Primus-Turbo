@@ -89,6 +89,7 @@ class FlashAttentionForward:
         block_sparse: bool = False,
         has_full_blocks: bool = False,
         sparse_block_size: tuple | None = None,
+        paged_kv: bool = False,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -121,6 +122,9 @@ class FlashAttentionForward:
         self.num_threads = 64 * num_waves
         if block_sparse and (varlen_q or varlen_k):
             raise NotImplementedError("block sparsity with varlen is not supported yet")
+        if paged_kv and varlen_k:
+            raise ValueError("page_table is not supported with cu_seqlens_k (as in FA4)")
+        self.paged_kv = paged_kv
         self.block_sparse = block_sparse
         self.has_full_blocks = block_sparse and has_full_blocks
         self.sparse_block_size = sparse_block_size
@@ -145,6 +149,7 @@ class FlashAttentionForward:
         num_aux, has_sink = self.num_aux_tensors, self.has_learnable_sink
         block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
         Q_SUB, KV_SUB = self.q_subtile, self.kv_subtile
+        paged_kv = self.paged_kv
 
         @fx.struct
         class SharedStorage:
@@ -171,6 +176,8 @@ class FlashAttentionForward:
             MaskIdx: fx.Tensor,
             FullCnt: fx.Tensor,
             FullIdx: fx.Tensor,
+            PageTable: fx.Tensor,
+            page_size: fx.Int32,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             softmax_scale: fx.Float32,
@@ -242,8 +249,14 @@ class FlashAttentionForward:
                 coord = (seqlen.offset_q + pos, h, None) if varlen_q else (batch, pos, h, None)
                 return fx.slice(t, coord)
 
+            pages = fx.slice(fx.rocdl.make_buffer_tensor(PageTable), (batch, None)) if paged_kv else None
+
             def kv_side_row(t, pos):
-                coord = (seqlen.offset_k + pos, kv_head, None) if varlen_k else (batch, pos, kv_head, None)
+                coord = (
+                    (fx.Int32(pages[pos // page_size]), pos % page_size, kv_head, None) if paged_kv
+                    else (seqlen.offset_k + pos, kv_head, None) if varlen_k
+                    else (batch, pos, kv_head, None)
+                )
                 return fx.slice(t, coord)
 
             def stage_kv(kv_base):
@@ -398,6 +411,8 @@ class FlashAttentionForward:
             MaskIdx: fx.Tensor,
             FullCnt: fx.Tensor,
             FullIdx: fx.Tensor,
+            PageTable: fx.Tensor,
+            page_size: fx.Int32,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32,
@@ -410,7 +425,8 @@ class FlashAttentionForward:
         ):
             kernel(
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
-                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, page_size,
+                seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
             ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -433,12 +449,19 @@ class FlashAttentionForward:
         aux_tensors=(),
         learnable_sink=None,
         block_sparse_tensors=None,
+        page_table=None,
         stream=None,
     ):
         """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
-        size the grid. Absent optional tensors are passed as unused placeholders."""
+        size the grid. Absent optional tensors are passed as unused placeholders.
+
+        Paged KV (FA4): k / v are ``[num_pages, page_size, Hk, D]`` and ``page_table``
+        ``[B, max_pages]`` int32; sequence lengths come from ``seqused_k``, else
+        ``max_pages * page_size``."""
         import torch
 
+        if (page_table is not None) != self.paged_kv:
+            raise ValueError("page_table does not match how this kernel was built")
         if (cu_seqlens_q is not None) != self.varlen_q or (cu_seqlens_k is not None) != self.varlen_k:
             raise ValueError("cu_seqlens_q / cu_seqlens_k do not match how this kernel was built")
         if (seqused_q is not None) != self.has_seqused_q or (seqused_k is not None) != self.has_seqused_k:
@@ -466,6 +489,12 @@ class FlashAttentionForward:
             batch, seqlen_q, num_heads, _ = q.shape
             out_shape, lse_shape = (batch, seqlen_q, num_heads, self.head_dim_v), (batch, num_heads, seqlen_q)
         seqlen_k = 0 if self.varlen_k else k.shape[1]
+        page_size = 1
+        if self.paged_kv:
+            if page_table.dtype != torch.int32 or page_table.shape[0] != batch:
+                raise ValueError("page_table must be int32 [batch, max_pages]")
+            page_size = k.shape[1]
+            seqlen_k = page_table.shape[1] * page_size
         if out is None:
             out = torch.empty(out_shape, dtype=q.dtype, device=q.device)
         if lse is None:
@@ -492,6 +521,7 @@ class FlashAttentionForward:
             *aux_slots,
             learnable_sink if learnable_sink is not None else placeholder,
             *sparse_slots,
+            page_table if page_table is not None else placeholder, page_size,
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
