@@ -56,6 +56,16 @@ class BlockInfo:
                 n_block_min = (window_left >= zero).select(_max(first_key, zero) // fx.Int32(self.tile_n), zero)
         return n_block_min, n_block_max
 
+    @staticmethod
+    def split(n_block_min, n_block_max, split_idx, num_splits):
+        """FA4's split-KV share: ``ceil(n / num_splits)`` consecutive blocks per split."""
+        zero = fx.Int32(0)
+        per_split = (n_block_max > n_block_min).select(
+            (n_block_max - n_block_min + num_splits - fx.Int32(1)) // num_splits, zero
+        )
+        lo = n_block_min + split_idx * per_split
+        return lo, _min(lo + per_split, n_block_max)
+
     def get_m_block_min_max(self, seqlen: SeqlenInfo, n_block, window_left, window_right):
         """``[m_block_min, m_block_max)``: the query blocks that can see a KV block (the
         backward's dK / dV loop). An empty range may come out with min > max."""

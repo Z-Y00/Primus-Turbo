@@ -38,6 +38,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.flex_attention.block_info import BlockInfo
 from primus_turbo.flydsl.flex_attention.block_sparsity import broadcast_heads, subtile_factors
+from primus_turbo.flydsl.flex_attention.combine import flash_attn_combine
 from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LOG2E, Softmax
@@ -90,6 +91,7 @@ class FlashAttentionForward:
         has_full_blocks: bool = False,
         sparse_block_size: tuple | None = None,
         paged_kv: bool = False,
+        split_kv: bool = False,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -125,6 +127,9 @@ class FlashAttentionForward:
         if paged_kv and varlen_k:
             raise ValueError("page_table is not supported with cu_seqlens_k (as in FA4)")
         self.paged_kv = paged_kv
+        if split_kv and (block_sparse or has_learnable_sink):
+            raise NotImplementedError("split-KV with block sparsity or a learnable sink is not supported")
+        self.split_kv = split_kv
         self.block_sparse = block_sparse
         self.has_full_blocks = block_sparse and has_full_blocks
         self.sparse_block_size = sparse_block_size
@@ -149,7 +154,8 @@ class FlashAttentionForward:
         num_aux, has_sink = self.num_aux_tensors, self.has_learnable_sink
         block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
         Q_SUB, KV_SUB = self.q_subtile, self.kv_subtile
-        paged_kv = self.paged_kv
+        paged_kv, split_kv = self.paged_kv, self.split_kv
+        o_elem = fx.Float32 if split_kv else elem
 
         @fx.struct
         class SharedStorage:
@@ -178,6 +184,7 @@ class FlashAttentionForward:
             FullIdx: fx.Tensor,
             PageTable: fx.Tensor,
             page_size: fx.Int32,
+            num_splits: fx.Int32,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             softmax_scale: fx.Float32,
@@ -189,7 +196,8 @@ class FlashAttentionForward:
             wave = tid // fx.Int32(64)
             m_block = fx.Int32(fx.block_idx.x)
             head = fx.Int32(fx.block_idx.y)
-            batch = fx.Int32(fx.block_idx.z)
+            batch = fx.Int32(fx.block_idx.z) // num_splits
+            split_idx = fx.Int32(fx.block_idx.z) % num_splits
             kv_head = head // fx.Int32(Q_PER_KV)
 
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, K_STEP, elem))
@@ -208,6 +216,8 @@ class FlashAttentionForward:
 
             copy_g128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem)
             copy_g64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
+            # Split-KV partial outputs are fp32: four elements are 128 bits.
+            copy_o = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32) if split_kv else copy_g64
             copy_s128 = fx.make_copy_atom(fx.UniversalCopy128b(), elem)
             copy_s64 = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
             copy_s16 = fx.make_copy_atom(fx.UniversalCopy16b(), elem)
@@ -248,6 +258,15 @@ class FlashAttentionForward:
                 """Row ``pos`` of this sequence in a query-side tensor (q or out)."""
                 coord = (seqlen.offset_q + pos, h, None) if varlen_q else (batch, pos, h, None)
                 return fx.slice(t, coord)
+
+            def out_row(pos):
+                """Row of O, or of this split's partial O ``[num_splits, ...]``."""
+                coord = (seqlen.offset_q + pos, head, None) if varlen_q else (batch, pos, head, None)
+                return fx.slice(o_t, (split_idx,) + coord if split_kv else coord)
+
+            def lse_head_row():
+                coord = (head, None) if varlen_q else (batch, head, None)
+                return fx.slice(lse_t, (split_idx,) + coord if split_kv else coord)
 
             pages = fx.slice(fx.rocdl.make_buffer_tensor(PageTable), (batch, None)) if paged_kv else None
 
@@ -323,6 +342,8 @@ class FlashAttentionForward:
             # barriers inside stay convergent.
             if m_block * fx.Int32(TM) < seqlen.seqlen_q:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, window_left, window_right)
+                if split_kv:
+                    n_block_min, n_block_max = BlockInfo.split(n_block_min, n_block_max, split_idx, num_splits)
                 q_pos = m_block * fx.Int32(TM) + wave * fx.Int32(MFMA_M) + fx.Int32(fx.get_scalar(c_cols[0]))
                 q_row = _min(q_pos, seqlen.seqlen_q - fx.Int32(1))
 
@@ -375,21 +396,17 @@ class FlashAttentionForward:
                 )
                 inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
                 if q_pos < seqlen.seqlen_q:
-                    o_packs = fx.logical_divide(q_side_row(o_t, q_row, head), fx.make_layout(4, 1))
+                    o_packs = fx.logical_divide(out_row(q_row), fx.make_layout(4, 1))
                     for c in range_constexpr(DV // MFMA_M):
                         o = Vec(results[2 + c]) * inv_vec
                         for g in range_constexpr(4):
                             d_start = fx.Int32(c * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[4 * g]))
-                            reg = fx.make_rmem_tensor(4, elem)
-                            reg.store(Vec.from_elements([o[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(elem))
-                            fx.copy(copy_g64, reg, fx.slice(o_packs, (None, d_start // fx.Int32(4))))
+                            reg = fx.make_rmem_tensor(4, o_elem)
+                            reg.store(Vec.from_elements([o[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(o_elem))
+                            fx.copy(copy_o, reg, fx.slice(o_packs, (None, d_start // fx.Int32(4))))
                     if lane < fx.Int32(MFMA_M):
-                        if varlen_q:
-                            lse_row = fx.slice(lse_t, (head, None))
-                            lse_row[seqlen.offset_q + q_row] = lse
-                        else:
-                            lse_row = fx.slice(lse_t, (batch, head, None))
-                            lse_row[q_row] = lse
+                        lse_row = lse_head_row()
+                        lse_row[seqlen.offset_q + q_row if varlen_q else q_row] = lse
 
         @flyc.jit
         def launch(
@@ -413,6 +430,7 @@ class FlashAttentionForward:
             FullIdx: fx.Tensor,
             PageTable: fx.Tensor,
             page_size: fx.Int32,
+            num_splits: fx.Int32,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32,
@@ -425,9 +443,9 @@ class FlashAttentionForward:
         ):
             kernel(
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
-                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, page_size,
+                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, page_size, num_splits,
                 seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
-            ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
+            ).launch(grid=(num_m_blocks, num_heads, batch * num_splits), block=(NT, 1, 1), stream=stream)
 
         return launch
 
@@ -450,6 +468,7 @@ class FlashAttentionForward:
         learnable_sink=None,
         block_sparse_tensors=None,
         page_table=None,
+        num_splits=1,
         stream=None,
     ):
         """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
@@ -462,6 +481,8 @@ class FlashAttentionForward:
 
         if (page_table is not None) != self.paged_kv:
             raise ValueError("page_table does not match how this kernel was built")
+        if num_splits != 1 and not self.split_kv:
+            raise ValueError("num_splits > 1 needs a kernel built with split_kv=True")
         if (cu_seqlens_q is not None) != self.varlen_q or (cu_seqlens_k is not None) != self.varlen_k:
             raise ValueError("cu_seqlens_q / cu_seqlens_k do not match how this kernel was built")
         if (seqused_q is not None) != self.has_seqused_q or (seqused_k is not None) != self.has_seqused_k:
@@ -495,6 +516,10 @@ class FlashAttentionForward:
                 raise ValueError("page_table must be int32 [batch, max_pages]")
             page_size = k.shape[1]
             seqlen_k = page_table.shape[1] * page_size
+        final_out, final_lse = out, lse
+        if self.split_kv:
+            out = torch.empty((num_splits, *out_shape), dtype=torch.float32, device=q.device)
+            lse = torch.empty((num_splits, *lse_shape), dtype=torch.float32, device=q.device)
         if out is None:
             out = torch.empty(out_shape, dtype=q.dtype, device=q.device)
         if lse is None:
@@ -521,9 +546,17 @@ class FlashAttentionForward:
             *aux_slots,
             learnable_sink if learnable_sink is not None else placeholder,
             *sparse_slots,
-            page_table if page_table is not None else placeholder, page_size,
+            page_table if page_table is not None else placeholder, page_size, int(num_splits),
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
         )
-        return out, lse
+        if not self.split_kv:
+            return out, lse
+        # Partial LSE is [splits, *lse_shape]; combine takes FA4's [splits, ..., S, H].
+        out, lse_c = flash_attn_combine(out, lse.transpose(-1, -2), out=final_out, out_dtype=q.dtype)
+        lse_c = lse_c.transpose(-1, -2)
+        if final_lse is None:
+            return out, lse_c.contiguous()
+        final_lse.copy_(lse_c)
+        return out, final_lse
