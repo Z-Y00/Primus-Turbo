@@ -158,12 +158,13 @@ class FlashAttentionForward:
         # FP8 runs natively in the GPU's format: FNUZ on gfx942, OCP on gfx950.
         self.fp8_ocp = _arch_has_ocp_fp8() if dtype in FP8_DTYPES and fp8_ocp is None else bool(fp8_ocp)
         self.input_dtype = dtype
-        # FlyDSL 0.3.4.1 has no e5m2 FNUZ type, so on gfx942 e5m2 inputs are dequantized
+        # FlyDSL 0.3.4.1 has no e5m2 MFMA on either target (no FNUZ e5m2 type for gfx942;
+        # its MFMA atom rejects OCP e5m2 on gfx950), so e5m2 inputs are dequantized
         # (exactly; only the descale multiply rounds) and run through the bf16 kernel.
-        self.dequant_e5m2 = dtype == "fp8_e5m2" and not self.fp8_ocp
+        self.dequant_e5m2 = dtype == "fp8_e5m2"
         if self.dequant_e5m2:
             if paged_kv:
-                raise NotImplementedError("paged KV with fp8 e5m2 needs gfx950 (no e5m2 FNUZ in FlyDSL)")
+                raise NotImplementedError("paged KV with fp8 e5m2 (no e5m2 MFMA in FlyDSL 0.3.4.1)")
             dtype = "bf16"
         self.fp8 = dtype in FP8_DTYPES
         if tile_n % MFMA_M:

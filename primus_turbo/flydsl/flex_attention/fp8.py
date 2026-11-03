@@ -6,19 +6,18 @@
 
 """FP8 inputs in the GPU's native format: FNUZ on gfx942, OCP on gfx950.
 
-An OCP fp8 and its FNUZ twin share bit patterns, the FNUZ value being exactly half
-(one more exponent bias). Converting is a reinterpretation with the per-tensor factor
-folded into the descale, plus fix-ups for the encodings with no counterpart: OCP's -0
-is FNUZ's NaN (-> +0), and FNUZ's largest-magnitude codes are OCP NaN / inf (->
-saturated to OCP's largest finite value). NaN / inf inputs are not preserved.
+OCP -> FNUZ (gfx942) reinterprets the bits: the same code is exactly half the value in
+FNUZ (one more exponent bias), so the factor of 2 goes into the descale and the result
+is exact; OCP's -0 is FNUZ's NaN and becomes +0. FNUZ -> OCP (gfx950) cannot do the
+same, because FNUZ's largest codes would double past OCP's range, so it converts by
+value instead: exact except that FNUZ's smallest subnormal rounds. NaN / inf inputs are
+not preserved.
 """
 
 import torch
 
 _OCP = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2}
 _FNUZ = {"fp8_e4m3": torch.float8_e4m3fnuz, "fp8_e5m2": torch.float8_e5m2fnuz}
-# Smallest magnitude code that is not finite in OCP: e4m3fn 0x7F (NaN), e5m2 0x7C (inf).
-_OCP_NONFINITE = {"fp8_e4m3": 0x7F, "fp8_e5m2": 0x7C}
 
 
 def _convert(t: torch.Tensor, dtype: str, to_ocp: bool):
@@ -29,12 +28,9 @@ def _convert(t: torch.Tensor, dtype: str, to_ocp: bool):
     source = _FNUZ[dtype] if to_ocp else _OCP[dtype]
     if t.dtype != source:
         raise TypeError(f"expected {_OCP[dtype]} or {_FNUZ[dtype]}, got {t.dtype}")
-    bits = t.view(torch.uint8)
     if to_ocp:
-        magnitude = bits & 0x7F
-        limit = _OCP_NONFINITE[dtype]
-        bits = torch.where(magnitude >= limit, (bits & 0x80) | (limit - 1), bits)
-        return bits.view(target), 0.5
+        return t.to(torch.float32).to(target), 1.0
+    bits = t.view(torch.uint8)
     return torch.where(bits == 0x80, torch.zeros_like(bits), bits).view(target), 2.0
 
 

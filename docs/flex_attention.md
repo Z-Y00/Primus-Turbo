@@ -115,9 +115,11 @@ FlyDSL mod is called, so aux reads stay in bounds without a mask. The built-in m
 | `num_splits` | causal/window or no mask | the same |
 
 The FlyDSL kernels themselves cover more than this interface exposes: paged KV,
-`seqused_q` / `seqused_k`, learnable sinks, and fp8 forward (FNUZ on gfx942, OCP on
-gfx950), with FA4's arguments (`FlashAttentionForward`, `FlashAttentionBackward`,
-`flash_attn_combine`).
+`seqused_q` / `seqused_k`, learnable sinks, and fp8 forward with FA4's arguments
+(`FlashAttentionForward`, `FlashAttentionBackward`, `flash_attn_combine`). E4M3 runs in
+the GPU's native format (FNUZ on gfx942, OCP on gfx950; the other format is converted
+on entry). E5M2 has no MFMA in FlyDSL 0.3.4.1 on either target, so it is dequantized
+exactly to bf16 and runs on the bf16 kernel (not with paged KV).
 
 ## Other differences
 

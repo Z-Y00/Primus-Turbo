@@ -147,7 +147,7 @@ def bench_inkling(layer, compiled, backend):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cases", default="", help="substring filter on case names")
+    parser.add_argument("--cases", default="", help="comma-separated substring filters on case names")
     parser.add_argument("--mode", default="default", help="torch.compile mode for PyTorch FlexAttention")
     parser.add_argument(
         "--backend",
@@ -166,7 +166,7 @@ def main():
     jobs = [(c[0], bench_dense, c) for c in dense_cases()]
     jobs += [(layer.name, bench_inkling, (layer,)) for layer in inkling.INKLING_LAYERS]
     for name, fn, case in jobs:
-        if args.cases not in name:
+        if not any(c in name for c in args.cases.split(",")):
             continue
         name, flops, (t_fwd, t_fb), (o_fwd, o_fb), diff = fn(*case, compiled, args.backend)
         rows.append(
