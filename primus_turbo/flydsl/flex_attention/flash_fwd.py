@@ -1,0 +1,283 @@
+###############################################################################
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# See LICENSE for license information.
+###############################################################################
+
+"""Flash attention forward in FlyDSL, structured after FA4's ``FlashAttentionForwardSm80``
+(``flash_attn/cute/flash_fwd.py``) and written for CDNA's wave64 MFMA (gfx942 first).
+
+Layout. A CTA holds ``num_waves`` waves; each wave owns 32 query rows. Scores are
+computed transposed, S^T = K . Q^T, with MFMA 32x32x8, so each lane holds one query
+row (the accumulator column) and 16 of a 32-key tile's scores for it -- the rest sit
+in lane ``^ 32``. That keeps the softmax reductions in-lane plus one shuffle, and lets
+the probabilities feed the PV product without any data movement: accumulator group
+``g`` (elements ``4g .. 4g+3``) is exactly the B fragment of reduction step ``g`` of
+O^T = V^T . P^T. Q lives in registers for the whole loop; each KV tile is staged
+global -> registers -> LDS once per CTA and read by every wave. Rows past a sequence's
+end are loaded clamped to its last row (never out of bounds) and masked away.
+
+Tensors are FA4's dense layout: q ``[B, Sq, Hq, D]``, k ``[B, Sk, Hk, D]``,
+v ``[B, Sk, Hk, Dv]``, out ``[B, Sq, Hq, Dv]``, lse ``[B, Hq, Sq]`` (fp32, natural log).
+Shapes and strides are read at runtime, so one compiled kernel serves every length.
+"""
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Vector as Vec
+
+from primus_turbo.flydsl.flex_attention.block_info import BlockInfo
+from primus_turbo.flydsl.flex_attention.mask import AttentionMask
+from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
+from primus_turbo.flydsl.flex_attention.softmax import LOG2E, Softmax
+
+MFMA_M = 32
+K_STEP = 8  # MFMA 32x32x8: four elements per lane per operand
+
+
+def _min(a, b):
+    return (a < b).select(a, b)
+
+
+class FlashAttentionForward:
+    """Builds and caches the launcher for one compile-time configuration."""
+
+    def __init__(
+        self,
+        dtype: str = "bf16",
+        head_dim: int = 128,
+        head_dim_v: int | None = None,
+        qhead_per_kvhead: int = 1,
+        is_causal: bool = False,
+        is_local: bool = False,
+        tile_n: int = 64,
+        num_waves: int = 4,
+    ):
+        if dtype not in ("bf16", "fp16"):
+            raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
+        head_dim_v = head_dim if head_dim_v is None else head_dim_v
+        if head_dim % K_STEP or head_dim_v % MFMA_M:
+            raise ValueError(f"need head_dim % {K_STEP} == 0 and head_dim_v % {MFMA_M} == 0")
+        if tile_n % MFMA_M:
+            raise ValueError(f"tile_n must be a multiple of {MFMA_M}")
+        if is_causal and is_local:
+            raise ValueError("pass causal with a left window as is_local with window_right = 0")
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_causal = is_causal
+        self.is_local = is_local
+        self.tile_n = tile_n
+        self.num_waves = num_waves
+        self.tile_m = MFMA_M * num_waves
+        self.num_threads = 64 * num_waves
+        for d in (head_dim, head_dim_v):
+            if (tile_n * d // 8) % self.num_threads:
+                raise ValueError(f"KV tile {tile_n}x{d} does not split evenly over {self.num_threads} threads")
+        self.launcher = self._build()
+
+    def _build(self):
+        D, DV, TN = self.head_dim, self.head_dim_v, self.tile_n
+        NW, NT, TM = self.num_waves, self.num_threads, self.tile_m
+        Q_PER_KV = self.qhead_per_kvhead
+        elem = fx.BFloat16 if self.dtype == "bf16" else fx.Float16
+        k_iters = TN * D // 8 // NT
+        v_iters = TN * DV // 8 // NT
+        block_info = BlockInfo(TM, TN, self.is_causal, self.is_local)
+        is_causal, is_local = self.is_causal, self.is_local
+
+        @fx.struct
+        class SharedStorage:
+            k: fx.Array[elem, TN * D, 16]
+            v: fx.Array[elem, TN * DV, 16]
+
+        @flyc.kernel(known_block_size=[NT, 1, 1])
+        def kernel(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,  # noqa: E741
+            LSE: fx.Tensor,
+            seqlen_q: fx.Int32,
+            seqlen_k: fx.Int32,
+            softmax_scale: fx.Float32,
+            window_left: fx.Int32,
+            window_right: fx.Int32,
+        ):
+            tid = fx.thread_idx.x
+            lane = tid % fx.Int32(64)
+            wave = tid // fx.Int32(64)
+            m_block = fx.Int32(fx.block_idx.x)
+            head = fx.Int32(fx.block_idx.y)
+            batch = fx.Int32(fx.block_idx.z)
+            kv_head = head // fx.Int32(Q_PER_KV)
+
+            mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, K_STEP, elem))
+            tiled_mma = fx.make_tiled_mma(mma_atom, fx.make_layout((1, 1, 1), (1, 1, 1)))
+            thr_mma = tiled_mma.get_slice(lane)
+            # Coordinate views: an element's value is its own (row, col) index.
+            b_coords = thr_mma.partition_B(fx.make_view(0, fx.make_layout((MFMA_M, K_STEP), (1, MFMA_M))))
+            c_rows = thr_mma.partition_C(fx.make_view(0, fx.make_layout((MFMA_M, MFMA_M), (1, 0))))
+            c_cols = thr_mma.partition_C(fx.make_view(0, fx.make_layout((MFMA_M, MFMA_M), (0, 1))))
+
+            def mfma(a_frag, b_frag, acc):
+                c_frag = fx.make_fragment_like(c_rows, fx.Float32)
+                c_frag.store(Vec(acc))
+                fx.gemm(tiled_mma, c_frag, a_frag, b_frag, c_frag)
+                return c_frag.load()
+
+            copy_g128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem)
+            copy_g64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
+            copy_s128 = fx.make_copy_atom(fx.UniversalCopy128b(), elem)
+            copy_s64 = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
+            copy_s16 = fx.make_copy_atom(fx.UniversalCopy16b(), elem)
+            copy_k = fx.make_tiled_copy_A(copy_s64, tiled_mma).get_slice(lane)
+            copy_vt = fx.make_tiled_copy_A(copy_s16, tiled_mma).get_slice(lane)
+
+            q_t = fx.rocdl.make_buffer_tensor(Q)
+            k_t = fx.rocdl.make_buffer_tensor(K)
+            v_t = fx.rocdl.make_buffer_tensor(V)
+            o_t = fx.rocdl.make_buffer_tensor(O)
+            lse_t = fx.rocdl.make_buffer_tensor(LSE)
+
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, K_STEP))
+            k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(8, 1))
+            # V^T view of the row-major [TN, DV] V tile: (d, key) with strides (1, DV).
+            vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, K_STEP))
+            v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(8, 1))
+
+            seqlen = SeqlenInfo.create_dense(seqlen_q, seqlen_k)
+            mask = AttentionMask(seqlen, is_causal, is_local, window_left, window_right)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, window_left, window_right)
+
+            q_pos = m_block * fx.Int32(TM) + wave * fx.Int32(MFMA_M) + fx.Int32(fx.get_scalar(c_cols[0]))
+            q_row = _min(q_pos, seqlen_q - fx.Int32(1))
+
+            # ---- Q: B fragments for every reduction step, register-resident ----
+            q_k0 = fx.Int32(fx.get_scalar(b_coords[0])) // fx.Int32(MFMA_M)  # this lane's first k in a step
+            q_packs = fx.logical_divide(fx.slice(q_t, (batch, q_row, head, None)), fx.make_layout(4, 1))
+            q_frags = []
+            for ks in range_constexpr(D // K_STEP):
+                reg = fx.make_rmem_tensor(4, elem)
+                fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * K_STEP) + q_k0) // fx.Int32(4))), reg)
+                frag = fx.make_fragment_like(b_coords, elem)
+                frag.store(Vec(reg.load()))
+                q_frags.append(frag)
+
+            def stage_kv(kv_base):
+                """Copy the K and V tiles at ``kv_base`` to LDS (rows clamped to the sequence)."""
+                for it in range_constexpr(k_iters):
+                    linear = fx.Int32(it * NT) + tid
+                    row = linear // fx.Int32(D // 8)
+                    key = _min(kv_base + row, seqlen_k - fx.Int32(1))
+                    src = fx.logical_divide(fx.slice(k_t, (batch, key, kv_head, None)), fx.make_layout(8, 1))
+                    reg = fx.make_rmem_tensor(8, elem)
+                    fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // 8))), reg)
+                    fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, linear)))
+                for it in range_constexpr(v_iters):
+                    linear = fx.Int32(it * NT) + tid
+                    row = linear // fx.Int32(DV // 8)
+                    key = _min(kv_base + row, seqlen_k - fx.Int32(1))
+                    src = fx.logical_divide(fx.slice(v_t, (batch, key, kv_head, None)), fx.make_layout(8, 1))
+                    reg = fx.make_rmem_tensor(8, elem)
+                    fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(DV // 8))), reg)
+                    fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, linear)))
+
+            def compute_one_n_block(n_block, row_max, row_sum, o_acc):
+                kv_base = n_block * fx.Int32(TN)
+                fx.gpu.barrier()  # every wave is done reading the previous tile
+                stage_kv(kv_base)
+                fx.gpu.barrier()
+
+                zero16 = Vec.filled(16, 0.0, fx.Float32)
+                scores, keep = [], []
+                for half in range_constexpr(TN // MFMA_M):
+                    acc = zero16
+                    for ks in range_constexpr(D // K_STEP):
+                        tile = fx.slice(k_lds_tiles, (None, None, half, ks))
+                        a_frag = thr_mma.make_fragment_A(tile)
+                        fx.copy(copy_s64, copy_k.partition_S(tile), copy_k.retile(a_frag))
+                        acc = mfma(a_frag, q_frags[ks], acc)
+                    acc = Vec(acc)
+                    for j in range_constexpr(16):
+                        kv_pos = kv_base + fx.Int32(half * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[j]))
+                        scores.append(acc[j] * softmax_scale * fx.Float32(LOG2E))
+                        keep.append(mask.keep(q_pos, kv_pos))
+
+                probs, new_max, new_sum, rescale = Softmax.online_softmax(row_max, row_sum, scores, keep)
+                rescale_vec = Vec.from_elements([rescale], fx.Float32).broadcast_to(16)
+                o_acc = [Vec(o) * rescale_vec for o in o_acc]
+                for half in range_constexpr(TN // MFMA_M):
+                    for g in range_constexpr(MFMA_M // K_STEP):
+                        first = half * 16 + 4 * g
+                        p_frag = fx.make_fragment_like(b_coords, elem)
+                        p_frag.store(Vec.from_elements(probs[first : first + 4], fx.Float32).to(elem))
+                        for c in range_constexpr(DV // MFMA_M):
+                            tile = fx.slice(vt_lds_tiles, (None, None, c, half * (MFMA_M // K_STEP) + g))
+                            a_frag = thr_mma.make_fragment_A(tile)
+                            fx.copy(copy_s16, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
+                            o_acc[c] = mfma(a_frag, p_frag, o_acc[c])
+                return new_max, new_sum, o_acc
+
+            init = Softmax.initial_state() + [Vec.filled(16, 0.0, fx.Float32) for _ in range_constexpr(DV // MFMA_M)]
+            results = init
+            for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
+                o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                row_max, row_sum, o_acc = compute_one_n_block(fx.Int32(n_iter), state[0], state[1], o_state)
+                results = yield [row_max, row_sum] + o_acc
+
+            # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
+            inv_sum, lse = Softmax.finalize(fx.Float32(results[0]), fx.Float32(results[1]))
+            inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
+            if q_pos < seqlen_q:
+                o_packs = fx.logical_divide(fx.slice(o_t, (batch, q_row, head, None)), fx.make_layout(4, 1))
+                for c in range_constexpr(DV // MFMA_M):
+                    o = Vec(results[2 + c]) * inv_vec
+                    for g in range_constexpr(4):
+                        d_start = fx.Int32(c * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[4 * g]))
+                        reg = fx.make_rmem_tensor(4, elem)
+                        reg.store(Vec.from_elements([o[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(elem))
+                        fx.copy(copy_g64, reg, fx.slice(o_packs, (None, d_start // fx.Int32(4))))
+                if lane < fx.Int32(MFMA_M):
+                    lse_row = fx.slice(lse_t, (batch, head, None))
+                    lse_row[q_row] = lse
+
+        @flyc.jit
+        def launch(
+            Q: fx.Tensor,
+            K: fx.Tensor,
+            V: fx.Tensor,
+            O: fx.Tensor,  # noqa: E741
+            LSE: fx.Tensor,
+            seqlen_q: fx.Int32,
+            seqlen_k: fx.Int32,
+            num_m_blocks: fx.Int32,
+            num_heads: fx.Int32,
+            batch: fx.Int32,
+            softmax_scale: fx.Float32,
+            window_left: fx.Int32,
+            window_right: fx.Int32,
+            stream: fx.Stream = fx.Stream(None),
+        ):
+            kernel(Q, K, V, O, LSE, seqlen_q, seqlen_k, softmax_scale, window_left, window_right).launch(
+                grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream
+            )
+
+        return launch
+
+    def __call__(self, q, k, v, out, lse, softmax_scale, window_left=-1, window_right=-1, stream=None):
+        import torch
+
+        batch, seqlen_q, num_heads, _ = q.shape
+        seqlen_k = k.shape[1]
+        num_m_blocks = (seqlen_q + self.tile_m - 1) // self.tile_m
+        stream = torch.cuda.current_stream() if stream is None else stream
+        self.launcher(
+            q, k, v, out, lse,
+            seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
+            float(softmax_scale), int(window_left), int(window_right),
+            stream=stream,
+        )
