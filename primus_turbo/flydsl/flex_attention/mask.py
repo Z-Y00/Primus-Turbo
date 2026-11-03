@@ -46,7 +46,7 @@ class AttentionMask:
     def clamp_kv(self, kv_pos):
         return _min(kv_pos, self.seqlen.seqlen_k - fx.Int32(1))
 
-    def keep(self, q_pos, kv_pos, mask_seqlen: bool = True):
+    def keep(self, q_pos, kv_pos, mask_seqlen: bool = True, apply_mask_mod: bool = True):
         keep = kv_pos < self.seqlen.seqlen_k if mask_seqlen else (kv_pos == kv_pos)
         if self.is_causal or self.is_local:
             rel = kv_pos - q_pos - self.seqlen.offset  # 0 on the diagonal
@@ -57,7 +57,7 @@ class AttentionMask:
                 right_ok = (self.window_right < zero) | (rel <= self.window_right)
                 left_ok = (self.window_left < zero) | (rel >= -self.window_left)
                 keep = keep & right_ok & left_ok
-        if self.mask_mod is not None:
+        if self.mask_mod is not None and apply_mask_mod:
             keep = keep & self.mask_mod(
                 self.batch_idx, self.head_idx, self.clamp_q(q_pos), self.clamp_kv(kv_pos), self.seqlen, self.aux_tensors
             )

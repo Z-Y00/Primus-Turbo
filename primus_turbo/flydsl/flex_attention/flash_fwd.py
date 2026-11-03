@@ -37,6 +37,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.flex_attention.block_info import BlockInfo
+from primus_turbo.flydsl.flex_attention.block_sparsity import broadcast_heads, subtile_factors
 from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LOG2E, Softmax
@@ -85,6 +86,9 @@ class FlashAttentionForward:
         mask_mod=None,
         num_aux_tensors: int = 0,
         has_learnable_sink: bool = False,
+        block_sparse: bool = False,
+        has_full_blocks: bool = False,
+        sparse_block_size: tuple | None = None,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -115,6 +119,12 @@ class FlashAttentionForward:
         self.has_seqused_k = has_seqused_k
         self.tile_m = MFMA_M * num_waves
         self.num_threads = 64 * num_waves
+        if block_sparse and (varlen_q or varlen_k):
+            raise NotImplementedError("block sparsity with varlen is not supported yet")
+        self.block_sparse = block_sparse
+        self.has_full_blocks = block_sparse and has_full_blocks
+        self.sparse_block_size = sparse_block_size
+        self.q_subtile, self.kv_subtile = subtile_factors(sparse_block_size, self.tile_m, tile_n)
         for d in (head_dim, head_dim_v):
             if (tile_n * d // 8) % self.num_threads:
                 raise ValueError(f"KV tile {tile_n}x{d} does not split evenly over {self.num_threads} threads")
@@ -133,6 +143,8 @@ class FlashAttentionForward:
         has_seqused_q, has_seqused_k = self.has_seqused_q, self.has_seqused_k
         score_mod, mask_mod = self.score_mod, self.mask_mod
         num_aux, has_sink = self.num_aux_tensors, self.has_learnable_sink
+        block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
+        Q_SUB, KV_SUB = self.q_subtile, self.kv_subtile
 
         @fx.struct
         class SharedStorage:
@@ -155,6 +167,10 @@ class FlashAttentionForward:
             Aux2: fx.Tensor,
             Aux3: fx.Tensor,
             Sink: fx.Tensor,
+            MaskCnt: fx.Tensor,
+            MaskIdx: fx.Tensor,
+            FullCnt: fx.Tensor,
+            FullIdx: fx.Tensor,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             softmax_scale: fx.Float32,
@@ -248,7 +264,11 @@ class FlashAttentionForward:
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(DV // 8))), reg)
                     fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, linear)))
 
-            def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc):
+            def sparse_n_block(idx_row, j):
+                """Kernel tile of the ``j``-th entry of a block list, sparse blocks split in KV_SUB."""
+                return fx.Int32(idx_row[j // fx.Int32(KV_SUB)]) * fx.Int32(KV_SUB) + j % fx.Int32(KV_SUB)
+
+            def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod=True):
                 kv_base = n_block * fx.Int32(TN)
                 fx.gpu.barrier()  # every wave is done reading the previous tile
                 stage_kv(kv_base)
@@ -268,7 +288,7 @@ class FlashAttentionForward:
                         kv_pos = kv_base + fx.Int32(half * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[j]))
                         score = _apply_score_mod(score_mod, acc[j] * softmax_scale, batch, head, q_pos, kv_pos, mask)
                         scores.append(score * fx.Float32(LOG2E))
-                        keep.append(mask.keep(q_pos, kv_pos))
+                        keep.append(mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod))
 
                 probs, new_max, new_sum, rescale = Softmax.online_softmax(row_max, row_sum, scores, keep)
                 rescale_vec = Vec.from_elements([rescale], fx.Float32).broadcast_to(16)
@@ -306,12 +326,35 @@ class FlashAttentionForward:
 
                 init = Softmax.initial_state() + [Vec.filled(16, 0.0, fx.Float32) for _ in range_constexpr(DV // MFMA_M)]
                 results = init
-                for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
-                    o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
-                    row_max, row_sum, o_acc = compute_one_n_block(
-                        fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
-                    )
-                    results = yield [row_max, row_sum] + o_acc
+                if block_sparse:
+                    # FA4's lists: blocks needing mask_mod, then fully kept blocks without it.
+                    # A sparse KV block spans KV_SUB kernel tiles, a sparse Q block Q_SUB m_blocks.
+                    sparse_m = m_block // fx.Int32(Q_SUB)
+                    mask_cnt = fx.Int32(fx.slice(fx.rocdl.make_buffer_tensor(MaskCnt), (batch, head, None))[sparse_m])
+                    mask_idx = fx.slice(fx.rocdl.make_buffer_tensor(MaskIdx), (batch, head, sparse_m, None))
+                    for n_iter, state in range(fx.Int32(0), mask_cnt * fx.Int32(KV_SUB), fx.Int32(1), init=results):
+                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                        row_max, row_sum, o_acc = compute_one_n_block(
+                            sparse_n_block(mask_idx, fx.Int32(n_iter)), q_frags, q_pos, state[0], state[1], o_state
+                        )
+                        results = yield [row_max, row_sum] + o_acc
+                    if has_full_blocks:
+                        full_cnt = fx.Int32(fx.slice(fx.rocdl.make_buffer_tensor(FullCnt), (batch, head, None))[sparse_m])
+                        full_idx = fx.slice(fx.rocdl.make_buffer_tensor(FullIdx), (batch, head, sparse_m, None))
+                        for n_iter, state in range(fx.Int32(0), full_cnt * fx.Int32(KV_SUB), fx.Int32(1), init=results):
+                            o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                            row_max, row_sum, o_acc = compute_one_n_block(
+                                sparse_n_block(full_idx, fx.Int32(n_iter)), q_frags, q_pos, state[0], state[1], o_state,
+                                apply_mask_mod=False,
+                            )
+                            results = yield [row_max, row_sum] + o_acc
+                else:
+                    for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
+                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                        row_max, row_sum, o_acc = compute_one_n_block(
+                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
+                        )
+                        results = yield [row_max, row_sum] + o_acc
 
                 # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
                 inv_sum, lse = Softmax.finalize(
@@ -351,6 +394,10 @@ class FlashAttentionForward:
             Aux2: fx.Tensor,
             Aux3: fx.Tensor,
             Sink: fx.Tensor,
+            MaskCnt: fx.Tensor,
+            MaskIdx: fx.Tensor,
+            FullCnt: fx.Tensor,
+            FullIdx: fx.Tensor,
             seqlen_q_static: fx.Int32,
             seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32,
@@ -363,7 +410,7 @@ class FlashAttentionForward:
         ):
             kernel(
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
-                Aux0, Aux1, Aux2, Aux3, Sink, seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
             ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -385,6 +432,7 @@ class FlashAttentionForward:
         max_seqlen_q=None,
         aux_tensors=(),
         learnable_sink=None,
+        block_sparse_tensors=None,
         stream=None,
     ):
         """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
@@ -400,6 +448,15 @@ class FlashAttentionForward:
             raise ValueError(f"kernel built for {self.num_aux_tensors} aux tensors, got {len(aux_tensors)}")
         if (learnable_sink is not None) != self.has_learnable_sink:
             raise ValueError("learnable_sink does not match how this kernel was built")
+        if (block_sparse_tensors is not None) != self.block_sparse:
+            raise ValueError("block_sparse_tensors does not match how this kernel was built")
+        if self.block_sparse:
+            if (block_sparse_tensors.full_block_cnt is not None) != self.has_full_blocks:
+                raise ValueError("full_block_cnt / full_block_idx do not match how this kernel was built")
+            if subtile_factors(block_sparse_tensors.block_size, self.tile_m, self.tile_n) != (
+                self.q_subtile, self.kv_subtile,
+            ):
+                raise ValueError("block_sparse_tensors.block_size does not match how this kernel was built")
         if self.varlen_q:
             total_q, num_heads, _ = q.shape
             batch = cu_seqlens_q.numel() - 1
@@ -417,6 +474,13 @@ class FlashAttentionForward:
         if learnable_sink is not None:
             learnable_sink = learnable_sink.to(torch.float32).contiguous()
         aux_slots = aux_tensors + (placeholder,) * (MAX_AUX_TENSORS - len(aux_tensors))
+        sparse_slots = (placeholder,) * 4
+        if self.block_sparse:
+            bst = broadcast_heads(block_sparse_tensors, num_heads)
+            sparse_slots = tuple(
+                t if t is not None else placeholder
+                for t in (bst.mask_block_cnt, bst.mask_block_idx, bst.full_block_cnt, bst.full_block_idx)
+            )
         num_m_blocks = max((seqlen_q + self.tile_m - 1) // self.tile_m, 1)
         stream = torch.cuda.current_stream() if stream is None else stream
         self.launcher(
@@ -427,6 +491,7 @@ class FlashAttentionForward:
             seqused_k if seqused_k is not None else placeholder,
             *aux_slots,
             learnable_sink if learnable_sink is not None else placeholder,
+            *sparse_slots,
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
