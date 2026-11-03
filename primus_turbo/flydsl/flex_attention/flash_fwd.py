@@ -17,9 +17,12 @@ O^T = V^T . P^T. Q lives in registers for the whole loop; each KV tile is staged
 global -> registers -> LDS once per CTA and read by every wave. Rows past a sequence's
 end are loaded clamped to its last row (never out of bounds) and masked away.
 
-Tensors are FA4's dense layout: q ``[B, Sq, Hq, D]``, k ``[B, Sk, Hk, D]``,
+Tensors follow FA4. Dense: q ``[B, Sq, Hq, D]``, k ``[B, Sk, Hk, D]``,
 v ``[B, Sk, Hk, Dv]``, out ``[B, Sq, Hq, Dv]``, lse ``[B, Hq, Sq]`` (fp32, natural log).
-Shapes and strides are read at runtime, so one compiled kernel serves every length.
+With ``cu_seqlens_q`` the query side is packed instead -- q / out ``[Tq, H, D]``, lse
+``[Hq, Tq]`` -- and likewise k / v with ``cu_seqlens_k``. ``seqused_q`` / ``seqused_k``
+override the per-sequence lengths. Shapes and strides are read at runtime, so one
+compiled kernel serves every length.
 """
 
 import flydsl.compiler as flyc
@@ -53,6 +56,10 @@ class FlashAttentionForward:
         is_local: bool = False,
         tile_n: int = 64,
         num_waves: int = 4,
+        varlen_q: bool = False,
+        varlen_k: bool = False,
+        has_seqused_q: bool = False,
+        has_seqused_k: bool = False,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -71,6 +78,10 @@ class FlashAttentionForward:
         self.is_local = is_local
         self.tile_n = tile_n
         self.num_waves = num_waves
+        self.varlen_q = varlen_q
+        self.varlen_k = varlen_k
+        self.has_seqused_q = has_seqused_q
+        self.has_seqused_k = has_seqused_k
         self.tile_m = MFMA_M * num_waves
         self.num_threads = 64 * num_waves
         for d in (head_dim, head_dim_v):
@@ -80,13 +91,15 @@ class FlashAttentionForward:
 
     def _build(self):
         D, DV, TN = self.head_dim, self.head_dim_v, self.tile_n
-        NW, NT, TM = self.num_waves, self.num_threads, self.tile_m
+        NT, TM = self.num_threads, self.tile_m
         Q_PER_KV = self.qhead_per_kvhead
         elem = fx.BFloat16 if self.dtype == "bf16" else fx.Float16
         k_iters = TN * D // 8 // NT
         v_iters = TN * DV // 8 // NT
         block_info = BlockInfo(TM, TN, self.is_causal, self.is_local)
         is_causal, is_local = self.is_causal, self.is_local
+        varlen_q, varlen_k = self.varlen_q, self.varlen_k
+        has_seqused_q, has_seqused_k = self.has_seqused_q, self.has_seqused_k
 
         @fx.struct
         class SharedStorage:
@@ -100,8 +113,12 @@ class FlashAttentionForward:
             V: fx.Tensor,
             O: fx.Tensor,  # noqa: E741
             LSE: fx.Tensor,
-            seqlen_q: fx.Int32,
-            seqlen_k: fx.Int32,
+            CuSeqlensQ: fx.Tensor,
+            CuSeqlensK: fx.Tensor,
+            SeqUsedQ: fx.Tensor,
+            SeqUsedK: fx.Tensor,
+            seqlen_q_static: fx.Int32,
+            seqlen_k_static: fx.Int32,
             softmax_scale: fx.Float32,
             window_left: fx.Int32,
             window_right: fx.Int32,
@@ -149,44 +166,48 @@ class FlashAttentionForward:
             vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, K_STEP))
             v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(8, 1))
 
-            seqlen = SeqlenInfo.create_dense(seqlen_q, seqlen_k)
+            seqlen = SeqlenInfo.create(
+                batch,
+                seqlen_q_static,
+                seqlen_k_static,
+                cu_seqlens_q=fx.rocdl.make_buffer_tensor(CuSeqlensQ) if varlen_q else None,
+                cu_seqlens_k=fx.rocdl.make_buffer_tensor(CuSeqlensK) if varlen_k else None,
+                seqused_q=fx.rocdl.make_buffer_tensor(SeqUsedQ) if has_seqused_q else None,
+                seqused_k=fx.rocdl.make_buffer_tensor(SeqUsedK) if has_seqused_k else None,
+            )
             mask = AttentionMask(seqlen, is_causal, is_local, window_left, window_right)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, window_left, window_right)
 
-            q_pos = m_block * fx.Int32(TM) + wave * fx.Int32(MFMA_M) + fx.Int32(fx.get_scalar(c_cols[0]))
-            q_row = _min(q_pos, seqlen_q - fx.Int32(1))
+            # Helpers defined in the kernel body are AST-rewritten along with it: an
+            # ``if`` becomes branch closures, so a ``return`` inside one would only leave
+            # the branch. Choose with conditional expressions and return once.
+            def q_side_row(t, pos, h):
+                """Row ``pos`` of this sequence in a query-side tensor (q or out)."""
+                coord = (seqlen.offset_q + pos, h, None) if varlen_q else (batch, pos, h, None)
+                return fx.slice(t, coord)
 
-            # ---- Q: B fragments for every reduction step, register-resident ----
-            q_k0 = fx.Int32(fx.get_scalar(b_coords[0])) // fx.Int32(MFMA_M)  # this lane's first k in a step
-            q_packs = fx.logical_divide(fx.slice(q_t, (batch, q_row, head, None)), fx.make_layout(4, 1))
-            q_frags = []
-            for ks in range_constexpr(D // K_STEP):
-                reg = fx.make_rmem_tensor(4, elem)
-                fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * K_STEP) + q_k0) // fx.Int32(4))), reg)
-                frag = fx.make_fragment_like(b_coords, elem)
-                frag.store(Vec(reg.load()))
-                q_frags.append(frag)
+            def kv_side_row(t, pos):
+                coord = (seqlen.offset_k + pos, kv_head, None) if varlen_k else (batch, pos, kv_head, None)
+                return fx.slice(t, coord)
 
             def stage_kv(kv_base):
                 """Copy the K and V tiles at ``kv_base`` to LDS (rows clamped to the sequence)."""
+                last_key = seqlen.seqlen_k - fx.Int32(1)
                 for it in range_constexpr(k_iters):
                     linear = fx.Int32(it * NT) + tid
-                    row = linear // fx.Int32(D // 8)
-                    key = _min(kv_base + row, seqlen_k - fx.Int32(1))
-                    src = fx.logical_divide(fx.slice(k_t, (batch, key, kv_head, None)), fx.make_layout(8, 1))
+                    key = _min(kv_base + linear // fx.Int32(D // 8), last_key)
+                    src = fx.logical_divide(kv_side_row(k_t, key), fx.make_layout(8, 1))
                     reg = fx.make_rmem_tensor(8, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // 8))), reg)
                     fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, linear)))
                 for it in range_constexpr(v_iters):
                     linear = fx.Int32(it * NT) + tid
-                    row = linear // fx.Int32(DV // 8)
-                    key = _min(kv_base + row, seqlen_k - fx.Int32(1))
-                    src = fx.logical_divide(fx.slice(v_t, (batch, key, kv_head, None)), fx.make_layout(8, 1))
+                    key = _min(kv_base + linear // fx.Int32(DV // 8), last_key)
+                    src = fx.logical_divide(kv_side_row(v_t, key), fx.make_layout(8, 1))
                     reg = fx.make_rmem_tensor(8, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(DV // 8))), reg)
                     fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, linear)))
 
-            def compute_one_n_block(n_block, row_max, row_sum, o_acc):
+            def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc):
                 kv_base = n_block * fx.Int32(TN)
                 fx.gpu.barrier()  # every wave is done reading the previous tile
                 stage_kv(kv_base)
@@ -222,28 +243,53 @@ class FlashAttentionForward:
                             o_acc[c] = mfma(a_frag, p_frag, o_acc[c])
                 return new_max, new_sum, o_acc
 
-            init = Softmax.initial_state() + [Vec.filled(16, 0.0, fx.Float32) for _ in range_constexpr(DV // MFMA_M)]
-            results = init
-            for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
-                o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
-                row_max, row_sum, o_acc = compute_one_n_block(fx.Int32(n_iter), state[0], state[1], o_state)
-                results = yield [row_max, row_sum] + o_acc
+            # A varlen grid is sized for the longest sequence; shorter ones skip the
+            # excess query blocks. The condition is uniform over the CTA, so the
+            # barriers inside stay convergent.
+            if m_block * fx.Int32(TM) < seqlen.seqlen_q:
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, window_left, window_right)
+                q_pos = m_block * fx.Int32(TM) + wave * fx.Int32(MFMA_M) + fx.Int32(fx.get_scalar(c_cols[0]))
+                q_row = _min(q_pos, seqlen.seqlen_q - fx.Int32(1))
 
-            # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
-            inv_sum, lse = Softmax.finalize(fx.Float32(results[0]), fx.Float32(results[1]))
-            inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
-            if q_pos < seqlen_q:
-                o_packs = fx.logical_divide(fx.slice(o_t, (batch, q_row, head, None)), fx.make_layout(4, 1))
-                for c in range_constexpr(DV // MFMA_M):
-                    o = Vec(results[2 + c]) * inv_vec
-                    for g in range_constexpr(4):
-                        d_start = fx.Int32(c * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[4 * g]))
-                        reg = fx.make_rmem_tensor(4, elem)
-                        reg.store(Vec.from_elements([o[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(elem))
-                        fx.copy(copy_g64, reg, fx.slice(o_packs, (None, d_start // fx.Int32(4))))
-                if lane < fx.Int32(MFMA_M):
-                    lse_row = fx.slice(lse_t, (batch, head, None))
-                    lse_row[q_row] = lse
+                # ---- Q: B fragments for every reduction step, register-resident ----
+                q_k0 = fx.Int32(fx.get_scalar(b_coords[0])) // fx.Int32(MFMA_M)  # this lane's first k in a step
+                q_packs = fx.logical_divide(q_side_row(q_t, q_row, head), fx.make_layout(4, 1))
+                q_frags = []
+                for ks in range_constexpr(D // K_STEP):
+                    reg = fx.make_rmem_tensor(4, elem)
+                    fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * K_STEP) + q_k0) // fx.Int32(4))), reg)
+                    frag = fx.make_fragment_like(b_coords, elem)
+                    frag.store(Vec(reg.load()))
+                    q_frags.append(frag)
+
+                init = Softmax.initial_state() + [Vec.filled(16, 0.0, fx.Float32) for _ in range_constexpr(DV // MFMA_M)]
+                results = init
+                for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
+                    o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                    row_max, row_sum, o_acc = compute_one_n_block(
+                        fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
+                    )
+                    results = yield [row_max, row_sum] + o_acc
+
+                # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
+                inv_sum, lse = Softmax.finalize(fx.Float32(results[0]), fx.Float32(results[1]))
+                inv_vec = Vec.from_elements([inv_sum], fx.Float32).broadcast_to(16)
+                if q_pos < seqlen.seqlen_q:
+                    o_packs = fx.logical_divide(q_side_row(o_t, q_row, head), fx.make_layout(4, 1))
+                    for c in range_constexpr(DV // MFMA_M):
+                        o = Vec(results[2 + c]) * inv_vec
+                        for g in range_constexpr(4):
+                            d_start = fx.Int32(c * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[4 * g]))
+                            reg = fx.make_rmem_tensor(4, elem)
+                            reg.store(Vec.from_elements([o[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(elem))
+                            fx.copy(copy_g64, reg, fx.slice(o_packs, (None, d_start // fx.Int32(4))))
+                    if lane < fx.Int32(MFMA_M):
+                        if varlen_q:
+                            lse_row = fx.slice(lse_t, (head, None))
+                            lse_row[seqlen.offset_q + q_row] = lse
+                        else:
+                            lse_row = fx.slice(lse_t, (batch, head, None))
+                            lse_row[q_row] = lse
 
         @flyc.jit
         def launch(
@@ -252,8 +298,12 @@ class FlashAttentionForward:
             V: fx.Tensor,
             O: fx.Tensor,  # noqa: E741
             LSE: fx.Tensor,
-            seqlen_q: fx.Int32,
-            seqlen_k: fx.Int32,
+            CuSeqlensQ: fx.Tensor,
+            CuSeqlensK: fx.Tensor,
+            SeqUsedQ: fx.Tensor,
+            SeqUsedK: fx.Tensor,
+            seqlen_q_static: fx.Int32,
+            seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32,
             num_heads: fx.Int32,
             batch: fx.Int32,
@@ -262,22 +312,62 @@ class FlashAttentionForward:
             window_right: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
-            kernel(Q, K, V, O, LSE, seqlen_q, seqlen_k, softmax_scale, window_left, window_right).launch(
-                grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream
-            )
+            kernel(
+                Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
+                seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+            ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
 
-    def __call__(self, q, k, v, out, lse, softmax_scale, window_left=-1, window_right=-1, stream=None):
+    def __call__(
+        self,
+        q,
+        k,
+        v,
+        softmax_scale,
+        out=None,
+        lse=None,
+        window_left=-1,
+        window_right=-1,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        max_seqlen_q=None,
+        stream=None,
+    ):
+        """Run the kernel; returns ``(out, lse)``. Varlen inputs need ``max_seqlen_q`` to
+        size the grid. Absent optional tensors are passed as unused placeholders."""
         import torch
 
-        batch, seqlen_q, num_heads, _ = q.shape
-        seqlen_k = k.shape[1]
-        num_m_blocks = (seqlen_q + self.tile_m - 1) // self.tile_m
+        if (cu_seqlens_q is not None) != self.varlen_q or (cu_seqlens_k is not None) != self.varlen_k:
+            raise ValueError("cu_seqlens_q / cu_seqlens_k do not match how this kernel was built")
+        if (seqused_q is not None) != self.has_seqused_q or (seqused_k is not None) != self.has_seqused_k:
+            raise ValueError("seqused_q / seqused_k do not match how this kernel was built")
+        if self.varlen_q:
+            total_q, num_heads, _ = q.shape
+            batch = cu_seqlens_q.numel() - 1
+            seqlen_q = int(max_seqlen_q)
+            out_shape, lse_shape = (total_q, num_heads, self.head_dim_v), (num_heads, total_q)
+        else:
+            batch, seqlen_q, num_heads, _ = q.shape
+            out_shape, lse_shape = (batch, seqlen_q, num_heads, self.head_dim_v), (batch, num_heads, seqlen_q)
+        seqlen_k = 0 if self.varlen_k else k.shape[1]
+        if out is None:
+            out = torch.empty(out_shape, dtype=q.dtype, device=q.device)
+        if lse is None:
+            lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
+        placeholder = lse
+        num_m_blocks = max((seqlen_q + self.tile_m - 1) // self.tile_m, 1)
         stream = torch.cuda.current_stream() if stream is None else stream
         self.launcher(
             q, k, v, out, lse,
+            cu_seqlens_q if cu_seqlens_q is not None else placeholder,
+            cu_seqlens_k if cu_seqlens_k is not None else placeholder,
+            seqused_q if seqused_q is not None else placeholder,
+            seqused_k if seqused_k is not None else placeholder,
             seqlen_q, seqlen_k, num_m_blocks, num_heads, batch,
             float(softmax_scale), int(window_left), int(window_right),
             stream=stream,
         )
+        return out, lse
