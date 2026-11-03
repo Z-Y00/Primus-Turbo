@@ -54,6 +54,35 @@ def broadcast_heads(tensors: BlockSparseTensors, num_heads: int) -> BlockSparseT
     )
 
 
+def _lists_to_dense(cnt, idx, num_cols):
+    sel = torch.arange(idx.shape[-1], device=idx.device) < cnt.unsqueeze(-1)
+    out = torch.zeros(*idx.shape[:-1], num_cols, dtype=torch.bool, device=idx.device)
+    return out.scatter(-1, idx.long().clamp(0, num_cols - 1), sel)
+
+
+def _dense_to_lists(sel):
+    cnt = sel.sum(-1).to(torch.int32)
+    order = torch.argsort((~sel).to(torch.int8), dim=-1, stable=True).to(torch.int32)
+    return cnt.contiguous(), order.contiguous()
+
+
+def transpose(tensors: BlockSparseTensors, num_kv_blocks: int) -> BlockSparseTensors:
+    """KV-major lists ``[B, H, N(, M)]`` (per sparse KV block, the sparse Q blocks that
+    see it) from query-major ones, for the backward's dK / dV kernel."""
+    num_q_blocks = tensors.mask_block_cnt.shape[-1]
+
+    def flip(cnt, idx):
+        if cnt is None:
+            return None, None
+        return _dense_to_lists(_lists_to_dense(cnt, idx, num_kv_blocks).transpose(-1, -2))
+
+    mask_cnt, mask_idx = flip(tensors.mask_block_cnt, tensors.mask_block_idx)
+    full_cnt, full_idx = flip(tensors.full_block_cnt, tensors.full_block_idx)
+    if mask_idx.shape[-1] != num_q_blocks:
+        raise AssertionError("transpose lost query blocks")
+    return BlockSparseTensors(mask_cnt, mask_idx, full_cnt, full_idx, tensors.block_size)
+
+
 def dense_to_block_sparse(
     dense_mask: torch.Tensor, block_size: Tuple[int, int]
 ) -> BlockSparseTensors:
@@ -72,12 +101,6 @@ def dense_to_block_sparse(
     any_kept = blocks.any(dim=(3, 5))
     all_kept = (blocks | ~valid_blocks).all(dim=(3, 5)) & any_kept
     partial = any_kept & ~all_kept
-
-    def to_lists(sel):
-        cnt = sel.sum(-1).to(torch.int32)
-        order = torch.argsort((~sel).to(torch.int8), dim=-1, stable=True).to(torch.int32)
-        return cnt.contiguous(), order.contiguous()
-
-    mask_cnt, mask_idx = to_lists(partial)
-    full_cnt, full_idx = to_lists(all_kept)
+    mask_cnt, mask_idx = _dense_to_lists(partial)
+    full_cnt, full_idx = _dense_to_lists(all_kept)
     return BlockSparseTensors(mask_cnt, mask_idx, full_cnt, full_idx, block_size)

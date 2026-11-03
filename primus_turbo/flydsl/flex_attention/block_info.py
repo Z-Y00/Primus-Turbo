@@ -55,3 +55,22 @@ class BlockInfo:
                 first_key = m_start + seqlen.offset - window_left
                 n_block_min = (window_left >= zero).select(_max(first_key, zero) // fx.Int32(self.tile_n), zero)
         return n_block_min, n_block_max
+
+    def get_m_block_min_max(self, seqlen: SeqlenInfo, n_block, window_left, window_right):
+        """``[m_block_min, m_block_max)``: the query blocks that can see a KV block (the
+        backward's dK / dV loop). An empty range may come out with min > max."""
+        m_block_max = _ceil_div(seqlen.seqlen_q, self.tile_m)
+        m_block_min = fx.Int32(0)
+        if self.is_causal or self.is_local:
+            zero = fx.Int32(0)
+            n_start = n_block * fx.Int32(self.tile_n)
+            first_query = n_start - seqlen.offset  # a query sees keys up to its diagonal (+ right)
+            if self.is_causal:
+                m_block_min = _max(first_query, zero) // fx.Int32(self.tile_m)
+            else:
+                bounded_min = _max(first_query - window_right, zero) // fx.Int32(self.tile_m)
+                m_block_min = (window_right >= zero).select(bounded_min, zero)
+                last_query = n_start + fx.Int32(self.tile_n) - fx.Int32(1) - seqlen.offset + window_left
+                bounded_max = _min(m_block_max, _ceil_div(_max(last_query + fx.Int32(1), zero), self.tile_m))
+                m_block_max = (window_left >= zero).select(bounded_max, m_block_max)
+        return m_block_min, m_block_max
