@@ -26,6 +26,7 @@ from primus_turbo.pytorch.kernels.flex_attention.flex_attention_jit_utils import
     build_jit,
     literal_tag,
 )
+from primus_turbo.pytorch.ops.attention.flex_attention_dual import dual_mod
 from primus_turbo.pytorch.ops.attention.flex_attention_interface import (
     flex_attention_varlen,
 )
@@ -49,6 +50,15 @@ def identity_score_mod_bwd(dscore, score, b, h, q_idx, kv_idx):
     return dscore
 
 
+def _flydsl_mods():
+    from primus_turbo.flydsl.flex_attention import mods
+
+    return mods
+
+
+dual_mod(identity_score_mod_bwd, factory=lambda: _flydsl_mods().identity_score_mod_bwd)
+
+
 @functools.lru_cache(maxsize=None)
 def make_softcap_score_mod(softcap: float):
     """``(score_mod, score_mod_bwd)`` for logit softcapping, ``cap * tanh(score / cap)``."""
@@ -68,7 +78,10 @@ def {bwd_name}(dscore, score, b, h, q_idx, kv_idx):
     t = libdevice.tanh(score * {1.0 / cap!r})
     return dscore * (1.0 - t * t)
 """
-    return build_jit(src, (fwd_name, bwd_name), f"softcap_{tag}")
+    fwd, bwd = build_jit(src, (fwd_name, bwd_name), f"softcap_{tag}")
+    dual_mod(fwd, factory=lambda: _flydsl_mods().make_softcap_mods(cap)[0])
+    dual_mod(bwd, factory=lambda: _flydsl_mods().make_softcap_mods(cap)[1])
+    return fwd, bwd
 
 
 @functools.lru_cache(maxsize=None)

@@ -14,6 +14,7 @@ from .flash_attn_usp_interface import (
     flash_attn_usp_func,
     flash_attn_varlen_usp_func,
 )
+from .flex_attention_dual import dual_mod, flydsl_twin
 from .flex_attention_interface import (
     AuxOutput,
     AuxRequest,

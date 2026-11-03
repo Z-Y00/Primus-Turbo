@@ -74,11 +74,56 @@ mask over the concatenated batch. Turbo adds:
   causal attention with a relative-position bias table `rel_logits[t, h, q - kv]`
   (Inkling), with gradients for q, k, v and `rel_logits`.
 
+## FlyDSL backend
+
+`kernel_options={"BACKEND": "FLYDSL"}` runs the call on FlyDSL kernels
+(`primus_turbo.flydsl.flex_attention`, structured after flash-attention's FA4
+`flash_attn/cute`), in place of Triton. `"AUTO"` picks FlyDSL when the call is supported
+and Triton otherwise; `PRIMUS_TURBO_FLEX_ATTENTION_BACKEND` sets the default (`TRITON`).
+PyTorch's own `kernel_options["BACKEND"]` selects among its backends the same way.
+
+Mods are **dual**: the API still takes the `@triton.jit` function, and the FlyDSL
+backend runs its registered twin, a plain Python function over `flydsl.expr` values
+with FA4's signatures (one element at a time; branch with `.select`, not `if`):
+
+```python
+import flydsl.expr as fx
+
+@triton.jit
+def document_mask(b, h, q_idx, kv_idx, DOC):
+    ...
+
+def document_mask_flydsl(b, h, q_idx, kv_idx, seqlen_info, aux_tensors):
+    docs = fx.slice(aux_tensors[0], (b, None))    # aux tensors keep their shapes
+    return (fx.Int32(docs[q_idx]) == fx.Int32(docs[kv_idx])) & (kv_idx <= q_idx)
+
+turbo.ops.dual_mod(document_mask, document_mask_flydsl)
+```
+
+`score_mod(score, b, h, q_idx, kv_idx, seqlen_info, aux_tensors)` and
+`score_mod_bwd(dscore, score, b, h, q_idx, kv_idx, seqlen_info, aux_tensors)` work the
+same way. Indices past a sequence's end are clamped to its last position before a
+FlyDSL mod is called, so aux reads stay in bounds without a mask. The built-in masks,
+`identity_score_mod_bwd` and `make_softcap_score_mod` have twins already.
+
+| | Triton backend | FlyDSL backend |
+|---|---|---|
+| Masks | causal/window path or block lists, block size tuned per pass | causal/window path, or the block lists at block size 128 (full blocks skip `mask_mod` in both passes); varlen custom masks run elementwise over every block |
+| Backward | dQ sweep plus dK/dV sweep | separate dQ and dK/dV kernels, deterministic, no atomics |
+| `score_grad_hook` | supported | not supported (use Triton for trainable aux tensors, e.g. `flex_attention_varlen_rel_bias`) |
+| Aux tensors | 4 for `score_mod` and 4 for `mask_mod` | 4 in total |
+| `num_splits` | causal/window or no mask | the same |
+
+The FlyDSL kernels themselves cover more than this interface exposes: paged KV,
+`seqused_q` / `seqused_k`, learnable sinks, and fp8 forward (FNUZ on gfx942, OCP on
+gfx950), with FA4's arguments (`FlashAttentionForward`, `FlashAttentionBackward`,
+`flash_attn_combine`).
+
 ## Other differences
 
 - `return_aux=AuxRequest(lse=True)` is supported; `max_scores` is not.
-- `kernel_options` accepts only `num_splits` (split the KV loop for short-query /
-  long-context shapes; dense inputs with a causal/window or no mask).
+- `kernel_options` accepts `num_splits` (split the KV loop for short-query /
+  long-context shapes; dense inputs with a causal/window or no mask) and `BACKEND`.
 - fp16 / bf16 inputs only.
 - The backward is deterministic: every dQ / dK / dV tile, and the `score_grad_hook`
   output, is written by a single program.

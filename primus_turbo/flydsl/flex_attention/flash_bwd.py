@@ -585,6 +585,9 @@ class FlashAttentionBackward:
         learnable_sink=None,
         block_sparse_tensors=None,
         block_sparse_tensors_kv=None,
+        dq=None,
+        dk=None,
+        dv=None,
         stream=None,
     ):
         """Returns ``(dq, dk, dv, dsink)`` (``dsink`` is ``None`` without a sink).
@@ -629,7 +632,9 @@ class FlashAttentionBackward:
         else:
             seqlen_k, num_kv_heads = k.shape[1], k.shape[2]
         # Rows past seqused_q / seqused_k get no gradient and are never written.
-        dq, dk, dv = torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        dq, dk, dv = (
+            torch.zeros_like(t) if g is None else g.zero_() for g, t in ((dq, q), (dk, k), (dv, v))
+        )
         placeholder = lse
         common = (
             cu_seqlens_q if cu_seqlens_q is not None else placeholder,

@@ -30,6 +30,7 @@ than traced:
 """
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import NamedTuple, Optional
 
@@ -41,6 +42,11 @@ from primus_turbo.pytorch.kernels.flex_attention.flex_attention_heuristic import
     MaskPath,
     default_paths,
     fastest,
+)
+from primus_turbo.pytorch.kernels.flex_attention.flex_attention_flydsl_impl import (
+    flydsl_backward,
+    flydsl_forward,
+    flydsl_unsupported_reason,
 )
 from primus_turbo.pytorch.kernels.flex_attention.flex_attention_impl import (
     flex_attention_backward_impl,
@@ -67,7 +73,10 @@ class AuxOutput(NamedTuple):
     max_scores: Optional[torch.Tensor] = None
 
 
-_KERNEL_OPTIONS = ("num_splits",)
+_KERNEL_OPTIONS = ("num_splits", "BACKEND")
+# "TRITON", "FLYDSL", or "AUTO" (FlyDSL when the call is supported, else Triton).
+_BACKENDS = ("TRITON", "FLYDSL", "AUTO")
+DEFAULT_BACKEND = os.environ.get("PRIMUS_TURBO_FLEX_ATTENTION_BACKEND", "TRITON").upper()
 
 
 @dataclass
@@ -89,6 +98,9 @@ class _Config:
     cu_seqlens_k: Optional[torch.Tensor] = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
+    backend: str = "TRITON"
+    # The FlyDSL backend reads the mask itself rather than a MaskPath.
+    block_mask: object = None
 
     @property
     def varlen(self) -> bool:
@@ -139,7 +151,10 @@ class FlexAttentionFunc(torch.autograd.Function):
             out = torch.empty(batch, heads, seqlen_q, v.shape[-1], dtype=q.dtype, device=q.device)
             lse = torch.empty(batch, heads, seqlen_q, dtype=torch.float32, device=q.device)
             qk, kk, vk, ok = (t.transpose(1, 2) for t in (q, k, v, out))
-        flex_attention_forward_impl(qk, kk, vk, ok, lse, **cfg.forward_kwargs(cfg.fwd))
+        if cfg.backend == "FLYDSL":
+            flydsl_forward(qk, kk, vk, ok, lse, cfg, cfg.block_mask)
+        else:
+            flex_attention_forward_impl(qk, kk, vk, ok, lse, **cfg.forward_kwargs(cfg.fwd))
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.cfg = cfg
         ctx.score_grad_like = (
@@ -166,6 +181,10 @@ class FlexAttentionFunc(torch.autograd.Function):
         tensors = (dout, q, k, v, out, dq, dk, dv)
         if not cfg.varlen:
             tensors = tuple(t.transpose(1, 2) for t in tensors)
+        if cfg.backend == "FLYDSL":
+            flydsl_backward(*tensors[:5], lse, *tensors[5:], cfg, cfg.block_mask,
+                            dlse=None if dlse is None else dlse.contiguous())
+            return dq, dk, dv, None, None
         flex_attention_backward_impl(
             *tensors[:5],
             lse,
@@ -222,6 +241,9 @@ def _resolve_options(kernel_options, return_lse, return_aux, varlen):
     num_splits = int(options.get("num_splits", 1))
     if num_splits < 1:
         raise ValueError(f"num_splits must be >= 1, got {num_splits}")
+    backend = str(options.get("BACKEND", DEFAULT_BACKEND)).upper()
+    if backend not in _BACKENDS:
+        raise ValueError(f"kernel_options BACKEND must be one of {_BACKENDS}, got {backend!r}")
     if num_splits > 1 and varlen:
         raise NotImplementedError("num_splits > 1 is not supported by flex_attention_varlen")
     if return_aux is not None:
@@ -229,7 +251,7 @@ def _resolve_options(kernel_options, return_lse, return_aux, varlen):
             raise ValueError("return_lse and return_aux cannot both be given; use return_aux")
         if return_aux.max_scores:
             raise NotImplementedError("return_aux=AuxRequest(max_scores=True) is not supported")
-    return num_splits
+    return num_splits, backend
 
 
 def _candidates(block_mask: BlockMask, num_splits: int):
@@ -392,7 +414,8 @@ def flex_attention(
     Returns ``out`` ``[B, Hq, Sq, Dv]``; with ``return_aux``, ``(out, AuxOutput)`` whose
     ``lse`` is ``[B, Hq, Sq]`` (natural log, differentiable). ``kernel_options`` accepts
     ``num_splits`` (split the KV loop to fill the GPU for short-query / long-context
-    shapes; dense masks only).
+    shapes; dense masks only) and ``BACKEND`` (``"TRITON"``, ``"FLYDSL"`` or ``"AUTO"``;
+    the FlyDSL backend runs each mod's registered twin, see ``flex_attention_dual``).
     """
     if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
         raise ValueError("flex_attention expects [B, H, S, D] query/key/value")
@@ -416,13 +439,15 @@ def flex_attention(
                 f"(B={batch}, H={heads_q}, Q_LEN={seqlen_q}, KV_LEN={seqlen_k})"
             )
     _check_mods(query, key, value, score_mod, score_mod_bwd, aux_tensors, score_grad_hook, score_grad_target)
+    num_splits, backend = _resolve_options(kernel_options, return_lse, return_aux, varlen=False)
     cfg = _Config(
         scale=query.shape[-1] ** -0.5 if scale is None else float(scale),
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,
-        num_splits=_resolve_options(kernel_options, return_lse, return_aux, varlen=False),
+        num_splits=num_splits,
         aux_tensors=list(aux_tensors or ()),
         score_grad_hook=score_grad_hook,
+        backend=backend,
     )
     return _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, return_aux)
 
@@ -432,7 +457,15 @@ def _run(query, key, value, block_mask, score_grad_target, cfg, return_lse, retu
         t is not None and t.requires_grad for t in (query, key, value, score_grad_target)
     )
     cfg.mask_aux_tensors = () if block_mask is None else block_mask.aux_tensors
-    cfg.fwd, cfg.bwd = _select_paths(block_mask, query, key, value, cfg, score_grad_target, needs_grad)
+    if cfg.backend != "TRITON":
+        reason = flydsl_unsupported_reason(cfg, block_mask, query)
+        if reason is not None and cfg.backend == "FLYDSL":
+            raise NotImplementedError(f"the FlyDSL flex attention backend does not support {reason}")
+        cfg.backend = "TRITON" if reason is not None else "FLYDSL"
+    if cfg.backend == "FLYDSL":
+        cfg.block_mask = block_mask
+    else:
+        cfg.fwd, cfg.bwd = _select_paths(block_mask, query, key, value, cfg, score_grad_target, needs_grad)
     out, lse = FlexAttentionFunc.apply(query, key, value, score_grad_target, cfg)
     return _finish(out, lse, return_lse, return_aux)
 
@@ -482,13 +515,15 @@ def flex_attention_varlen(
         if block_mask.shape[1] not in (1, heads_q):
             raise ValueError(f"block mask has {block_mask.shape[1]} heads, query has {heads_q}")
     _check_mods(query, key, value, score_mod, score_mod_bwd, aux_tensors, score_grad_hook, score_grad_target)
+    num_splits, backend = _resolve_options(kernel_options, return_lse, return_aux, varlen=True)
     cfg = _Config(
         scale=query.shape[-1] ** -0.5 if scale is None else float(scale),
         score_mod=score_mod,
         score_mod_bwd=score_mod_bwd,
-        num_splits=_resolve_options(kernel_options, return_lse, return_aux, varlen=True),
+        num_splits=num_splits,
         aux_tensors=list(aux_tensors or ()),
         score_grad_hook=score_grad_hook,
+        backend=backend,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=int(max_seqlen_q),

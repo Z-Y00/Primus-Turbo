@@ -34,6 +34,27 @@ def identity_score_mod_bwd(dscore, score, batch_idx, head_idx, q_idx, kv_idx, se
     return dscore
 
 
+def noop_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return kv_idx == kv_idx
+
+
+def causal_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """``kv_idx <= q_idx`` (top-left aligned, as PyTorch's ``causal_mask``)."""
+    return kv_idx <= q_idx
+
+
+@functools.lru_cache(maxsize=None)
+def make_sliding_window_mask(window_left: int, window_right: int):
+    """``q_idx - window_left <= kv_idx <= q_idx + window_right`` (top-left aligned)."""
+    left, right = int(window_left), int(window_right)
+
+    def sliding_window_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        rel = q_idx - kv_idx
+        return (rel <= fx.Int32(left)) & (rel >= fx.Int32(-right))
+
+    return sliding_window_mask
+
+
 @functools.lru_cache(maxsize=None)
 def make_softcap_mods(softcap: float):
     """``(score_mod, score_mod_bwd)`` for ``cap * tanh(score / cap)``, as FA4 implements

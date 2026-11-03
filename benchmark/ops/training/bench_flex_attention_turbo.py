@@ -20,6 +20,7 @@ Cases:
                     in tests/pytorch/ref/inkling_attention_ref.py, which the tests share.
 
 Usage: python bench_flex_attention_turbo.py [--cases inkling] [--mode max-autotune-no-cudagraphs]
+                                            [--backend TRITON|FLYDSL|AUTO]
 """
 
 import argparse
@@ -51,6 +52,21 @@ def band_mask(b, h, q_idx, kv_idx):
 @triton.jit
 def prefix_lm_mask(b, h, q_idx, kv_idx):
     return (kv_idx < 1024) | (q_idx >= kv_idx)
+
+
+def _register_flydsl_twins():
+    """FlyDSL twins of the custom masks, for --backend FLYDSL / AUTO."""
+    import flydsl.expr as fx
+
+    def band_mask_flydsl(b, h, q_idx, kv_idx, seqlen_info, aux):
+        d = q_idx - kv_idx
+        return (d < fx.Int32(1024)) & (d > fx.Int32(-1024))
+
+    def prefix_lm_mask_flydsl(b, h, q_idx, kv_idx, seqlen_info, aux):
+        return (kv_idx < fx.Int32(1024)) | (kv_idx <= q_idx)
+
+    turbo.ops.dual_mod(band_mask, band_mask_flydsl)
+    turbo.ops.dual_mod(prefix_lm_mask, prefix_lm_mask_flydsl)
 
 
 def median_ms(fn):
@@ -96,7 +112,7 @@ def dense_cases():
     ]
 
 
-def bench_dense(name, B, Hq, Hkv, S, torch_mask, turbo_mask, compiled):
+def bench_dense(name, B, Hq, Hkv, S, torch_mask, turbo_mask, compiled, backend):
     D = 128
     gen = torch.Generator().manual_seed(0)
     q, k, v = (
@@ -108,13 +124,16 @@ def bench_dense(name, B, Hq, Hkv, S, torch_mask, turbo_mask, compiled):
         lambda: compiled(q, k, v, block_mask=t_mask, enable_gqa=True), (q, k, v)
     )
     o_out, o_fwd, o_fb = time_fwd_bwd(
-        lambda: turbo.ops.flex_attention(q, k, v, block_mask=o_mask, enable_gqa=True), (q, k, v)
+        lambda: turbo.ops.flex_attention(
+            q, k, v, block_mask=o_mask, enable_gqa=True, kernel_options={"BACKEND": backend}
+        ),
+        (q, k, v),
     )
     flops = 4 * B * Hq * D * S * S * (1.0 - t_mask.sparsity() / 100.0)
     return name, flops, (t_fwd, t_fb), (o_fwd, o_fb), (t_out.float() - o_out.float()).abs().max().item()
 
 
-def bench_inkling(layer, compiled):
+def bench_inkling(layer, compiled, backend):
     """Miles' PyTorch formulation vs Turbo on the Inkling layer (see inkling_attention_ref)."""
     x = inkling.make_inputs(layer, dtype=DTYPE)
     block_mask = inkling.miles_block_mask(layer, x)
@@ -130,7 +149,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", default="", help="substring filter on case names")
     parser.add_argument("--mode", default="default", help="torch.compile mode for PyTorch FlexAttention")
+    parser.add_argument(
+        "--backend",
+        default="TRITON",
+        choices=("TRITON", "FLYDSL", "AUTO"),
+        help="Turbo flex attention backend (Inkling's trainable bias always runs on Triton)",
+    )
     args = parser.parse_args()
+    if args.backend != "TRITON":
+        _register_flydsl_twins()
     compiled = torch.compile(
         torch_flex.flex_attention, dynamic=False, mode=None if args.mode == "default" else args.mode
     )
@@ -141,7 +168,7 @@ def main():
     for name, fn, case in jobs:
         if args.cases not in name:
             continue
-        name, flops, (t_fwd, t_fb), (o_fwd, o_fb), diff = fn(*case, compiled)
+        name, flops, (t_fwd, t_fb), (o_fwd, o_fb), diff = fn(*case, compiled, args.backend)
         rows.append(
             [
                 name,
@@ -159,7 +186,10 @@ def main():
         print(rows[-1], flush=True)
         torch._dynamo.reset()
         torch.cuda.empty_cache()
-    print(f"\n{torch.cuda.get_device_name(0)}, torch {torch.__version__}, PyTorch compile mode={args.mode}")
+    print(
+        f"\n{torch.cuda.get_device_name(0)}, torch {torch.__version__}, PyTorch compile mode={args.mode}, "
+        f"turbo backend={args.backend}"
+    )
     headers = [
         "case",
         "torch fwd ms",

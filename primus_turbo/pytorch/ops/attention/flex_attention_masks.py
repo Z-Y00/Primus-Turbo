@@ -54,6 +54,7 @@ from primus_turbo.pytorch.kernels.flex_attention.flex_attention_jit_utils import
     build_jit,
     literal_tag,
 )
+from primus_turbo.pytorch.ops.attention.flex_attention_dual import dual_mod
 from primus_turbo.triton.flex_attention.flex_attention_utils import MAX_AUX_TENSORS
 
 __all__ = [
@@ -85,6 +86,16 @@ _FAST_PATH[noop_mask] = (False, -1, -1)
 _FAST_PATH[causal_mask] = (True, -1, -1)
 
 
+def _flydsl_mods():
+    from primus_turbo.flydsl.flex_attention import mods
+
+    return mods
+
+
+dual_mod(noop_mask, factory=lambda: _flydsl_mods().noop_mask)
+dual_mod(causal_mask, factory=lambda: _flydsl_mods().causal_mask)
+
+
 @functools.lru_cache(maxsize=None)
 def sliding_window_mask(window_left: int, window_right: int = 0):
     """Keep keys with ``q_idx - window_left <= kv_idx <= q_idx + window_right``.
@@ -103,6 +114,7 @@ def {name}(b, h, q_idx, kv_idx):
 """
     fn = build_jit(src, name, name)
     _FAST_PATH[fn] = (right == 0, left, right)
+    dual_mod(fn, factory=lambda: _flydsl_mods().make_sliding_window_mask(left, right))
     return fn
 
 
