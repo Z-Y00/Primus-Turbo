@@ -150,7 +150,7 @@ class FlashAttentionDecode:
             return Vec.from_elements(values, elem)
 
         @flyc.kernel(known_block_size=[NT, 1, 1])
-        def kernel(
+        def paged_decode_kernel(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, PageTable: fx.Tensor, SeqUsedK: fx.Tensor,
             POut: fx.Tensor, PLse: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
@@ -345,7 +345,7 @@ class FlashAttentionDecode:
             page_size: fx.Int32, softmax_scale: fx.Float32, window_left: fx.Int32,
             batch: fx.Int32, num_parts: fx.Int32, num_kv_heads: fx.Int32, stream: fx.Stream = fx.Stream(None),
         ):
-            kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale,
+            paged_decode_kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale,
                    window_left).launch(grid=(batch, num_parts, num_kv_heads), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -357,62 +357,106 @@ class FlashAttentionDecode:
         is_local, has_sink = self.is_local, self.has_learnable_sink
         NT = 256
         PER_THREAD = 4  # consecutive d per thread
+        QUADS = D // PER_THREAD  # threads covering one head's D
+        NSG = NT // QUADS  # sub-groups, each folding an interleaved share of the partitions
+        UNROLL = 8  # partitions a sub-group folds per loop iteration (independent loads)
+        STATE = 2 + PER_THREAD  # max, weight sum, output quad
+
+        @fx.struct
+        class SharedStorage:
+            buf: fx.Array[fx.Float32, NSG * QUADS * STATE, 16]
 
         @flyc.kernel(known_block_size=[NT, 1, 1])
-        def kernel(POut: fx.Tensor, PLse: fx.Tensor, SeqUsedK: fx.Tensor, Sink: fx.Tensor, O: fx.Tensor,
-                   LSE: fx.Tensor, window_left: fx.Int32):
+        def paged_decode_reduce_kernel(POut: fx.Tensor, PLse: fx.Tensor, SeqUsedK: fx.Tensor, Sink: fx.Tensor,
+                                       O: fx.Tensor, LSE: fx.Tensor, window_left: fx.Int32):
+            # One CTA per (sequence, query head).
             tid = fx.Int32(fx.thread_idx.x)
             b = fx.Int32(fx.block_idx.x)
-            kvh = fx.Int32(fx.block_idx.y)
+            head = fx.Int32(fx.block_idx.y)
+            kvh, h = head // fx.Int32(G), head % fx.Int32(G)
+            sg, quad = tid // fx.Int32(QUADS), tid % fx.Int32(QUADS)
+            d = quad * fx.Int32(PER_THREAD)
             pout_t = fx.rocdl.make_buffer_tensor(POut)
-            plse_t = fx.rocdl.make_buffer_tensor(PLse)
+            lse_col = fx.slice(fx.rocdl.make_buffer_tensor(PLse), (b, kvh, None, h))
             o_t = fx.rocdl.make_buffer_tensor(O)
             lse_t = fx.rocdl.make_buffer_tensor(LSE)
             seqlen = fx.Int32(fx.rocdl.make_buffer_tensor(SeqUsedK)[b])
             nparts = (seqlen + fx.Int32(PARTITION - 1)) // fx.Int32(PARTITION)
+            last_part = nparts - fx.Int32(1)
             first_part = _first_live_partition(is_local, seqlen, window_left)
             copy_f128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             copy_o64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_base = fx.recast_iter(fx.Uint8, lds.buf.ptr)
 
-            for it in range_constexpr(-(-(G * D) // (NT * PER_THREAD))):
-                e = (fx.Int32(it * NT) + tid) * fx.Int32(PER_THREAD)
-                h, d = e // fx.Int32(D), e % fx.Int32(D)
-                if h < fx.Int32(G):
-                    lse_col = fx.slice(plse_t, (b, kvh, None, h))
-                    # One online pass: running max, rescaled weight sum, rescaled output.
-                    init = [fx.Float32(NEG_BIG), fx.Float32(0.0), Vec.filled(PER_THREAD, 0.0, fx.Float32)]
-                    for p, state in range(first_part, nparts, fx.Int32(1), init=init):
-                        lp = fx.Float32(lse_col[fx.Int32(p)])
-                        new_m = _max(fx.Float32(state[0]), lp)
-                        rescale = fx.math.exp2(fx.Float32(state[0]) - new_m)
-                        w = fx.math.exp2(lp - new_m)
-                        reg = fx.make_rmem_tensor(PER_THREAD, fx.Float32)
-                        row = fx.logical_divide(fx.slice(pout_t, (b, kvh, fx.Int32(p), h, None)),
-                                                fx.make_layout(PER_THREAD, 1))
-                        fx.copy(copy_f128, fx.slice(row, (None, d // fx.Int32(PER_THREAD))), reg)
-                        rv = Vec.from_elements([rescale], fx.Float32).broadcast_to(PER_THREAD)
-                        wv = Vec.from_elements([w], fx.Float32).broadcast_to(PER_THREAD)
-                        out = yield [new_m, fx.Float32(state[1]) * rescale + w,
-                                     Vec(state[2]) * rv + Vec(reg.load()) * wv]
-                    m = fx.Float32(out[0])
-                    wsum = fx.Float32(out[1])
-                    scale, lse = _finish(m, wsum, _sink_log2(has_sink, Sink, kvh * fx.Int32(G) + h))
-                    vals = Vec(out[2]) * Vec.from_elements([scale], fx.Float32).broadcast_to(PER_THREAD)
-                    reg = fx.make_rmem_tensor(PER_THREAD, elem)
-                    reg.store(vals.to(elem))
-                    o_row = fx.logical_divide(fx.slice(o_t, (b, kvh * fx.Int32(G) + h, None)),
-                                              fx.make_layout(PER_THREAD, 1))
-                    fx.copy(copy_o64, reg, fx.slice(o_row, (None, d // fx.Int32(PER_THREAD))))
-                    if d == fx.Int32(0):
-                        lse_row = fx.slice(lse_t, (b, None))
-                        lse_row[kvh * fx.Int32(G) + h] = lse
+            def lds_ptr(idx):
+                p = fx.add_offset(lds_base, fx.make_int_tuple(idx * fx.Int32(4)))
+                return fx.recast_iter(
+                    fx.PointerType.get(fx.Float32.ir_type, fx.AddressSpace.Shared, dsl_size_of(fx.Float32)), p)
+
+            # Sub-group sg folds partitions first_part + (sg + NSG * i) * UNROLL + j.
+            init = [fx.Float32(NEG_BIG), fx.Float32(0.0), Vec.filled(PER_THREAD, 0.0, fx.Float32)]
+            start = first_part + sg * fx.Int32(UNROLL)
+            for p0, state in range(start, nparts, fx.Int32(NSG * UNROLL), init=init):
+                lps, outs = [], []
+                for j in range_constexpr(UNROLL):
+                    p = fx.Int32(p0) + fx.Int32(j)
+                    pc = _min(p, last_part)
+                    lps.append((p < nparts).select(fx.Float32(lse_col[pc]), fx.Float32(NEG_BIG)))
+                    reg = fx.make_rmem_tensor(PER_THREAD, fx.Float32)
+                    row = fx.logical_divide(fx.slice(pout_t, (b, kvh, pc, h, None)), fx.make_layout(PER_THREAD, 1))
+                    fx.copy(copy_f128, fx.slice(row, (None, quad)), reg)
+                    outs.append(Vec(reg.load()))
+                new_m = fx.Float32(state[0])
+                for lp in lps:
+                    new_m = _max(new_m, lp)
+                rescale = fx.math.exp2(fx.Float32(state[0]) - new_m)
+                wsum = fx.Float32(state[1]) * rescale
+                acc = Vec(state[2]) * Vec.from_elements([rescale], fx.Float32).broadcast_to(PER_THREAD)
+                for j in range_constexpr(UNROLL):
+                    p = fx.Int32(p0) + fx.Int32(j)
+                    # Out-of-range slots and fully masked partitions weigh 0.
+                    w = (p < nparts).select(fx.math.exp2(lps[j] - new_m), fx.Float32(0.0))
+                    wsum = wsum + w
+                    acc = acc + outs[j] * Vec.from_elements([w], fx.Float32).broadcast_to(PER_THREAD)
+                out = yield [new_m, wsum, acc]
+
+            # Merge the sub-groups' states through LDS; sub-group 0 finishes.
+            slot = (sg * fx.Int32(QUADS) + quad) * fx.Int32(STATE)
+            fx.ptr_store(Vec.from_elements([fx.Float32(out[0])], fx.Float32), lds_ptr(slot))
+            fx.ptr_store(Vec.from_elements([fx.Float32(out[1])], fx.Float32), lds_ptr(slot + fx.Int32(1)))
+            fx.ptr_store(Vec(out[2]), lds_ptr(slot + fx.Int32(2)))
+            fx.gpu.barrier()
+            if sg == fx.Int32(0):
+                m = fx.Float32(NEG_BIG)
+                for g in range_constexpr(NSG):
+                    m = _max(m, Vec(fx.ptr_load(lds_ptr(fx.Int32(g * QUADS * STATE) + quad * fx.Int32(STATE)),
+                                                 result_type=Vec.make_type(1, fx.Float32)))[0])
+                wsum = fx.Float32(0.0)
+                acc = Vec.filled(PER_THREAD, 0.0, fx.Float32)
+                for g in range_constexpr(NSG):
+                    s = fx.Int32(g * QUADS * STATE) + quad * fx.Int32(STATE)
+                    st = Vec(fx.ptr_load(lds_ptr(s), result_type=Vec.make_type(2, fx.Float32)))
+                    r_ = fx.math.exp2(st[0] - m)
+                    wsum = wsum + st[1] * r_
+                    part_acc = Vec(fx.ptr_load(lds_ptr(s + fx.Int32(2)), result_type=Vec.make_type(PER_THREAD, fx.Float32)))
+                    acc = acc + part_acc * Vec.from_elements([r_], fx.Float32).broadcast_to(PER_THREAD)
+                scale, lse = _finish(m, wsum, _sink_log2(has_sink, Sink, head))
+                vals = acc * Vec.from_elements([scale], fx.Float32).broadcast_to(PER_THREAD)
+                reg = fx.make_rmem_tensor(PER_THREAD, elem)
+                reg.store(vals.to(elem))
+                o_row = fx.logical_divide(fx.slice(o_t, (b, head, None)), fx.make_layout(PER_THREAD, 1))
+                fx.copy(copy_o64, reg, fx.slice(o_row, (None, quad)))
+                if quad == fx.Int32(0):
+                    lse_row = fx.slice(lse_t, (b, None))
+                    lse_row[head] = lse
 
         @flyc.jit
         def launch(POut: fx.Tensor, PLse: fx.Tensor, SeqUsedK: fx.Tensor, Sink: fx.Tensor, O: fx.Tensor,
-                   LSE: fx.Tensor, window_left: fx.Int32, batch: fx.Int32, num_kv_heads: fx.Int32,
+                   LSE: fx.Tensor, window_left: fx.Int32, batch: fx.Int32, num_q_heads: fx.Int32,
                    stream: fx.Stream = fx.Stream(None)):
-            kernel(POut, PLse, SeqUsedK, Sink, O, LSE, window_left).launch(
-                grid=(batch, num_kv_heads, 1), block=(NT, 1, 1), stream=stream)
+            paged_decode_reduce_kernel(POut, PLse, SeqUsedK, Sink, O, LSE, window_left).launch(
+                grid=(batch, num_q_heads, 1), block=(NT, 1, 1), stream=stream)
 
         return launch
 
@@ -453,5 +497,5 @@ class FlashAttentionDecode:
         self.decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, *aux_slots, page_size,
                              float(softmax_scale), int(window_left), B, num_parts, Hk, stream=stream)
         self.reduce_launcher(pout, plse, seqused_k, learnable_sink if learnable_sink is not None else plse,
-                             out, lse, int(window_left), B, Hk, stream=stream)
+                             out, lse, int(window_left), B, Hq, stream=stream)
         return out, lse
