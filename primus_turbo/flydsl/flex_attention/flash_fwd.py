@@ -570,13 +570,14 @@ class FlashAttentionForward:
 
         Paged KV (FA4): k / v are ``[num_pages, page_size, Hk, D]`` and ``page_table``
         ``[B, max_pages]`` int32; sequence lengths come from ``seqused_k``, else
-        ``max_pages * page_size``."""
+        ``max_pages * page_size``. ``num_splits < 1`` picks the split count with FA4's
+        heuristic (needs ``split_kv=True``)."""
         import torch
 
         if (page_table is not None) != self.paged_kv:
             raise ValueError("page_table does not match how this kernel was built")
         if num_splits != 1 and not self.split_kv:
-            raise ValueError("num_splits > 1 needs a kernel built with split_kv=True")
+            raise ValueError("num_splits != 1 needs a kernel built with split_kv=True")
         descales = ()
         out_dtype = torch.bfloat16 if self.fp8 or self.dequant_e5m2 else q.dtype  # FA4: fp8 writes bf16
         if self.dequant_e5m2:
@@ -620,6 +621,14 @@ class FlashAttentionForward:
                 raise ValueError("page_table must be int32 [batch, max_pages]")
             page_size = k.shape[1]
             seqlen_k = page_table.shape[1] * page_size
+        num_m_blocks = max((seqlen_q + self.tile_m - 1) // self.tile_m, 1)
+        if num_splits < 1:
+            # FA4's heuristic: enough splits to fill the CUs, none for short KV. Without
+            # pack_gqa every query head is its own CTA.
+            num_n_blocks = -(-(seqlen_k if seqlen_k else k.shape[0] // max(batch, 1)) // self.tile_n)
+            num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+            total_m_blocks = max(batch * num_heads * num_m_blocks, 1)
+            num_splits = 1 if num_n_blocks <= 4 else max(1, min(num_cus // total_m_blocks, 128, num_n_blocks))
         final_out, final_lse = out, lse
         if self.split_kv:
             out = torch.empty((num_splits, *out_shape), dtype=torch.float32, device=q.device)
@@ -639,7 +648,6 @@ class FlashAttentionForward:
                 t if t is not None else placeholder
                 for t in (bst.mask_block_cnt, bst.mask_block_idx, bst.full_block_cnt, bst.full_block_idx)
             )
-        num_m_blocks = max((seqlen_q + self.tile_m - 1) // self.tile_m, 1)
         stream = torch.cuda.current_stream() if stream is None else stream
         self.launcher(
             q, k, v, out, lse,
