@@ -45,8 +45,8 @@ def flydsl_unsupported_reason(cfg, block_mask, q) -> Optional[str]:
         return "this environment: FlyDSL is not installed"
     if q.dtype not in (torch.bfloat16, torch.float16):
         return f"dtype {q.dtype}"
-    if cfg.score_grad_hook is not None:
-        return "score_grad_hook (trainable aux tensors) is Triton-only"
+    if cfg.score_grad_hook is not None and flydsl_twin(cfg.score_grad_hook) is None:
+        return "score_grad_hook has no FlyDSL twin (register one with dual_mod)"
     if cfg.score_mod is not None and flydsl_twin(cfg.score_mod) is None:
         return "score_mod has no FlyDSL twin (register one with dual_mod)"
     if cfg.score_mod_bwd is not None and flydsl_twin(cfg.score_mod_bwd) is None:
@@ -76,6 +76,12 @@ def _with_aux_slice_bwd(mod, lo, hi):
     if mod is None:
         return None
     return lambda g, s, b, h, q_idx, kv_idx, seqlen, aux: mod(g, s, b, h, q_idx, kv_idx, seqlen, aux[lo:hi])
+
+
+def _with_aux_slice_hook(hook, lo, hi):
+    if hook is None:
+        return None
+    return lambda g, ok, b, h, q_idx, kv_idx, seqlen, aux: hook(g, ok, b, h, q_idx, kv_idx, seqlen, aux[lo:hi])
 
 
 def _mask_setup(cfg, block_mask):
@@ -173,12 +179,14 @@ def flydsl_forward(q, k, v, out, lse, cfg, block_mask):
         aux_tensors=aux, num_splits=cfg.num_splits, **kwargs)
 
 
-def flydsl_backward(dout, q, k, v, out, lse, dq, dk, dv, cfg, block_mask, dlse=None):
-    """Same views as ``flydsl_forward``; writes dq / dk / dv."""
+def flydsl_backward(dout, q, k, v, out, lse, dq, dk, dv, cfg, block_mask, dlse=None, score_grad=None):
+    """Same views as ``flydsl_forward``; writes dq / dk / dv, and ``score_grad`` (zeroed,
+    the ``score_grad_target``'s gradient) through the hook's FlyDSL twin when given."""
     static, window, mods, aux, plan, heads_q = _common(cfg, q, k, v, block_mask)
     score_fly, score_bwd_fly, mask_fly, n_score, n_aux = mods
+    hook_fly = flydsl_twin(cfg.score_grad_hook) if score_grad is not None else None
     key = (tuple(sorted(static.items())), score_fly, score_bwd_fly, mask_fly, n_score, plan is not None,
-           plan is not None and plan.full is not None)
+           plan is not None and plan.full is not None, hook_fly)
     bwd = _BACKWARDS.get(key)
     if bwd is None:
         bwd = _flydsl().FlashAttentionBackward(
@@ -189,6 +197,7 @@ def flydsl_backward(dout, q, k, v, out, lse, dq, dk, dv, cfg, block_mask, dlse=N
             block_sparse=plan is not None,
             has_full_blocks=plan is not None and plan.full is not None,
             sparse_block_size=(SPARSE_BLOCK, SPARSE_BLOCK) if plan is not None else None,
+            score_grad_hook=_with_aux_slice_hook(hook_fly, 0, n_score),
         )
         _BACKWARDS[key] = bwd
     kwargs = {}
@@ -199,8 +208,13 @@ def flydsl_backward(dout, q, k, v, out, lse, dq, dk, dv, cfg, block_mask, dlse=N
         batch = q.shape[0]
         kwargs["block_sparse_tensors"] = _sparse_tensors(plan, batch, heads_q)
         kwargs["block_sparse_tensors_kv"] = _expand_bst(_kv_major(plan, plan.num_kv_blocks), batch, heads_q)
+    sg = score_grad
+    if sg is not None and sg.dtype != torch.float32:
+        sg = torch.zeros(sg.shape, dtype=torch.float32, device=sg.device)
     bwd(q, k, v, out, dout, lse, cfg.scale, dlse=dlse, window_left=window[0], window_right=window[1],
-        aux_tensors=aux, dq=dq, dk=dk, dv=dv, **kwargs)
+        aux_tensors=aux, dq=dq, dk=dk, dv=dv, score_grad=sg, **kwargs)
+    if sg is not None and sg is not score_grad:
+        score_grad.copy_(sg)
 
 
 def _expand_bst(bst, batch, heads):

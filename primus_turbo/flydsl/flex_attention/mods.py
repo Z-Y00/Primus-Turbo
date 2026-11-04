@@ -10,6 +10,15 @@
     score_mod_bwd(dscore, score, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors) -> dscore
     mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors) -> bool
 
+A trainable aux tensor gets its gradient from a ``score_grad_hook``, called once per
+(query, key) pair in the backward's dQ sweep with the gradient of the score_mod output:
+
+    score_grad_hook(dscore, valid, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
+        -> (flat index into the gradient, value, store?)
+
+The kernel stores ``value`` there when ``store?`` (mods have no side effects of their
+own); ``valid`` is false for pairs past either sequence's end.
+
 They are plain Python functions traced into the kernel, one element at a time:
 ``score`` is an ``fx.Float32`` already multiplied by ``softmax_scale``, the indices are
 ``fx.Int32`` and sequence-local, and ``aux_tensors`` is a tuple of buffer tensors.
@@ -70,3 +79,32 @@ def make_softcap_mods(softcap: float):
         return dscore * (fx.Float32(1.0) - t * t)
 
     return softcap_score_mod, softcap_score_mod_bwd
+
+
+@functools.lru_cache(maxsize=None)
+def make_rel_bias_mods(num_heads: int, rel_extent: int):
+    """``(score_mod, score_grad_hook)`` for ``score += rel_logits[t, h, q_idx - kv_idx]``,
+    ``0 <= q_idx - kv_idx < rel_extent``, with aux tensors ``(rel_logits [T, H, RE] fp32,
+    cu_seqlens)``: ``t = cu_seqlens[b] + q_idx`` is the query's packed row (varlen)."""
+    H, RE = int(num_heads), int(rel_extent)
+
+    def rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
+        cu = aux_tensors[1]
+        start = fx.Int32(cu[batch_idx])
+        end = fx.Int32(cu[batch_idx + fx.Int32(1)])
+        rd = q_idx - kv_idx
+        row = start + q_idx
+        keep = (rd >= fx.Int32(0)) & (rd < fx.Int32(RE)) & (row < end)
+        return row, rd, keep
+
+    def rel_bias_score_mod(score, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        row, rd, keep = rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+        zero = fx.Int32(0)
+        bias = fx.Float32(fx.slice(aux_tensors[0], (keep.select(row, zero), head_idx, None))[keep.select(rd, zero)])
+        return score + keep.select(bias, fx.Float32(0.0))
+
+    def rel_bias_grad_hook(dscore, valid, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        row, rd, keep = rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+        return row * fx.Int32(H * RE) + head_idx * fx.Int32(RE) + rd, dscore, keep & valid
+
+    return rel_bias_score_mod, rel_bias_grad_hook

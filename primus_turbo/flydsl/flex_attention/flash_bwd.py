@@ -54,6 +54,15 @@ def _mod_grad(score_mod_bwd, grad, score, batch, head, q_pos, kv_pos, mask: Atte
     )
 
 
+def _store_score_grad(hook, grad_t, pad, dscore, valid, batch, head, q_pos, kv_pos, mask: AttentionMask):
+    """Store what ``score_grad_hook`` returns; a declined store goes out of bounds (dropped)."""
+    if hook is None:
+        return
+    idx, value, ok = hook(dscore, valid, batch, head, mask.clamp_q(q_pos), mask.clamp_kv(kv_pos), mask.seqlen,
+                          mask.aux_tensors)
+    grad_t[ok.select(idx, pad)] = fx.Float32(value)
+
+
 def _lse_log2(lse):
     """LSE in base 2; an empty row's -inf becomes +inf so its P recomputes to 0."""
     return (lse == fx.Float32(float("-inf"))).select(fx.Float32(float("inf")), lse * fx.Float32(LOG2E))
@@ -173,6 +182,7 @@ class FlashAttentionBackward:
         block_sparse: bool = False,
         has_full_blocks: bool = False,
         sparse_block_size: tuple | None = None,
+        score_grad_hook=None,
         num_waves: int = 4,
         dq_tile_n: int = 64,
         dkdv_tile_m: int = 64,
@@ -196,6 +206,7 @@ class FlashAttentionBackward:
         self.varlen_q, self.varlen_k = varlen_q, varlen_k
         self.has_seqused_q, self.has_seqused_k = has_seqused_q, has_seqused_k
         self.score_mod, self.score_mod_bwd, self.mask_mod = score_mod, score_mod_bwd, mask_mod
+        self.score_grad_hook = score_grad_hook
         self.num_aux_tensors = num_aux_tensors
         self.block_sparse = block_sparse
         self.has_full_blocks = block_sparse and has_full_blocks
@@ -225,6 +236,7 @@ class FlashAttentionBackward:
         varlen_q, varlen_k = self.varlen_q, self.varlen_k
         has_seqused_q, has_seqused_k = self.has_seqused_q, self.has_seqused_k
         score_mod, score_mod_bwd, mask_mod = self.score_mod, self.score_mod_bwd, self.mask_mod
+        score_grad_hook = self.score_grad_hook
         num_aux = self.num_aux_tensors
         block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
         Q_SUB, KV_SUB = self.dq_sub
@@ -237,12 +249,12 @@ class FlashAttentionBackward:
         @flyc.kernel(known_block_size=[NT, 1, 1])
         def kernel(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, dO: fx.Tensor, LSE: fx.Tensor, Dsum: fx.Tensor,
-            dQ: fx.Tensor,
+            dQ: fx.Tensor, ScoreGrad: fx.Tensor,
             CuSeqlensQ: fx.Tensor, CuSeqlensK: fx.Tensor, SeqUsedQ: fx.Tensor, SeqUsedK: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             MaskCnt: fx.Tensor, MaskIdx: fx.Tensor, FullCnt: fx.Tensor, FullIdx: fx.Tensor,
             seqlen_q_static: fx.Int32, seqlen_k_static: fx.Int32, softmax_scale: fx.Float32,
-            window_left: fx.Int32, window_right: fx.Int32,
+            window_left: fx.Int32, window_right: fx.Int32, score_grad_pad: fx.Int32,
         ):
             tid = fx.thread_idx.x
             lane = tid % fx.Int32(64)
@@ -259,6 +271,11 @@ class FlashAttentionBackward:
             q_t, k_t, v_t = (fx.rocdl.make_buffer_tensor(t) for t in (Q, K, V))
             do_t, dq_t = fx.rocdl.make_buffer_tensor(dO), fx.rocdl.make_buffer_tensor(dQ)
             lse_t, dsum_t = fx.rocdl.make_buffer_tensor(LSE), fx.rocdl.make_buffer_tensor(Dsum)
+            # Flat fp32 gradient of the hook's target, bounds-checked: a declined store goes
+            # to index score_grad_pad (its size), which the hardware drops.
+            sg_t = fx.rocdl.make_buffer_tensor(
+                ScoreGrad, max_size=False, num_records_bytes=fx.Int64(score_grad_pad) * fx.Int64(4)
+            ) if score_grad_hook is not None else None
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             k_rows = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, K_STEP))
@@ -317,6 +334,9 @@ class FlashAttentionBackward:
                         keep = mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod)
                         p = keep.select(fx.math.exp2(score * fx.Float32(LOG2E) - lse2), fx.Float32(0.0))
                         grad = p * (dp_acc[j] - dsum)
+                        _store_score_grad(score_grad_hook, sg_t, score_grad_pad, grad,
+                                          (q_pos < seqlen.seqlen_q) & (kv_pos < seqlen.seqlen_k),
+                                          batch, head, q_pos, kv_pos, mask)
                         ds_all.append(_mod_grad(score_mod_bwd, grad, scaled, batch, head, q_pos, kv_pos, mask))
                 for half in range_constexpr(TN // MFMA_M):
                     for g in range_constexpr(MFMA_M // K_STEP):
@@ -364,19 +384,19 @@ class FlashAttentionBackward:
         @flyc.jit
         def launch(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, dO: fx.Tensor, LSE: fx.Tensor, Dsum: fx.Tensor,
-            dQ: fx.Tensor,
+            dQ: fx.Tensor, ScoreGrad: fx.Tensor,
             CuSeqlensQ: fx.Tensor, CuSeqlensK: fx.Tensor, SeqUsedQ: fx.Tensor, SeqUsedK: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             MaskCnt: fx.Tensor, MaskIdx: fx.Tensor, FullCnt: fx.Tensor, FullIdx: fx.Tensor,
             seqlen_q_static: fx.Int32, seqlen_k_static: fx.Int32,
             num_m_blocks: fx.Int32, num_heads: fx.Int32, batch: fx.Int32,
-            softmax_scale: fx.Float32, window_left: fx.Int32, window_right: fx.Int32,
+            softmax_scale: fx.Float32, window_left: fx.Int32, window_right: fx.Int32, score_grad_pad: fx.Int32,
             stream: fx.Stream = fx.Stream(None),
         ):
             kernel(
-                Q, K, V, dO, LSE, Dsum, dQ, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
+                Q, K, V, dO, LSE, Dsum, dQ, ScoreGrad, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
                 Aux0, Aux1, Aux2, Aux3, MaskCnt, MaskIdx, FullCnt, FullIdx,
-                seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right, score_grad_pad,
             ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -588,11 +608,14 @@ class FlashAttentionBackward:
         dq=None,
         dk=None,
         dv=None,
+        score_grad=None,
         stream=None,
     ):
         """Returns ``(dq, dk, dv, dsink)`` (``dsink`` is ``None`` without a sink).
         ``block_sparse_tensors`` are the forward's lists and ``block_sparse_tensors_kv``
-        their KV-major transpose (``block_sparsity.transpose``)."""
+        their KV-major transpose (``block_sparsity.transpose``). With a ``score_grad_hook``,
+        ``score_grad`` is its target's fp32 gradient buffer (zeroed by the caller); the hook's
+        stores write it."""
         import torch
 
         if (cu_seqlens_q is not None) != self.varlen_q or (cu_seqlens_k is not None) != self.varlen_k:
@@ -657,9 +680,16 @@ class FlashAttentionBackward:
         static_k = 0 if self.varlen_k else seqlen_k
         stream = torch.cuda.current_stream() if stream is None else stream
         scalars = (float(softmax_scale), int(window_left), int(window_right))
+        if (score_grad is not None) != (self.score_grad_hook is not None):
+            raise ValueError("score_grad does not match how this kernel was built")
+        sg_flat, sg_pad = placeholder, 0
+        if score_grad is not None:
+            if score_grad.dtype != torch.float32 or not score_grad.is_contiguous():
+                raise ValueError("score_grad must be a contiguous fp32 tensor")
+            sg_flat, sg_pad = score_grad.view(-1), score_grad.numel()
         self.dq_launcher(
-            q, k, v, dout, lse, dsum, dq, *common, *sparse_slots(block_sparse_tensors),
-            static_q, static_k, max(-(-seqlen_q // self.dq_tile_m), 1), num_heads, batch, *scalars,
+            q, k, v, dout, lse, dsum, dq, sg_flat, *common, *sparse_slots(block_sparse_tensors),
+            static_q, static_k, max(-(-seqlen_q // self.dq_tile_m), 1), num_heads, batch, *scalars, sg_pad,
             stream=stream,
         )
         self.dkdv_launcher(

@@ -183,8 +183,8 @@ class FlexAttentionFunc(torch.autograd.Function):
             tensors = tuple(t.transpose(1, 2) for t in tensors)
         if cfg.backend == "FLYDSL":
             flydsl_backward(*tensors[:5], lse, *tensors[5:], cfg, cfg.block_mask,
-                            dlse=None if dlse is None else dlse.contiguous())
-            return dq, dk, dv, None, None
+                            dlse=None if dlse is None else dlse.contiguous(), score_grad=score_grad)
+            return dq, dk, dv, score_grad, None
         flex_attention_backward_impl(
             *tensors[:5],
             lse,

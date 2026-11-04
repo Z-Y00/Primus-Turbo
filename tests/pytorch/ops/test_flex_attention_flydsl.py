@@ -230,15 +230,29 @@ def test_varlen(mask_name):
 # ---------------------------------------------------------------- backend selection
 
 
-def test_auto_falls_back_to_triton_and_flydsl_rejects():
-    seqlens = (128, 64)
+@pytest.mark.parametrize("window_left", [None, 100])
+def test_rel_bias_score_grad_hook_matches_triton(window_left):
+    # Inkling's relative-position bias: the bias table trains through score_grad_hook.
+    seqlens = (300, 129, 64)
     cu = _cu(seqlens)
-    gen = torch.Generator().manual_seed(9)
-    q, k, v = (torch.randn(192, 4, 64, generator=gen).to("cuda", DTYPE).requires_grad_(True) for _ in range(3))
-    rel = torch.randn(192, 4, 16, device="cuda", requires_grad=True)
-    # The rel-bias mods train an aux tensor through score_grad_hook: Triton only.
-    flex_attention_varlen_rel_bias(q, k, v, rel, cu, 128)
+    T, Hq, Hkv, D, RE = sum(seqlens), 8, 2, 64, 160
+    gen = torch.Generator().manual_seed(21)
+    q = torch.randn(T, Hq, D, generator=gen).to("cuda", DTYPE).requires_grad_(True)
+    k, v = (torch.randn(T, Hkv, D, generator=gen).to("cuda", DTYPE).requires_grad_(True) for _ in range(2))
+    rel = (torch.randn(T, Hq, RE, generator=gen) * 0.5).cuda().requires_grad_(True)
+    dout = torch.randn(T, Hq, D, generator=gen).to("cuda", DTYPE)
+    results = []
+    for backend in ("TRITON", "FLYDSL"):
+        out = flex_attention_varlen_rel_bias(q, k, v, rel, cu, max(seqlens), scale=D**-0.5, window_left=window_left,
+                                             kernel_options={"BACKEND": backend})
+        results.append((out, *torch.autograd.grad(out, (q, k, v, rel), dout)))
+    for name, ref, got in zip(("out", "dq", "dk", "dv", "drel"), *results):
+        scale = ref.abs().max().item()
+        err = (got.float() - ref.float()).abs().max().item()
+        assert err <= TOL * max(scale, 1.0), f"{name}: max error {err:.3e} (scale {scale:.3e})"
 
+
+def test_auto_falls_back_to_triton_and_flydsl_rejects():
     @triton.jit
     def _triton_only_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx - 1

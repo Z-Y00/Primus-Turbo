@@ -140,7 +140,9 @@ def bench_inkling(layer, compiled, backend):
     t_out, t_fwd, t_fb = time_fwd_bwd(
         lambda: inkling.miles_flex(layer, x, block_mask, compiled), (x.q, x.k, x.v, x.rel_logits_htr)
     )
-    o_out, o_fwd, o_fb = time_fwd_bwd(lambda: inkling.turbo_flex(layer, x), (x.q, x.k, x.v, x.rel_logits))
+    o_out, o_fwd, o_fb = time_fwd_bwd(
+        lambda: inkling.turbo_flex(layer, x, {"BACKEND": backend}), (x.q, x.k, x.v, x.rel_logits)
+    )
     diff = (t_out.float() - o_out.float()).abs().max().item()
     return layer.name, layer.flops(), (t_fwd, t_fb), (o_fwd, o_fb), diff
 
@@ -153,7 +155,7 @@ def main():
         "--backend",
         default="TRITON",
         choices=("TRITON", "FLYDSL", "AUTO"),
-        help="Turbo flex attention backend (Inkling's trainable bias always runs on Triton)",
+        help="Turbo flex attention backend",
     )
     args = parser.parse_args()
     if args.backend != "TRITON":

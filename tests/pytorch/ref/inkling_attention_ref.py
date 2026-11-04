@@ -151,7 +151,7 @@ def miles_flex(layer: InklingLayer, inputs: InklingInputs, block_mask, flex_fn=t
     return out.squeeze(0).permute(1, 0, 2)
 
 
-def turbo_flex(layer: InklingLayer, inputs: InklingInputs):
+def turbo_flex(layer: InklingLayer, inputs: InklingInputs, kernel_options=None):
     """Primus-Turbo: ``[T, H, D]`` in, ``[T, H, D]`` out, gradient on ``rel_logits``."""
     return turbo.ops.flex_attention_varlen_rel_bias(
         inputs.q,
@@ -162,4 +162,5 @@ def turbo_flex(layer: InklingLayer, inputs: InklingInputs):
         max(layer.seqlens),
         scale=layer.scale,
         window_left=layer.window_left,
+        kernel_options=kernel_options,
     )

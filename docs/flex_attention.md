@@ -110,7 +110,7 @@ FlyDSL mod is called, so aux reads stay in bounds without a mask. The built-in m
 |---|---|---|
 | Masks | causal/window path or block lists, block size tuned per pass | causal/window path, or the block lists at block size 128 (full blocks skip `mask_mod` in both passes); varlen custom masks run elementwise over every block |
 | Backward | dQ sweep plus dK/dV sweep | separate dQ and dK/dV kernels, deterministic, no atomics |
-| `score_grad_hook` | supported | not supported (use Triton for trainable aux tensors, e.g. `flex_attention_varlen_rel_bias`) |
+| `score_grad_hook` | supported | supported through a FlyDSL twin that returns `(flat index, value, store?)`; the dQ kernel stores it (registered for `flex_attention_varlen_rel_bias`) |
 | Aux tensors | 4 for `score_mod` and 4 for `mask_mod` | 4 in total |
 | `num_splits` | causal/window or no mask | the same |
 
@@ -154,8 +154,7 @@ own autotune tables were swept on MI300X. Against `torch.compile(flex_attention)
 
 ### FlyDSL backend: supported, validated, not tuned
 
-Supported: everything on this page except `score_grad_hook`, for bf16 / fp16, forward
-and deterministic backward. The kernels additionally support paged KV, split-KV
+Supported: everything on this page, for bf16 / fp16, forward and deterministic backward. The kernels additionally support paged KV, split-KV
 (`num_splits < 1` picks it with FA4's heuristic), learnable sinks and fp8 forward.
 
 Validated with the kernel test suites (forward, mods, block-sparse, paged, split-KV,
@@ -264,7 +263,7 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
 - FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
   reads, a 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while
   staying deterministic), then the kernel-optimize loop against the Triton backend.
-- FlyDSL features: varlen block-sparse lists, `score_grad_hook`, split-KV combined with
+- FlyDSL features: varlen block-sparse lists, split-KV combined with
   block sparsity or sinks, native e5m2 (needs MFMA support in FlyDSL), fp8 backward.
 - Validation: the turbo-API FlyDSL tests and benchmarks on gfx950 (only the kernel
   suites ran there).

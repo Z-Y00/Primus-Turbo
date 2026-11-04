@@ -116,7 +116,10 @@ def {hook_name}(dscore, valid, b, h, q_idx, kv_idx, DREL, REL, CU_SEQLENS):
     offset, keep = _rel_offsets_{H}_{RE}(b, h, q_idx, kv_idx, CU_SEQLENS)
     tl.store(DREL + offset, dscore.to(DREL.dtype.element_ty), mask=keep & valid)
 """
-    return build_jit(src, (mod_name, hook_name), f"rel_bias_{H}_{RE}")
+    score_mod, grad_hook = build_jit(src, (mod_name, hook_name), f"rel_bias_{H}_{RE}")
+    dual_mod(score_mod, factory=lambda: _flydsl_mods().make_rel_bias_mods(H, RE)[0])
+    dual_mod(grad_hook, factory=lambda: _flydsl_mods().make_rel_bias_mods(H, RE)[1])
+    return score_mod, grad_hook
 
 
 def flex_attention_varlen_rel_bias(
@@ -128,13 +131,15 @@ def flex_attention_varlen_rel_bias(
     max_seqlen: int,
     scale=None,
     window_left=None,
+    kernel_options=None,
 ):
     """Causal varlen self-attention with a relative-position bias table.
 
     query ``[T, Hq, D]``, key/value ``[T, Hkv, D]`` (GQA allowed), rel_logits
     ``[T, Hq, RE]`` contiguous (Inkling uses fp32). Keys are kept when
     ``0 <= q_idx - kv_idx <= window_left`` (no window when None). Gradients flow to
-    query, key, value and rel_logits.
+    query, key, value and rel_logits. ``kernel_options`` is passed through (e.g.
+    ``{"BACKEND": "FLYDSL"}``).
     """
     T, H, _ = query.shape
     if rel_logits.dim() != 3 or rel_logits.shape[:2] != (T, H):
@@ -159,4 +164,5 @@ def flex_attention_varlen_rel_bias(
         aux_tensors=[rel_logits.detach(), cu_seqlens],
         score_grad_hook=grad_hook,
         score_grad_target=rel_logits,
+        kernel_options=kernel_options,
     )
