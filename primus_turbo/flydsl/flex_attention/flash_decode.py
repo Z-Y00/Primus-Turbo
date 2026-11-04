@@ -166,7 +166,9 @@ class FlashAttentionDecode:
             l16 = lane % fx.Int32(16)
             r = lane // fx.Int32(16)
             b = fx.Int32(fx.block_idx.x)
-            part = fx.Int32(fx.block_idx.y)
+            # block_idx.y counts partitions from the sequence's first in-window one, and
+            # the partials are indexed the same way.
+            part_rel = fx.Int32(fx.block_idx.y)
             kvh = fx.Int32(fx.block_idx.z)
 
             q_t = fx.rocdl.make_buffer_tensor(Q)
@@ -203,6 +205,7 @@ class FlashAttentionDecode:
                 page = fx.Int32(pages[tok // page_size])
                 return fx.slice(t, (page, tok % page_size, kvh, None))
 
+            part = _first_live_partition(is_local, seqlen, window_left) + part_rel
             part_start = part * fx.Int32(PARTITION)
             # Q: B operand, column = head l16 (clamped into the group; extra columns compute
             # garbage that is never stored).
@@ -217,7 +220,7 @@ class FlashAttentionDecode:
             mask_keep = mask.keep
             # Partitions past the sequence or before the window do nothing; the reducer
             # never reads them.
-            live = (part_start < seqlen) & (part >= _first_live_partition(is_local, seqlen, window_left))
+            live = part_start < seqlen
             if live:
                 last = seqlen - fx.Int32(1)
                 wave_start = part_start + wave * fx.Int32(TOK_PER_WAVE)
@@ -329,7 +332,7 @@ class FlashAttentionDecode:
                         if h < fx.Int32(G):
                             reg = fx.make_rmem_tensor(4, fx.Float32)
                             reg.store(acc4 * inv)
-                            row = fx.logical_divide(fx.slice(pout_t, (b, kvh, part, h, None)), fx.make_layout(4, 1))
+                            row = fx.logical_divide(fx.slice(pout_t, (b, kvh, part_rel, h, None)), fx.make_layout(4, 1))
                             fx.copy(copy_f128, reg, fx.slice(row, (None, (fx.Int32(rnd * D_ROUND) + d) // fx.Int32(4))))
 
                 # Partition LSE (log2 domain) per head: lanes of wave 0 with r == 0.
@@ -340,7 +343,7 @@ class FlashAttentionDecode:
                     m_h = fx.Float32(NEG_BIG)
                     for w in range_constexpr(NWAVES):
                         m_h = _max(m_h, lds_load(fx.Int32(off_max + w * 64) + tid * fx.Int32(4), fx.Float32, 1)[0])
-                    lse_row = fx.slice(plse_t, (b, kvh, part, None))
+                    lse_row = fx.slice(plse_t, (b, kvh, part_rel, None))
                     lse_row[tid] = m_h + fx.math.log2(total_l)
 
         @flyc.jit
@@ -387,9 +390,10 @@ class FlashAttentionDecode:
             o_t = fx.rocdl.make_buffer_tensor(O)
             lse_t = fx.rocdl.make_buffer_tensor(LSE)
             seqlen = fx.Int32(fx.rocdl.make_buffer_tensor(SeqUsedK)[b])
-            nparts = (seqlen + fx.Int32(PARTITION - 1)) // fx.Int32(PARTITION)
+            # Partials are indexed from the first in-window partition (see the decode kernel).
+            nparts = (seqlen + fx.Int32(PARTITION - 1)) // fx.Int32(PARTITION) - _first_live_partition(
+                is_local, seqlen, window_left)
             last_part = nparts - fx.Int32(1)
-            first_part = _first_live_partition(is_local, seqlen, window_left)
             copy_f128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             copy_o64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -400,9 +404,9 @@ class FlashAttentionDecode:
                 return fx.recast_iter(
                     fx.PointerType.get(fx.Float32.ir_type, fx.AddressSpace.Shared, dsl_size_of(fx.Float32)), p)
 
-            # Sub-group sg folds partitions first_part + (sg + NSG * i) * UNROLL + j.
+            # Sub-group sg folds partitions (sg + NSG * i) * UNROLL + j.
             init = [fx.Float32(NEG_BIG), fx.Float32(0.0), Vec.filled(PER_THREAD, 0.0, fx.Float32)]
-            start = first_part + sg * fx.Int32(UNROLL)
+            start = sg * fx.Int32(UNROLL)
             for p0, state in range(start, nparts, fx.Int32(NSG * UNROLL), init=init):
                 lps, outs = [], []
                 for j in range_constexpr(UNROLL):
@@ -471,7 +475,8 @@ class FlashAttentionDecode:
                  window_left=-1, aux_tensors=(), learnable_sink=None, partials=None, stream=None):
         """Returns ``(out [B, Hq, D], lse [B, Hq])``. ``partials`` = ``(pout, plse)`` may be
         preallocated (e.g. for CUDA-graph capture): ``[B, Hk, P, G, D]`` / ``[B, Hk, P, G]``
-        fp32 with ``P >= ceil(max_pages * page_size / 256)``. ``window_left`` keeps keys
+        fp32 with ``P >= ceil(max_pages * page_size / 256)`` (with a window, P >=
+        ``min(that, ceil((window_left + 1) / 256) + 1)`` suffices). ``window_left`` keeps keys
         ``seqlen - 1 - window_left ..`` (negative: no limit) when built ``is_local``."""
         import torch
 
@@ -489,6 +494,9 @@ class FlashAttentionDecode:
         if learnable_sink is not None:
             learnable_sink = learnable_sink.to(torch.float32).contiguous()
         num_parts = max(-(-(page_table.shape[1] * page_size) // PARTITION), 1)
+        if self.is_local and window_left >= 0:
+            # A window of W + 1 keys spans at most ceil((W + 1) / 256) + 1 partitions.
+            num_parts = min(num_parts, -(-(int(window_left) + 1) // PARTITION) + 1)
         if partials is None:
             pout = torch.empty(B, Hk, num_parts, self.group, D, dtype=torch.float32, device=q.device)
             plse = torch.empty(B, Hk, num_parts, self.group, dtype=torch.float32, device=q.device)
