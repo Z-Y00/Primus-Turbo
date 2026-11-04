@@ -254,8 +254,13 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
 - Triton backend: when the Primus image moves to a ROCm Triton 3.9 build, rerun the full
   flex attention suites to confirm the miscompile is gone there too.
 - FlyDSL decode: an opt-in fp8-MFMA path for fp8 KV (q quantized per head, as aiter) for
-  the last 10-18% at large batch; sparse partitions are still launched (a compacted grid
-  would save the scan and the empty CTAs).
+  the last 10-18% at large batch.
+- FlyDSL decode, block-sparse (minor): every partition still gets a CTA that scans the
+  group's lists and exits if nothing is listed. A small pre-pass could build a per
+  (sequence, KV head) table of live partitions and block statuses; CTAs would index it
+  directly (the grid stays worst-case sized for CUDA graphs, with extra CTAs exiting at
+  once) and the reduce would fold only live partials. Expected: ~1/8 density at
+  32 x 32K from 49 us toward ~21 us, and the 1-8 us scan cost gone when all blocks are listed.
 - FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
   reads, a 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while
   staying deterministic), then the kernel-optimize loop against the Triton backend.
