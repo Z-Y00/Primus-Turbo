@@ -258,6 +258,36 @@ def test_fp8_kv_cache():
     _check(out, lse, deq(q8, q_d), deq(k8, k_d), deq(v8, v_d), table, seqlens, D**-0.5, o_tol=6e-2, lse_tol=1e-2)
 
 
+@pytest.mark.parametrize("per_token", [False, True])
+def test_decode_fp8_kv_cache_bf16_query(per_token):
+    # aiter / SGLang decode: bf16 q, native-fp8 cache, k / v scales per tensor or per token.
+    from primus_turbo.flydsl.flex_attention.flash_decode import FlashAttentionDecode
+    from primus_turbo.flydsl.flex_attention.flash_fwd import _arch_has_ocp_fp8
+
+    fmt = torch.float8_e4m3fn if _arch_has_ocp_fp8() else torch.float8_e4m3fnuz
+    fmax = torch.finfo(fmt).max
+    seqlens = (1, 900, 64, 4097)
+    Hq, Hk, D = 12, 2, 128
+    k_cache, v_cache, table, used = _paged_cache(seqlens, 16, Hk, D, seed=11, dtype=torch.float32)
+    if per_token:  # token magnitudes that differ, so a misindexed scale shows
+        gen = torch.Generator().manual_seed(12)
+        k_cache = k_cache * torch.rand(*k_cache.shape[:3], 1, generator=gen).cuda() * 4
+        v_cache = v_cache * torch.rand(*v_cache.shape[:3], 1, generator=gen).cuda() * 4
+    amax = lambda t: t.abs().amax(-1) if per_token else t.abs().amax().reshape(1)  # noqa: E731
+    k_s, v_s = amax(k_cache) / fmax, amax(v_cache) / fmax
+    expand = lambda s: s[..., None] if per_token else s  # noqa: E731
+    k8, v8 = (k_cache / expand(k_s)).to(fmt), (v_cache / expand(v_s)).to(fmt)
+    q = torch.randn(len(seqlens), Hq, D, device="cuda").to(DTYPE)
+    dec = FlashAttentionDecode(head_dim=D, qhead_per_kvhead=Hq // Hk, kv_dtype="fp8",
+                               kv_scale="token" if per_token else "tensor")
+    out, lse = dec(q, k8, v8, table, used, D**-0.5, k_scale=k_s, v_scale=v_s)
+    deq_k, deq_v = k8.float() * expand(k_s), v8.float() * expand(v_s)
+    _check(out[:, None], lse[:, :, None], q[:, None], deq_k, deq_v, table, seqlens, D**-0.5, o_tol=3e-2,
+           lse_tol=2e-3)
+    with pytest.raises(ValueError, match="needs k_scale and v_scale"):
+        dec(q, k8, v8, table, used, D**-0.5)
+
+
 def test_validation():
     k_cache, v_cache, table, used = _paged_cache((100,), 16, 1, 64)
     q = torch.randn(1, 1, 1, 64, device="cuda").to(DTYPE)

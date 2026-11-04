@@ -6,8 +6,11 @@
 
 """Paged-KV GQA decode: the FlyDSL flash attention forward vs aiter (per rank, one GPU).
 
-FlyDSL runs ``FlashAttentionForward(paged_kv=True)`` (FA4's page_table + seqused_k)
-with split-KV chosen by FA4's heuristic. aiter runs ``paged_attention_ragged``, the
+FlyDSL runs ``FlashAttentionForward(paged_kv=True)`` (FA4's page_table + seqused_k),
+which sends one-token queries to the ``FlashAttentionDecode`` kernel. With
+``--kv-dtype fp8`` both sides take a bf16 query and the same native-fp8 cache with
+per-tensor k / v scales (FlyDSL calls ``FlashAttentionDecode(kv_dtype="fp8")``
+directly). aiter runs ``paged_attention_ragged``, the
 kernel SGLang's aiter backend uses for full-GQA decode (skipped when aiter is not
 installed). Both read the same shuffled page pool. Decode is memory-bound, so cells
 report KV bandwidth; ``--check`` adds the SNR against an fp32 reference.
@@ -25,6 +28,7 @@ import torch
 from tabulate import tabulate
 
 from primus_turbo.flydsl.flex_attention import FlashAttentionForward
+from primus_turbo.flydsl.flex_attention.flash_decode import FlashAttentionDecode
 
 try:
     from aiter.ops.attention import paged_attention_ragged
@@ -150,11 +154,19 @@ def bench_cell(cfg, batch, ctx, args, seed):
     k_cache = torch.randn(num_pages, ps, Hk, D, device=dev, dtype=torch.bfloat16)
     v_cache = torch.randn(num_pages, ps, Hk, D, device=dev, dtype=torch.bfloat16)
     sink = torch.randn(Hq, device=dev) if use_sink else None
+    if args.kv_dtype == "fp8":  # one quantized cache for both kernels; the reference reads it dequantized
+        fmt = fp8_format()
+        k_scale, v_scale = (t.abs().amax().float().reshape(1) / torch.finfo(fmt).max for t in (k_cache, v_cache))
+        k_cache, v_cache = (k_cache / k_scale).to(fmt), (v_cache / v_scale).to(fmt)
+        k_ref, v_ref = k_cache.float() * k_scale, v_cache.float() * v_scale
+    else:
+        k_scale = v_scale = torch.ones(1, device=dev)
+        k_ref, v_ref = k_cache, v_cache
     # Bytes a decode step must read: a sliding window only touches its last window + 1 keys.
     read_lens = lens if window is None else lens.clamp(max=window + 1)
     kv_bytes = 2 * int(read_lens.sum()) * Hk * D * (1 if args.kv_dtype == "fp8" else 2)
     peak = PEAK_HBM_GBPS.get(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
-    ref = reference(q[:, 0], k_cache, v_cache, table, lens, scale, window, sink) if args.check else None
+    ref = reference(q[:, 0], k_ref, v_ref, table, lens, scale, window, sink) if args.check else None
 
     def result(ms, mode, out):
         gbps = kv_bytes / (ms * 1e-3) / 1e9
@@ -173,40 +185,44 @@ def bench_cell(cfg, batch, ctx, args, seed):
     else:
         flags.update(split_kv=True)
         call.update(num_splits=0)
-    fq, fk, fv = q, k_cache, v_cache
-    if args.kv_dtype == "fp8":
-        fmt, fmax = fp8_format(), torch.finfo(fp8_format()).max
-        d = {n: torch.full((batch, Hk), float(t.abs().max()) / fmax, device=dev) for n, t in
-             (("q", q), ("k", k_cache), ("v", v_cache))}
-        fq, fk, fv = ((t / d[n][0, 0]).to(fmt) for n, t in (("q", q), ("k", k_cache), ("v", v_cache)))
-        flags.update(dtype="fp8_e4m3")
-        call.update(q_descale=d["q"], k_descale=d["k"], v_descale=d["v"])
-    fwd = FlashAttentionForward(**flags)
     holder = {}
+    if args.kv_dtype == "fp8":
+        dec = FlashAttentionDecode(head_dim=D, qhead_per_kvhead=Hq // Hk, is_local=window is not None,
+                                   has_learnable_sink=use_sink, kv_dtype="fp8")
+        parts = -(-int(lens.max()) // 128)
+        partials = (torch.empty(batch, Hk, parts, Hq // Hk, D, device=dev),
+                    torch.empty(batch, Hk, parts, Hq // Hk, device=dev))
+        out = torch.empty(batch, Hq, D, device=dev, dtype=torch.bfloat16)
+        lse = torch.empty(batch, Hq, device=dev)
 
-    def run_flydsl():
-        holder["out"], _ = fwd(fq, fk, fv, scale, **call)
+        def run_flydsl():
+            holder["out"], _ = dec(q[:, 0], k_cache, v_cache, table, used, scale, out=out, lse=lse,
+                                   window_left=-1 if window is None else window, learnable_sink=sink,
+                                   partials=partials, k_scale=k_scale, v_scale=v_scale)
+    else:
+        fwd = FlashAttentionForward(**flags)
+
+        def run_flydsl():
+            holder["out"], _ = fwd(q, k_cache, v_cache, scale, **call)
+            holder["out"] = holder["out"][:, 0]
 
     ms, mode = time_ms(run_flydsl)
-    row = {"flydsl": result(ms, mode, holder["out"][:, 0])}
+    row = {"flydsl": result(ms, mode, holder["out"])}
 
     # ---- aiter (full-attention GQA only) ----
     if paged_attention_ragged is not None and window is None and not use_sink:
         max_parts = -(-int(lens.max()) // PARTITION_SIZE)
         workspace = torch.empty((batch * Hq * max_parts * D) * 4 + 2 * (batch * Hq * max_parts) * 4,
                                 dtype=torch.uint8, device=dev)
-        ones = torch.ones(1, device=dev)
-        a_k, a_v, kv_dtype = k_cache, v_cache, "auto"
-        if args.kv_dtype == "fp8":
-            a_k, a_v, kv_dtype = k_cache.to(fp8_format()), v_cache.to(fp8_format()), "fp8_e4m3"
+        kv_dtype = "fp8_e4m3" if args.kv_dtype == "fp8" else "auto"
         a_out = torch.empty(batch, Hq, D, device=dev, dtype=torch.bfloat16)
         indptr = offsets.to(dev, torch.int32)
         indices = perm.to(dev, torch.int32)
         last = (((lens - 1) % ps) + 1).to(dev, torch.int32)
 
         def run_aiter():
-            paged_attention_ragged(a_out, workspace, q[:, 0], a_k, a_v, scale, indptr, indices, last, ps,
-                                   max_parts, None, kv_dtype, "NHD", 0.0, ones, ones, None, PARTITION_SIZE)
+            paged_attention_ragged(a_out, workspace, q[:, 0], k_cache, v_cache, scale, indptr, indices, last, ps,
+                                   max_parts, None, kv_dtype, "NHD", 0.0, k_scale, v_scale, None, PARTITION_SIZE)
 
         with quiet():
             ms, mode = time_ms(run_aiter)

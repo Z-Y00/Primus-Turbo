@@ -41,7 +41,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from primus_turbo.flydsl.flex_attention.flash_fwd import MAX_AUX_TENSORS, _apply_score_mod
+from primus_turbo.flydsl.flex_attention.flash_fwd import MAX_AUX_TENSORS, _apply_score_mod, _arch_has_ocp_fp8
 from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LN2, LOG2E, NEG_BIG
@@ -83,6 +83,36 @@ def _finish(m, wsum, sink_log2):
     return rescale / total, (new_m + fx.math.log2(total)) * fx.Float32(LN2)
 
 
+def _fp8_to_f32(vec):
+    """fp8 values (the GPU's native format, a multiple of 4) -> Float32 list."""
+    words = Vec(vec).bitcast(fx.Int32)
+    out = []
+    for w in range(len(words)):
+        for hi in (False, True):
+            pair = Vec(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, words[w], hi))
+            out += [pair[0], pair[1]]
+    return out
+
+
+# Static dispatch outside the kernel body (see flash_fwd._apply_score_mod).
+def _load_kv(kv_fp8, load_elem, copy_fp8, kv_elem, elem, row, first):
+    """One 16-byte load of a K / V row at element ``first``, as 8-element ``elem`` vectors:
+    8 bf16 / fp16 -> [vec], or 16 fp8 -> [vec, vec] (converted here)."""
+    if not kv_fp8:
+        return [load_elem(row, first)]
+    packs = fx.logical_divide(row, fx.make_layout(16, 1))
+    reg = fx.make_rmem_tensor(16, kv_elem)
+    fx.copy(copy_fp8, fx.slice(packs, (None, first // fx.Int32(16))), reg)
+    f = _fp8_to_f32(reg.load())
+    return [Vec.from_elements(f[:8], fx.Float32).to(elem), Vec.from_elements(f[8:], fx.Float32).to(elem)]
+
+
+def _d_offset(kw, r, p):
+    """Head-dim offset of a lane's p-th 8-element group for S = K . Q^T (any order works
+    if K and Q share it): 16-byte loads of ``kw`` elements, lane group r at kw * r."""
+    return r * fx.Int32(kw) + fx.Int32(4 * kw * (p // (kw // 8)) + 8 * (p % (kw // 8)))
+
+
 def _sink_log2(has_sink, sink, head):
     if not has_sink:
         return None
@@ -103,6 +133,8 @@ class FlashAttentionDecode:
         num_aux_tensors: int = 0,
         has_learnable_sink: bool = False,
         partition_size: int | None = None,
+        kv_dtype: str = "bf16",
+        kv_scale: str = "tensor",
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -119,6 +151,14 @@ class FlashAttentionDecode:
         self.dtype, self.head_dim, self.group = dtype, head_dim, qhead_per_kvhead
         self.is_local, self.score_mod, self.mask_mod = is_local, score_mod, mask_mod
         self.num_aux_tensors, self.has_learnable_sink = num_aux_tensors, has_learnable_sink
+        if kv_dtype not in ("bf16", "fp16", "fp8") or kv_scale not in ("tensor", "token"):
+            raise ValueError(f"kv_dtype must be bf16 / fp16 / fp8 and kv_scale tensor / token, got {kv_dtype}, {kv_scale}")
+        # An fp8 KV cache is in the GPU's native format (FNUZ on gfx942, OCP on gfx950).
+        self.kv_fp8 = kv_dtype == "fp8"
+        self.per_token_scale = self.kv_fp8 and kv_scale == "token"
+        self.fp8_ocp = _arch_has_ocp_fp8() if self.kv_fp8 else False
+        if self.kv_fp8 and head_dim % 64:
+            raise ValueError(f"an fp8 KV cache needs head_dim % 64 == 0, got {head_dim}")
         self._get_launchers(partition_size or PARTITION)
 
     # ------------------------------------------------------------- decode ----
@@ -133,6 +173,9 @@ class FlashAttentionDecode:
         elem = fx.Float16 if fp16 else fx.BFloat16
         is_local, score_mod, mask_mod = self.is_local, self.score_mod, self.mask_mod
         num_aux = self.num_aux_tensors
+        kv_fp8, per_token = self.kv_fp8, self.per_token_scale
+        kv_elem = (fx.Float8E4M3FN if self.fp8_ocp else fx.Float8E4M3FNUZ) if kv_fp8 else elem
+        KW = 16 if kv_fp8 else 8  # K / V elements per 16-byte load
         TOK_PER_WAVE = P // NWAVES
         NCHUNK_ = TOK_PER_WAVE // CHUNK  # 16-token MFMA chunks per wave
         NT = NWAVES * 64
@@ -166,7 +209,7 @@ class FlashAttentionDecode:
         @flyc.kernel(known_block_size=[NT, 1, 1])
         def paged_decode_kernel(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, PageTable: fx.Tensor, SeqUsedK: fx.Tensor,
-            POut: fx.Tensor, PLse: fx.Tensor,
+            POut: fx.Tensor, PLse: fx.Tensor, KScale: fx.Tensor, VScale: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             page_size: fx.Int32, softmax_scale: fx.Float32, window_left: fx.Int32,
         ):
@@ -211,9 +254,24 @@ class FlashAttentionDecode:
                 fx.copy(copy_g128, fx.slice(packs, (None, first // fx.Int32(8))), reg)
                 return Vec(reg.load())
 
+            copy_kv128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), kv_elem)
+
+            def load_kv(row, first):
+                return _load_kv(kv_fp8, load8, copy_kv128, kv_elem, elem, row, first)
+
             def kv_row(t, tok):
                 page = fx.Int32(pages[tok // page_size])
                 return fx.slice(t, (page, tok % page_size, kvh, None))
+
+            def token_scale(t, tok):
+                """Per-token fp8 scale ``t[page, offset, kv head]``."""
+                page = fx.Int32(pages[tok // page_size])
+                return fx.Float32(fx.slice(t, (page, tok % page_size, None))[kvh])
+
+            ks_t, vs_t = fx.rocdl.make_buffer_tensor(KScale), fx.rocdl.make_buffer_tensor(VScale)
+            # Per-tensor scales: K's folds into the score scale, V's into the output scale.
+            k_tensor_scale = fx.Float32(ks_t[fx.Int32(0)]) if kv_fp8 and not per_token else fx.Float32(1.0)
+            v_tensor_scale = fx.Float32(vs_t[fx.Int32(0)]) if kv_fp8 and not per_token else fx.Float32(1.0)
 
             part = _first_live_partition(is_local, seqlen, window_left, P) + part_rel
             part_start = part * fx.Int32(P)
@@ -235,31 +293,35 @@ class FlashAttentionDecode:
                 last = seqlen - fx.Int32(1)
                 wave_start = part_start + wave * fx.Int32(TOK_PER_WAVE)
 
-                # Each lane owns d = 8r + 32p .. +8 of Q and K.
+                # Each lane owns D / 32 8-element groups of Q and K (d = 8r + 32p .. +8 for
+                # bf16; fp8 K loads 16 at a time, see _d_offset).
                 q_row = fx.slice(q_t, (b, head, None))
-                q8 = [load8(q_row, r * fx.Int32(8) + fx.Int32(32 * p)) for p in range_constexpr(D // 32)]
+                q8 = [load8(q_row, _d_offset(KW, r, p)) for p in range_constexpr(D // 32)]
 
                 # K for all four chunks, straight to registers (A operand, row = token l16).
                 k8 = []
                 for c in range_constexpr(NCHUNK_):
                     tok = _min(wave_start + fx.Int32(c * CHUNK) + l16, last)
                     row = kv_row(k_t, tok)
-                    k8.append([load8(row, r * fx.Int32(8) + fx.Int32(32 * p)) for p in range_constexpr(D // 32)])
+                    groups = []
+                    for p in range_constexpr(D // KW // 4):
+                        groups += load_kv(row, _d_offset(KW, r, p * (KW // 8)))
+                    k8.append(groups)
 
                 # V for all four chunks: lane j of the wave holds pack j (+64, ...) of the
-                # chunk's 16 x D tile, row = j // (D / 8), 8 elements at column 8 * (j % (D / 8)).
-                PACKS = CHUNK * D // 8
+                # chunk's 16 x D tile, row = j // (D / KW), KW elements at column KW * (j % (D / KW)).
+                PACKS = CHUNK * D // KW
                 v8 = []
                 for c in range_constexpr(NCHUNK_):
                     chunk = []
                     for it in range_constexpr(PACKS // 64):
                         j = fx.Int32(it * 64) + lane
-                        tok = _min(wave_start + fx.Int32(c * CHUNK) + j // fx.Int32(D // 8), last)
-                        chunk.append(load8(kv_row(v_t, tok), fx.Int32(8) * (j % fx.Int32(D // 8))))
+                        tok = _min(wave_start + fx.Int32(c * CHUNK) + j // fx.Int32(D // KW), last)
+                        chunk.append(load_kv(kv_row(v_t, tok), fx.Int32(KW) * (j % fx.Int32(D // KW))))
                     v8.append(chunk)
 
                 # S = K . Q^T: lane holds head l16, tokens 4r + i of each chunk.
-                scores, keep = [], []
+                scores, keep, v_scales = [], [], []
                 for c in range_constexpr(NCHUNK_):
                     acc = Vec.filled(4, 0.0, fx.Float32)
                     for p in range_constexpr(D // 32):
@@ -268,7 +330,11 @@ class FlashAttentionDecode:
                     acc = Vec(acc)
                     for i in range_constexpr(4):
                         tok = wave_start + fx.Int32(c * CHUNK) + r * fx.Int32(4) + fx.Int32(i)
-                        score = _apply_score_mod(score_mod, acc[i] * softmax_scale, b, head, q_idx, tok, mask)
+                        tok_c = _min(tok, last)
+                        k_scale = token_scale(ks_t, tok_c) if per_token else k_tensor_scale
+                        v_scales.append(token_scale(vs_t, tok_c) if per_token else None)
+                        score = _apply_score_mod(score_mod, acc[i] * (softmax_scale * k_scale), b, head, q_idx, tok,
+                                                 mask)
                         scores.append(score * fx.Float32(LOG2E))
                         keep.append(mask_keep(q_idx, tok))
 
@@ -303,9 +369,14 @@ class FlashAttentionDecode:
                 for c in range_constexpr(NCHUNK_):
                     for it in range_constexpr(PACKS // 64):
                         j = fx.Int32(it * 64) + lane
-                        row, col = j // fx.Int32(D // 8), fx.Int32(8) * (j % fx.Int32(D // 8))
-                        lds_store(v_base + (row * fx.Int32(V_ROW) + col) * fx.Int32(2), elem, v8[c][it])
-                    a = Vec.from_elements([probs[c * 4 + i] for i in range(4)], fx.Float32).to(elem)
+                        row, col = j // fx.Int32(D // KW), fx.Int32(KW) * (j % fx.Int32(D // KW))
+                        for h in range_constexpr(KW // 8):
+                            lds_store(v_base + (row * fx.Int32(V_ROW) + col + fx.Int32(8 * h)) * fx.Int32(2), elem,
+                                      v8[c][it][h])
+                    # A per-token V scale weighs each probability entering P . V (not the sum).
+                    pv = [probs[c * 4 + i] * v_scales[c * 4 + i] if per_token else probs[c * 4 + i]
+                          for i in range(4)]
+                    a = Vec.from_elements(pv, fx.Float32).to(elem)
                     for dt in range_constexpr(D // 16):
                         col = fx.Int32(16 * dt) + l16
                         bvals = [lds_load(v_base + ((r * fx.Int32(4) + fx.Int32(i)) * fx.Int32(V_ROW) + col)
@@ -338,7 +409,7 @@ class FlashAttentionDecode:
                                                    * fx.Int32(4), fx.Float32, 4)
                         # A partition whose keys mask_mod removed entirely has l = 0: O = 0.
                         inv_l = (tl > fx.Float32(0.0)).select(fx.Float32(1.0) / tl, fx.Float32(0.0))
-                        inv = Vec.from_elements([inv_l], fx.Float32).broadcast_to(4)
+                        inv = Vec.from_elements([inv_l * v_tensor_scale], fx.Float32).broadcast_to(4)
                         if h < fx.Int32(G):
                             reg = fx.make_rmem_tensor(4, fx.Float32)
                             reg.store(acc4 * inv)
@@ -359,12 +430,12 @@ class FlashAttentionDecode:
         @flyc.jit
         def launch(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, PageTable: fx.Tensor, SeqUsedK: fx.Tensor,
-            POut: fx.Tensor, PLse: fx.Tensor,
+            POut: fx.Tensor, PLse: fx.Tensor, KScale: fx.Tensor, VScale: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             page_size: fx.Int32, softmax_scale: fx.Float32, window_left: fx.Int32,
             batch: fx.Int32, num_parts: fx.Int32, num_kv_heads: fx.Int32, stream: fx.Stream = fx.Stream(None),
         ):
-            paged_decode_kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale,
+            paged_decode_kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, KScale, VScale, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale,
                    window_left).launch(grid=(batch, num_parts, num_kv_heads), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -482,12 +553,17 @@ class FlashAttentionDecode:
 
     # --------------------------------------------------------------- host ----
     def __call__(self, q, k_cache, v_cache, page_table, seqused_k, softmax_scale, out=None, lse=None,
-                 window_left=-1, aux_tensors=(), learnable_sink=None, partials=None, stream=None):
+                 window_left=-1, aux_tensors=(), learnable_sink=None, partials=None, k_scale=None, v_scale=None,
+                 stream=None):
         """Returns ``(out [B, Hq, D], lse [B, Hq])``. ``partials`` = ``(pout, plse)`` may be
         preallocated (e.g. for CUDA-graph capture): ``[B, Hk, P, G, D]`` / ``[B, Hk, P, G]``
         fp32 with ``P >= ceil(max_pages * page_size / 256)`` (with a window, P >=
         ``min(that, ceil((window_left + 1) / 256) + 1)`` suffices). ``window_left`` keeps keys
-        ``seqlen - 1 - window_left ..`` (negative: no limit) when built ``is_local``."""
+        ``seqlen - 1 - window_left ..`` (negative: no limit) when built ``is_local``.
+
+        An fp8 cache (``kv_dtype="fp8"``, native format) dequantizes as ``k_cache * k_scale``
+        / ``v_cache * v_scale``: fp32 ``[1]`` per tensor, or ``[num_pages, page_size, Hk]`` per
+        token (``kv_scale="token"``)."""
         import torch
 
         B, Hq, D = q.shape
@@ -496,6 +572,17 @@ class FlashAttentionDecode:
             raise ValueError("q / cache shapes do not match how this kernel was built")
         if page_table.dtype != torch.int32 or seqused_k.dtype != torch.int32:
             raise ValueError("page_table must be int32 [batch, max_pages], and seqused_k int32 [batch]")
+        if self.kv_fp8:
+            native = torch.float8_e4m3fn if self.fp8_ocp else torch.float8_e4m3fnuz
+            if k_cache.dtype != native or v_cache.dtype != native:
+                raise ValueError(f"fp8 KV cache must be {native} on this GPU, got {k_cache.dtype} / {v_cache.dtype}")
+            want = tuple(k_cache.shape[:3]) if self.per_token_scale else (1,)
+            if k_scale is None or v_scale is None:
+                raise ValueError("an fp8 KV cache needs k_scale and v_scale")
+            k_scale = torch.as_tensor(k_scale, dtype=torch.float32, device=q.device).reshape(want).contiguous()
+            v_scale = torch.as_tensor(v_scale, dtype=torch.float32, device=q.device).reshape(want).contiguous()
+        elif k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
+            raise ValueError("a bf16 / fp16 KV cache must match q's dtype (build with kv_dtype='fp8' for fp8)")
         aux_tensors = tuple(aux_tensors or ())
         if len(aux_tensors) != self.num_aux_tensors:
             raise ValueError(f"kernel built for {self.num_aux_tensors} aux tensors, got {len(aux_tensors)}")
@@ -532,7 +619,10 @@ class FlashAttentionDecode:
             lse = torch.empty(B, Hq, dtype=torch.float32, device=q.device)
         stream = torch.cuda.current_stream() if stream is None else stream
         aux_slots = aux_tensors + (plse,) * (MAX_AUX_TENSORS - len(aux_tensors))
-        decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, *aux_slots, page_size,
+        k_scale = plse if k_scale is None else k_scale
+        v_scale = plse if v_scale is None else v_scale
+        decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, k_scale, v_scale, *aux_slots,
+                        page_size,
                              float(softmax_scale), int(window_left), B, num_parts, Hk, stream=stream)
         reduce_launcher(pout, plse, seqused_k, learnable_sink if learnable_sink is not None else plse,
                              out, lse, int(window_left), B, Hq, stream=stream)
