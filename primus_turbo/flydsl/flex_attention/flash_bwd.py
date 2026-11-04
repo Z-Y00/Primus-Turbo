@@ -178,6 +178,9 @@ def _stage_rows(ops, tid, NT, rows, dim, row_of, lds_packs):
         fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, row * fx.Int32(chunks) + (chunk ^ (row & fx.Int32(mask))))))
 
 
+MIN_SPLIT_WORK = 128
+
+
 class FlashAttentionBackward:
     """Builds the dQ and dK/dV launchers for one compile-time configuration.
 
@@ -733,7 +736,8 @@ class FlashAttentionBackward:
             stream=stream,
         )
         num_n_blocks = max(-(-seqlen_k // self.dkdv_tile_n), 1)
-        split = self._dkdv_split(num_n_blocks * num_kv_heads * batch, q.device)
+        split = self._dkdv_split(num_n_blocks * num_kv_heads * batch, seqlen_q, int(window_left), int(window_right),
+                                 q.device)
         dk_out, dv_out = dk, dv
         if split > 1:
             dk_out = torch.empty((split, *dk.shape), dtype=torch.float32, device=dk.device)
@@ -751,14 +755,27 @@ class FlashAttentionBackward:
             dv.copy_(dv_out.sum(0))
         return dq, dk, dv, dsink
 
-    def _dkdv_split(self, ctas, device):
-        """Smallest power-of-two split of the GQA group across CTAs that gives every CU a
-        dK/dV CTA (it fits one per CU); a grid that already fills the GPU is not split, as the
-        fp32 partials then cost more than they add."""
+    def _dkdv_split(self, ctas, seqlen_q, window_left, window_right, device):
+        """Power-of-two split of the GQA group across dK/dV CTAs (it fits one CTA per CU).
+        Split until every CU has a CTA; keep splitting up to two per CU only while each CTA
+        keeps at least ``MIN_SPLIT_WORK`` (query tile x head) iterations, since below that the
+        fp32 partials cost more than the extra overlap gains."""
         import torch
 
         num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+        m_blocks = max(-(-seqlen_q // self.dkdv_tile_m), 1)
+        if self.is_local and window_left >= 0:
+            span = window_left + max(window_right, 0) + self.dkdv_tile_n
+            m_iters = min(m_blocks, -(-span // self.dkdv_tile_m))
+        elif self.is_causal:
+            m_iters = max(m_blocks // 2, 1)
+        else:
+            m_iters = m_blocks
+        work = m_iters * self.qhead_per_kvhead
         split = 1
-        while ctas * split < num_cus and self.qhead_per_kvhead % (split * 2) == 0:
-            split *= 2
+        while self.qhead_per_kvhead % (split * 2) == 0:
+            if ctas * split < num_cus or (ctas * split < 2 * num_cus and work // (split * 2) >= MIN_SPLIT_WORK):
+                split *= 2
+            else:
+                break
         return split
