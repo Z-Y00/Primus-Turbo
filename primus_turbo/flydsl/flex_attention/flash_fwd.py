@@ -208,6 +208,12 @@ class FlashAttentionForward:
             if (tile_n * d // pack) % self.num_threads:
                 raise ValueError(f"KV tile {tile_n}x{d} does not split evenly over {self.num_threads} threads")
         self.launcher = self._build()
+        # Paged single-token decode goes to FlashAttentionDecode (built on first use).
+        self._decode_ok = (
+            paged_kv and not varlen_q and not block_sparse and not self.fp8 and not self.dequant_e5m2
+            and qhead_per_kvhead <= 16 and head_dim == head_dim_v and head_dim % 32 == 0
+        )
+        self._decode = None
 
     def _build(self):
         D, DV, TN = self.head_dim, self.head_dim_v, self.tile_n
@@ -540,6 +546,30 @@ class FlashAttentionForward:
 
         return launch
 
+    def _run_decode(self, q, k, v, softmax_scale, out, lse, window_left, seqused_k, aux_tensors, learnable_sink,
+                    page_table, stream):
+        """One query token per sequence on a paged cache: FlashAttentionDecode (GQA packed,
+        256-token partitions). Causal needs no mask here (the keys end at the query)."""
+        import torch
+
+        from primus_turbo.flydsl.flex_attention.flash_decode import FlashAttentionDecode
+
+        if self._decode is None:
+            self._decode = FlashAttentionDecode(
+                dtype=self.dtype, head_dim=self.head_dim, qhead_per_kvhead=self.qhead_per_kvhead,
+                is_local=self.is_local, score_mod=self.score_mod, mask_mod=self.mask_mod,
+                num_aux_tensors=self.num_aux_tensors, has_learnable_sink=self.has_learnable_sink,
+            )
+        B, _, Hq, D = q.shape
+        if seqused_k is None:
+            seqused_k = torch.full((B,), page_table.shape[1] * k.shape[1], dtype=torch.int32, device=q.device)
+        o3 = None if out is None else out.view(B, Hq, D)
+        l2 = None if lse is None else lse.view(B, Hq)
+        o3, l2 = self._decode(q.view(B, Hq, D), k, v, page_table, seqused_k, softmax_scale, out=o3, lse=l2,
+                              window_left=window_left if self.is_local else -1, aux_tensors=aux_tensors,
+                              learnable_sink=learnable_sink, stream=stream)
+        return o3.view(B, 1, Hq, D), l2.view(B, Hq, 1)
+
     def __call__(
         self,
         q,
@@ -576,6 +606,9 @@ class FlashAttentionForward:
 
         if (page_table is not None) != self.paged_kv:
             raise ValueError("page_table does not match how this kernel was built")
+        if self._decode_ok and q.dim() == 4 and q.shape[1] == 1:
+            return self._run_decode(q, k, v, softmax_scale, out, lse, window_left, seqused_k, aux_tensors,
+                                    learnable_sink, page_table, stream)
         if num_splits != 1 and not self.split_kv:
             raise ValueError("num_splits != 1 needs a kernel built with split_kv=True")
         descales = ()

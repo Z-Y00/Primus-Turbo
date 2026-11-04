@@ -181,6 +181,59 @@ def test_softcap():
     _check(out, lse, q, k_cache, v_cache, table, seqlens, D**-0.5, softcap=10.0)
 
 
+def _prefix_or_recent(b, h, q_idx, kv_idx, seqlen_info, aux):
+    """Keep a per-sequence prefix (aux[0][b]) and the last 64 keys."""
+    import flydsl.expr as fx
+
+    return (kv_idx < fx.Int32(aux[0][b])) | (kv_idx >= seqlen_info.seqlen_k - fx.Int32(64))
+
+
+def _alibi(score, b, h, q_idx, kv_idx, seqlen_info, aux):
+    """score + slope[h] * (kv_idx - query position); slopes in aux[1]."""
+    import flydsl.expr as fx
+
+    return score + fx.Float32(aux[1][h]) * fx.Float32(kv_idx - (seqlen_info.seqlen_k - fx.Int32(1)))
+
+
+def test_decode_mask_mod_score_mod_aux():
+    # Decode-only shapes: the mask empties whole 256-key partitions in the middle of the
+    # long sequences, and the bias depends on each sequence's length.
+    seqlens = (1, 90, 257, 1000, 5000)
+    Hq, Hk, D = 12, 2, 128
+    k_cache, v_cache, table, used = _paged_cache(seqlens, 16, Hk, D, seed=8)
+    q = torch.randn(len(seqlens), 1, Hq, D, device="cuda").to(DTYPE)
+    prefix = torch.tensor([0, 10, 300, 40, 600], dtype=torch.int32, device="cuda")
+    slopes = -torch.rand(Hq, device="cuda") * 0.05
+    sink = torch.randn(Hq, device="cuda")
+    fwd = FlashAttentionForward(head_dim=D, qhead_per_kvhead=Hq // Hk, is_local=True, has_seqused_k=True,
+                                paged_kv=True, mask_mod=_prefix_or_recent, score_mod=_alibi, num_aux_tensors=2,
+                                has_learnable_sink=True)
+    out, lse = fwd(q, k_cache, v_cache, D**-0.5, window_left=900, window_right=0, seqused_k=used,
+                   page_table=table, aux_tensors=(prefix, slopes), learnable_sink=sink)
+    for b, n in enumerate(seqlens):
+        k, v = _gather(k_cache, table, b, n), _gather(v_cache, table, b, n)
+        kv = torch.arange(n, device="cuda")
+        s = torch.einsum("hd,nhd->hn", q[b, 0].float(), k.float().repeat_interleave(Hq // Hk, 1)) * D**-0.5
+        s = s + slopes[:, None] * (kv - (n - 1))
+        keep = ((kv < prefix[b]) | (kv >= n - 64)) & (kv >= n - 1 - 900)
+        s = torch.cat([s.masked_fill(~keep, float("-inf")), sink[:, None]], 1)
+        ref_o = torch.einsum("hn,nhd->hd", torch.softmax(s, -1)[:, :n], v.float().repeat_interleave(Hq // Hk, 1))
+        torch.testing.assert_close(out[b, 0].float(), ref_o, atol=2e-2, rtol=2e-2, msg=f"out, sequence {b}")
+        torch.testing.assert_close(lse[b, :, 0], torch.logsumexp(s, -1), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("group", [1, 16])
+def test_decode_group_sizes_and_empty_sequence(group):
+    seqlens = (300, 0, 4097)
+    Hk, D = 2, 64
+    k_cache, v_cache, table, used = _paged_cache(seqlens, 64, Hk, D, seed=9)
+    q = torch.randn(len(seqlens), 1, Hk * group, D, device="cuda").to(DTYPE)
+    fwd = FlashAttentionForward(head_dim=D, qhead_per_kvhead=group, has_seqused_k=True, paged_kv=True)
+    out, lse = fwd(q, k_cache, v_cache, D**-0.5, seqused_k=used, page_table=table)
+    assert torch.all(out[1] == 0) and torch.all(torch.isneginf(lse[1]))
+    _check(out[[0, 2]], lse[[0, 2]], q[[0, 2]], k_cache, v_cache, table[[0, 2]], (300, 4097), D**-0.5)
+
+
 def test_fp8_kv_cache():
     # e4m3 in the GPU's native format, per-(batch, kv head) descales; bf16 output.
     from primus_turbo.flydsl.flex_attention.flash_fwd import _arch_has_ocp_fp8
