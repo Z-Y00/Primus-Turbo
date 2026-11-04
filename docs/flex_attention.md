@@ -129,3 +129,103 @@ exactly to bf16 and runs on the bf16 kernel (not with paged KV).
 - fp16 / bf16 inputs only.
 - The backward is deterministic: every dQ / dK / dV tile, and the `score_grad_hook`
   output, is written by a single program.
+
+## Status (November 2026)
+
+Measured on MI300X (gfx942), `rocm/primus:v26.8` (Triton 3.8.0, PyTorch 2.14, FlyDSL
+0.3.4.1), one GPU, bf16, head dim 128 unless noted.
+
+### Triton backend: supported and tuned
+
+Everything on this page, forward and backward: built-in masks on the causal/window
+path, block-sparse masks (memoized dense lists, sync-free varlen lists), varlen,
+`score_mod` / `mask_mod` with aux tensors, `score_grad_hook` (Inkling's relative-position
+bias), `num_splits`. Tuned: the first call per mask and shape picks the causal/window
+path or block size 64 / 128 separately for the forward and the backward, and the kernels'
+own autotune tables were swept on MI300X. Against `torch.compile(flex_attention)`
+(`benchmark/ops/training/bench_flex_attention_turbo.py`, 4K-8K tokens, 16/2 heads):
+
+| case | turbo fwd ms (vs torch) | turbo fwd+bwd ms (vs torch) |
+|---|---|---|
+| causal, 8K | 1.73 (7.0x) | 10.95 (3.0x) |
+| sliding window 1K, 8K | 0.67 (4.4x) | 2.72 (2.7x) |
+| band 1K (block-sparse), 8K | 0.96 (5.4x) | 5.93 (2.2x) |
+| prefix LM (block-sparse), 8K | 1.90 (6.3x) | 11.29 (2.7x) |
+
+### FlyDSL backend: supported, validated, not tuned
+
+Supported: everything on this page except `score_grad_hook`, for bf16 / fp16, forward
+and deterministic backward. The kernels additionally support paged KV, split-KV
+(`num_splits < 1` picks it with FA4's heuristic), learnable sinks and fp8 forward.
+
+Validated with the kernel test suites (forward, mods, block-sparse, paged, split-KV,
+fp8, backward) on MI300X (gfx942) and MI350 (gfx950), and through the turbo API by
+`tests/pytorch/ops/test_flex_attention_flydsl.py` and
+`tests/pytorch/ops/test_flex_attention_flydsl_paged.py` on MI300X.
+
+Not tuned: one tile shape (128 x 64 forward, 32 x 32 x 8 MFMA, 4 waves), single-buffered
+KV staging in LDS, V^T read from LDS one element at a time, and a backward that spends
+7 matmuls where 5 suffice. Same benchmark as above:
+
+| case | flydsl fwd ms (vs triton) | flydsl fwd+bwd ms (vs triton) |
+|---|---|---|
+| causal, 8K | 4.62 (0.37x) | 27.3 (0.40x) |
+| sliding window 1K, 8K | 1.23 (0.54x) | 5.40 (0.50x) |
+| band 1K, 8K | 1.97 (0.49x) | 9.27 (0.64x) |
+| prefix LM, 8K | 4.50 (0.42x) | 26.9 (0.42x) |
+
+Paged decode (`benchmark/ops/inference/bench_paged_attn_flydsl.py`, MiniMax-M2.7 at
+TP=8: 6 query heads / 1 KV head, page size 16): correct (SNR ~53 dB) but far from
+aiter's `paged_attention_ragged`, at 2-3% of HBM bandwidth against aiter's 50-65%:
+
+| batch x context | flydsl ms | aiter ms |
+|---|---|---|
+| 1 x 32K | 0.155 | 0.015 |
+| 32 x 32K | 5.46 | 0.164 |
+| 128 x 32K | 14.3 | 0.64 |
+
+The kernel is shaped for prefill: without GQA packing each query head is its own CTA
+and re-reads its KV head (6x here), and a 128-row query tile holds one decode token.
+
+### Known issue: Triton 3.8.0 miscompiles one causal backward config
+
+Triton 3.8.0 generates an out-of-bounds read in the causal backward
+(`bwd_kernel_fused_causal` in `primus_turbo/triton/flex_attention/flex_attention_bwd_kernel.py`)
+for the autotune config `BLOCK_M1=64, BLOCK_N1=128, BLOCK_M2=128, BLOCK_N2=64,
+BLK_SLICE_FACTOR=1` (one of the two extra configs `_extend_bwd_configs` adds) when the
+kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
+
+- Symptom: `HSA_STATUS_ERROR_MEMORY_FAULT` in `bwd_kernel_fused_causal`, only when the
+  autotuner benchmarks that config and the page after the `delta` tensor is unmapped.
+  `tests/pytorch/ops/test_flex_attention.py::test_score_grad_hook_returns_captured_tensor_gradient`
+  aborts when run after the rest of that file; it passes on its own. When it does not
+  fault, results are correct.
+- Cause: the masked load `Di = tl.load(Delta + offs_m * stride_delta_m, mask=mask_m)` in
+  `_bwd_dq_inner` is issued with lane offsets past the end of `delta`. The source, the
+  TTGIR and the LLVM IR are correct; the machine code's wave-uniform offset is wrong
+  (1088 where the source computes 600), and Triton's buffer descriptors span 2 GB, so
+  the hardware does not stop the read.
+- Not a kernel bug: the same source, config and inputs run clean on Triton 3.7.1 and on
+  3.8.0 with `AMDGCN_USE_BUFFER_OPS=0`. Skipping any one of `move_up_prologue_loads`,
+  `optimize_buffer_op_ptr`, `fold_true_cmpi` or `prepare_if_combining` does not help.
+  The exact compiler change is not identified.
+- Reproduce deterministically: pin the causal backward to that config and run the test
+  with `PYTORCH_NO_HIP_MEMORY_CACHING=1`, allocating each tensor so it ends at a 2 MB
+  boundary; a standalone reproducer (no Primus-Turbo build needed) is attached to the
+  Triton ticket.
+- Status: not fixed in this repo. Until the compiler is fixed, either drop that config
+  from the causal list (costs 1.02-1.05x on some shapes; the non-causal kernel can keep
+  it) or compile `bwd_kernel_fused_causal` with buffer ops off.
+
+### To do
+
+- Triton backend: work around or pick up the fix for the Triton 3.8.0 miscompile above.
+- FlyDSL decode: pack GQA heads into the query tile (one CTA per KV head), a 1-wave
+  32-row tile for decode, double-buffered paged KV loads; target aiter's bandwidth.
+- FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
+  reads, a 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while
+  staying deterministic), then the kernel-optimize loop against the Triton backend.
+- FlyDSL features: varlen block-sparse lists, `score_grad_hook`, split-KV combined with
+  block sparsity or sinks, native e5m2 (needs MFMA support in FlyDSL), fp8 backward.
+- Validation: the turbo-API FlyDSL tests and benchmarks on gfx950 (only the kernel
+  suites ran there).
