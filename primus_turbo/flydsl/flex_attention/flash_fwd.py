@@ -238,6 +238,12 @@ class FlashAttentionForward:
         paged_kv, split_kv = self.paged_kv, self.split_kv
         o_elem = fx.Float32 if split_kv else out_elem
 
+        # K's 16-byte chunks are XOR-swizzled by row (chunk ^= row % 2^K_SWZ): unswizzled,
+        # the 32 key rows of an A fragment are a multiple of 128 bytes apart and all read
+        # the same LDS bank. A swizzle costs no LDS (padding would push a CTA past 32 KB).
+        k_chunks = D // PACK
+        K_SWZ = min(3, k_chunks.bit_length() - 1) if k_chunks & (k_chunks - 1) == 0 else 0
+
         @fx.struct
         class SharedStorage:
             k: fx.Array[elem, TN * D, 16]
@@ -320,7 +326,11 @@ class FlashAttentionForward:
             lse_t = fx.rocdl.make_buffer_tensor(LSE)
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, KS))
+            k_layout = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(K_SWZ, PACK.bit_length() - 1, D.bit_length() - PACK.bit_length())),
+                fx.make_layout((TN, D), (D, 1)),
+            ) if K_SWZ else fx.make_layout((TN, D), (D, 1))
+            k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, k_layout), (MFMA_M, KS))
             k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(PACK, 1))
             # V^T view of the row-major [TN, DV] V tile: (d, key) with strides (1, DV).
             vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, KS))
@@ -376,7 +386,9 @@ class FlashAttentionForward:
                     src = fx.logical_divide(kv_side_row(k_t, key), fx.make_layout(PACK, 1))
                     reg = fx.make_rmem_tensor(PACK, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // PACK))), reg)
-                    fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, linear)))
+                    k_row, k_chunk = linear // fx.Int32(k_chunks), linear % fx.Int32(k_chunks)
+                    k_pack = k_row * fx.Int32(k_chunks) + (k_chunk ^ (k_row & fx.Int32((1 << K_SWZ) - 1)))
+                    fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, k_pack)))
                 for it in range_constexpr(v_iters):
                     linear = fx.Int32(it * NT) + tid
                     row, col = linear // fx.Int32(DV // PACK), linear % fx.Int32(DV // PACK)
