@@ -128,12 +128,16 @@ class FlashAttentionDecode:
         NT = NWAVES * 64
         V_ROW = D + 8  # padded LDS row (elements) for the staged V chunk
         V_CHUNK_BYTES = CHUNK * V_ROW * 2
-        # LDS: per-wave V chunk | cross-wave max / sum | per-head final max / sum | partial O
-        off_v = 0
-        off_max = off_v + NWAVES * V_CHUNK_BYTES
+        # The cross-wave O sum runs in O_ROUNDS slices of D and reuses the V staging area,
+        # keeping LDS near 18 KB so two CTAs fit a CU (VGPRs allow two).
+        O_ROUNDS = 2 if D >= 128 else 1
+        D_ROUND = D // O_ROUNDS
+        # LDS: cross-wave max / sum | shared area (per-wave V chunks, then partial O slices)
+        off_max = 0
         off_sum = off_max + NWAVES * 16 * 4
-        off_o = off_sum + NWAVES * 16 * 4
-        total = off_o + NWAVES * 16 * D * 4
+        off_v = off_sum + NWAVES * 16 * 4
+        off_o = off_v
+        total = off_v + max(NWAVES * V_CHUNK_BYTES, NWAVES * 16 * D_ROUND * 4)
 
         @fx.struct
         class SharedStorage:
@@ -281,50 +285,52 @@ class FlashAttentionDecode:
                 # B = V chunk read transposed from LDS (k = token 4r + i, column = d).
                 o = [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(D // 16)]
                 v_base = fx.Int32(off_v) + wave * fx.Int32(V_CHUNK_BYTES)
+                # The V chunk area is private to the wave and a wave's LDS operations run in
+                # order, so staging and reading it need no CTA barrier.
                 for c in range_constexpr(NCHUNK):
                     for it in range_constexpr(PACKS // 64):
                         j = fx.Int32(it * 64) + lane
                         row, col = j // fx.Int32(D // 8), fx.Int32(8) * (j % fx.Int32(D // 8))
                         lds_store(v_base + (row * fx.Int32(V_ROW) + col) * fx.Int32(2), elem, v8[c][it])
-                    fx.gpu.barrier()
                     a = Vec.from_elements([probs[c * 4 + i] for i in range(4)], fx.Float32).to(elem)
                     for dt in range_constexpr(D // 16):
                         col = fx.Int32(16 * dt) + l16
                         bvals = [lds_load(v_base + ((r * fx.Int32(4) + fx.Int32(i)) * fx.Int32(V_ROW) + col)
                                           * fx.Int32(2), elem, 1)[0] for i in range(4)]
                         o[dt] = mfma(a, as4(bvals), o[dt])
+
+                # Sum the waves' partial O (o[dt][i] = O[head 4r + i][d 16 dt + l16]) through
+                # the shared area, one D_ROUND slice at a time.
+                DT_ROUND = D_ROUND // 16
+                for rnd in range_constexpr(O_ROUNDS):
+                    fx.gpu.barrier()  # every wave is done with the area (V chunks or last slice)
+                    for dt_r in range_constexpr(DT_ROUND):
+                        ov = Vec(o[rnd * DT_ROUND + dt_r])
+                        for i in range_constexpr(4):
+                            h = r * fx.Int32(4) + fx.Int32(i)
+                            d = fx.Int32(16 * dt_r) + l16
+                            lds_store(fx.Int32(off_o) + ((wave * fx.Int32(16) + h) * fx.Int32(D_ROUND) + d)
+                                      * fx.Int32(4), fx.Float32, Vec.from_elements([ov[i]], fx.Float32))
                     fx.gpu.barrier()
-
-                # Sum the waves' partial O (o[dt][i] = O[head 4r + i][d 16 dt + l16]) in LDS.
-                for dt in range_constexpr(D // 16):
-                    ov = Vec(o[dt])
-                    for i in range_constexpr(4):
-                        h = r * fx.Int32(4) + fx.Int32(i)
-                        d = fx.Int32(16 * dt) + l16
-                        lds_store(fx.Int32(off_o) + ((wave * fx.Int32(16) + h) * fx.Int32(D) + d) * fx.Int32(4),
-                                  fx.Float32, Vec.from_elements([ov[i]], fx.Float32))
-                fx.gpu.barrier()
-
-                # Each thread finishes 4 consecutive (head, d) elements of the 16 x D tile.
-                ELEMS = 16 * D
-                for it in range_constexpr(ELEMS // (NT * 4)):
-                    e = (fx.Int32(it * NT) + tid) * fx.Int32(4)
-                    h, d = e // fx.Int32(D), e % fx.Int32(D)
-                    total_l = fx.Float32(0.0)
-                    for w in range_constexpr(NWAVES):
-                        total_l = total_l + lds_load(fx.Int32(off_sum + w * 64) + h * fx.Int32(4), fx.Float32, 1)[0]
-                    acc4 = Vec.filled(4, 0.0, fx.Float32)
-                    for w in range_constexpr(NWAVES):
-                        acc4 = acc4 + lds_load(fx.Int32(off_o) + ((fx.Int32(w * 16) + h) * fx.Int32(D) + d)
-                                               * fx.Int32(4), fx.Float32, 4)
-                    # A partition whose keys mask_mod removed entirely has l = 0: O = 0.
-                    inv_l = (total_l > fx.Float32(0.0)).select(fx.Float32(1.0) / total_l, fx.Float32(0.0))
-                    inv = Vec.from_elements([inv_l], fx.Float32).broadcast_to(4)
-                    if h < fx.Int32(G):
-                        reg = fx.make_rmem_tensor(4, fx.Float32)
-                        reg.store(acc4 * inv)
-                        row = fx.logical_divide(fx.slice(pout_t, (b, kvh, part, h, None)), fx.make_layout(4, 1))
-                        fx.copy(copy_f128, reg, fx.slice(row, (None, d // fx.Int32(4))))
+                    # Each thread finishes 4 consecutive (head, d) elements of the 16 x D_ROUND slice.
+                    for it in range_constexpr(16 * D_ROUND // (NT * 4)):
+                        e = (fx.Int32(it * NT) + tid) * fx.Int32(4)
+                        h, d = e // fx.Int32(D_ROUND), e % fx.Int32(D_ROUND)
+                        tl = fx.Float32(0.0)
+                        for w in range_constexpr(NWAVES):
+                            tl = tl + lds_load(fx.Int32(off_sum + w * 64) + h * fx.Int32(4), fx.Float32, 1)[0]
+                        acc4 = Vec.filled(4, 0.0, fx.Float32)
+                        for w in range_constexpr(NWAVES):
+                            acc4 = acc4 + lds_load(fx.Int32(off_o) + ((fx.Int32(w * 16) + h) * fx.Int32(D_ROUND) + d)
+                                                   * fx.Int32(4), fx.Float32, 4)
+                        # A partition whose keys mask_mod removed entirely has l = 0: O = 0.
+                        inv_l = (tl > fx.Float32(0.0)).select(fx.Float32(1.0) / tl, fx.Float32(0.0))
+                        inv = Vec.from_elements([inv_l], fx.Float32).broadcast_to(4)
+                        if h < fx.Int32(G):
+                            reg = fx.make_rmem_tensor(4, fx.Float32)
+                            reg.store(acc4 * inv)
+                            row = fx.logical_divide(fx.slice(pout_t, (b, kvh, part, h, None)), fx.make_layout(4, 1))
+                            fx.copy(copy_f128, reg, fx.slice(row, (None, (fx.Int32(rnd * D_ROUND) + d) // fx.Int32(4))))
 
                 # Partition LSE (log2 domain) per head: lanes of wave 0 with r == 0.
                 if tid < fx.Int32(G):
