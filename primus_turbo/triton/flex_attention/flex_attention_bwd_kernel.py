@@ -413,7 +413,36 @@ def _extend_bwd_configs(configs):
     return out
 
 
-causal_autotune_configs = _extend_bwd_configs(causal_autotune_configs)
+def _triton_version() -> tuple:
+    return tuple(int(p) for p in triton.__version__.split("+")[0].split(".")[:2])
+
+
+def _drop_causal_faulting_configs(configs):
+    """Drop (64, 128, 128, 64, slice 1) from the causal kernel on Triton < 3.9.
+
+    Triton 3.8.0 miscompiles it on MI300X: the masked ``delta`` load in ``_bwd_dq_inner``
+    is issued with a wrong wave-uniform offset, so it reads past the end of ``delta``.
+    That faults when the next page is unmapped and otherwise feeds wrong ``delta``
+    values into dQ. Triton 3.9.0 compiles it correctly. Dropping it costs its tuning gain
+    (1.02-1.05x on some shapes); the non-causal kernel keeps it.
+    """
+    if _triton_version() >= (3, 9):
+        return list(configs)
+    return [
+        c
+        for c in configs
+        if (
+            c.kwargs.get("BLOCK_M1"),
+            c.kwargs.get("BLOCK_N1"),
+            c.kwargs.get("BLOCK_M2"),
+            c.kwargs.get("BLOCK_N2"),
+            c.kwargs.get("BLK_SLICE_FACTOR"),
+        )
+        != (64, 128, 128, 64, 1)
+    ]
+
+
+causal_autotune_configs = _drop_causal_faulting_configs(_extend_bwd_configs(causal_autotune_configs))
 noncausal_autotune_configs = _extend_bwd_configs(noncausal_autotune_configs)
 causal_autotune_configs = _sanitize_nonkdim(causal_autotune_configs)
 

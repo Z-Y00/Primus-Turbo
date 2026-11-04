@@ -199,7 +199,8 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   autotuner benchmarks that config and the page after the `delta` tensor is unmapped.
   `tests/pytorch/ops/test_flex_attention.py::test_score_grad_hook_returns_captured_tensor_gradient`
   aborts when run after the rest of that file; it passes on its own. When it does not
-  fault, results are correct.
+  fault, dQ can be silently wrong: in the standalone reproducer with ordinary
+  allocations, dQ was off by 27x (relative max error) while dK and dV were correct.
 - Cause: the masked load `Di = tl.load(Delta + offs_m * stride_delta_m, mask=mask_m)` in
   `_bwd_dq_inner` is issued with lane offsets past the end of `delta`. The source, the
   TTGIR and the LLVM IR are correct; the machine code's wave-uniform offset is wrong
@@ -213,13 +214,26 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   with `PYTORCH_NO_HIP_MEMORY_CACHING=1`, allocating each tensor so it ends at a 2 MB
   boundary; a standalone reproducer (no Primus-Turbo build needed) is attached to the
   Triton ticket.
-- Status: not fixed in this repo. Until the compiler is fixed, either drop that config
-  from the causal list (costs 1.02-1.05x on some shapes; the non-causal kernel can keep
-  it) or compile `bwd_kernel_fused_causal` with buffer ops off.
+- Fixed in Triton 3.9.0. With the reproducer on MI300X, in `rocm/pytorch` ROCm 7.2.3
+  with PyTorch 2.10 so that only Triton changes:
+
+  | Triton | Tensors at allocation ends | Ordinary allocations |
+  |---|---|---|
+  | 3.8.0 | memory access fault | completes, dQ wrong (27x), dK / dV correct |
+  | 3.8.0, `AMDGCN_USE_BUFFER_OPS=0` | correct | not run |
+  | 3.9.0 | correct | correct |
+
+  PyPI's Triton 3.9.0 cannot be dropped into `rocm/primus:v26.8`: that image's PyTorch
+  (2.14.0+rocm10.1.0) is built against its own ROCm Triton, and loading both aborts with
+  a duplicate LLVM option. The fix needs a ROCm Triton 3.9 build in the image.
+- Workaround in this repo: on Triton < 3.9, `_drop_causal_faulting_configs` removes that
+  config from the causal backward's autotune list (costs 1.02-1.05x on some shapes; the
+  non-causal kernel keeps it). On 3.9 and later the list is unchanged.
 
 ### To do
 
-- Triton backend: work around or pick up the fix for the Triton 3.8.0 miscompile above.
+- Triton backend: when the Primus image moves to a ROCm Triton 3.9 build, rerun the full
+  flex attention suites to confirm the miscompile is gone there too.
 - FlyDSL decode: pack GQA heads into the query tile (one CTA per KV head), a 1-wave
   32-row tile for decode, double-buffered paged KV loads; target aiter's bandwidth.
 - FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
