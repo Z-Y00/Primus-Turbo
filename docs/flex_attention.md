@@ -176,23 +176,35 @@ KV staging in LDS, V^T read from LDS one element at a time, and a backward that 
 
 Paged decode: `FlashAttentionForward` routes one-token paged calls to
 `FlashAttentionDecode` (`flash_decode.py`), modelled on aiter's `paged_attention_ragged`
-(vLLM's ll4mi kernel): a CTA per (sequence, 256-token partition, KV head) with the GQA
-group packed into a 16-row MFMA tile, K loaded straight to registers, and a FlyDSL
-reduce over partitions. It supports `score_mod` / `mask_mod` with aux tensors, sliding
-windows (out-of-window partitions skipped), learnable sinks and softcap; not yet fp8 KV
-or block-sparse lists (those calls stay on the prefill kernel).
+(vLLM's ll4mi kernel): a CTA per (sequence, partition, KV head) with the GQA group
+packed into a 16-row MFMA tile, K loaded straight to registers, V staged in wave-private
+LDS (no CTA barriers in P . V), and a parallel FlyDSL reduce over partitions. The
+partition is 128 tokens when the grid would fill at most half the CUs, else 256.
+It supports `score_mod` / `mask_mod` with aux tensors, sliding windows (the grid covers
+only in-window partitions), learnable sinks, softcap, and:
+
+- fp8 KV cache with a bf16 query (`kv_dtype="fp8"`, the GPU's native e4m3, per-tensor
+  or per-token `k_scale` / `v_scale` as aiter and SGLang use them), converted to bf16 in
+  registers so the scores keep bf16 accuracy. Called on `FlashAttentionDecode` directly
+  (the forward's fp8 mode quantizes q too and stays on the prefill kernel).
+- Block-sparse lists (FA4's, query block 0): each CTA scans its group's lists into a
+  per-block status; partitions no head lists are skipped without reading K / V, and
+  `mask_mod` runs only on mask-list blocks.
+
 `benchmark/ops/inference/bench_paged_attn_flydsl.py`, MiniMax-M2.7 at TP=8 (6 query
-heads / 1 KV head, page size 16), SNR ~53 dB (aiter ~51 dB):
+heads / 1 KV head, page size 16), MI300X, ms:
 
-| batch x context | flydsl ms | aiter ms | prefill kernel (before) ms |
-|---|---|---|---|
-| 1 x 32K | 0.033 | 0.016 | 0.155 |
-| 8 x 8K | 0.018 | 0.014 | 0.255 |
-| 32 x 32K | 0.203 | 0.162 | 5.46 |
-| 128 x 32K | 0.733 | 0.643 | 14.3 |
+| batch x context | flydsl bf16 | aiter bf16 | flydsl fp8 KV | aiter fp8 KV | prefill kernel (before) |
+|---|---|---|---|---|---|
+| 1 x 32K | 0.015 | 0.019 | 0.014 | 0.019 | 0.155 |
+| 8 x 8K | 0.017 | 0.017 | 0.014 | 0.015 | 0.255 |
+| 32 x 32K | 0.168 | 0.164 | 0.090 | 0.075 | 5.46 |
+| 128 x 32K | 0.671 | 0.653 | 0.395 | 0.365 | 14.3 |
 
-At batch >= 32 it reads 2.6-2.9 TB/s against aiter's 3.3 TB/s; small-batch long-context
-cells trail most (the reduce walks up to 128 partitions serially).
+SNR against fp32: FlyDSL ~53 dB in both modes; aiter ~51 dB bf16 and ~25 dB fp8 (it also
+rounds q and P to fp8). The fp8 gap at large batch is the fp8 -> bf16 conversion.
+Block-sparse with ~1/8 of 128-key blocks listed: 32 x 32K 0.171 -> 0.049 ms,
+128 x 8K 0.164 -> 0.054 ms; listing every block costs 1-8 us over dense.
 
 ### Known issue: Triton 3.8.0 miscompiles one causal backward config
 
@@ -241,10 +253,9 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
 
 - Triton backend: when the Primus image moves to a ROCm Triton 3.9 build, rerun the full
   flex attention suites to confirm the miscompile is gone there too.
-- FlyDSL decode: close the gap to aiter (parallel reduce, V without the LDS
-  round-trip, launch only in-window partitions, partition count tuned for small
-  batch), then fp8 KV cache (bf16 query, per-tensor / per-token scales) and
-  block-sparse lists on the decode path.
+- FlyDSL decode: an opt-in fp8-MFMA path for fp8 KV (q quantized per head, as aiter) for
+  the last 10-18% at large batch; sparse partitions are still launched (a compacted grid
+  would save the scan and the empty CTAs).
 - FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
   reads, a 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while
   staying deterministic), then the kernel-optimize loop against the Triton backend.
