@@ -81,6 +81,7 @@ class _Ops:
         self.c_cols = self.thr_mma.partition_C(fx.make_view(0, fx.make_layout((MFMA_M, MFMA_M), (0, 1))))
         self.copy_g128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem)
         self.copy_g64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
+        self.copy_g128_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
         self.copy_s128 = fx.make_copy_atom(fx.UniversalCopy128b(), elem)
         self.copy_s64 = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
         self.copy_s16 = fx.make_copy_atom(fx.UniversalCopy16b(), elem)
@@ -130,19 +131,20 @@ class _Ops:
         frag.store(Vec.from_elements(values, fx.Float32).to(self.elem))
         return frag
 
-    def store_transposed_acc(self, acc_tiles, row, scale=None):
+    def store_transposed_acc(self, acc_tiles, row, scale=None, fp32=False):
         """Store accumulator tiles of shape [dim, 32 lanes] into this lane's global row
-        (4 contiguous elements per group)."""
+        (4 contiguous elements per group), in the element type or, with ``fp32``, as fp32."""
         packs = fx.logical_divide(row, fx.make_layout(4, 1))
+        out_elem, atom = (fx.Float32, self.copy_g128_f32) if fp32 else (self.elem, self.copy_g64)
         for c in range_constexpr(len(acc_tiles)):
             vals = Vec(acc_tiles[c])
             if scale is not None:
                 vals = vals * Vec.from_elements([scale], fx.Float32).broadcast_to(16)
             for g in range_constexpr(4):
                 d_start = fx.Int32(c * MFMA_M) + self.row(4 * g)
-                reg = fx.make_rmem_tensor(4, self.elem)
-                reg.store(Vec.from_elements([vals[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(self.elem))
-                fx.copy(self.copy_g64, reg, fx.slice(packs, (None, d_start // fx.Int32(4))))
+                reg = fx.make_rmem_tensor(4, out_elem)
+                reg.store(Vec.from_elements([vals[4 * g + i] for i in range_constexpr(4)], fx.Float32).to(out_elem))
+                fx.copy(atom, reg, fx.slice(packs, (None, d_start // fx.Int32(4))))
 
 
 def _swizzle_bits(dim):
@@ -245,7 +247,12 @@ class FlashAttentionBackward:
         if dkdv_tile_m > self.num_threads or dkdv_tile_m % MFMA_M:
             raise ValueError(f"dkdv_tile_m must be a multiple of {MFMA_M} and at most {self.num_threads}")
         self.dq_launcher = self._build_dq()
-        self.dkdv_launcher = self._build_dkdv()
+        self._dkdv_launchers = {}
+
+    def _dkdv_launcher(self, split):
+        if split not in self._dkdv_launchers:
+            self._dkdv_launchers[split] = self._build_dkdv(split)
+        return self._dkdv_launchers[split]
 
     # ------------------------------------------------------------------ dQ ----
     def _build_dq(self):
@@ -423,9 +430,14 @@ class FlashAttentionBackward:
         return launch
 
     # --------------------------------------------------------------- dK / dV ----
-    def _build_dkdv(self):
+    def _build_dkdv(self, split=1):
+        """dK / dV, one CTA per (key tile, KV head x ``split``, batch). With ``split`` > 1
+        each CTA sums G / split query heads of the GQA group and writes fp32 partials
+        ``[split, ...]`` that the host adds in a fixed order (deterministic)."""
         D, DV, TM, TN, NT = self.head_dim, self.head_dim_v, self.dkdv_tile_m, self.dkdv_tile_n, self.num_threads
         G = self.qhead_per_kvhead
+        HPS = G // split  # query heads per CTA
+        partial = split > 1
         elem = fx.BFloat16 if self.dtype == "bf16" else fx.Float16
         block_info = BlockInfo(TM, TN, self.is_causal, self.is_local)
         is_causal, is_local = self.is_causal, self.is_local
@@ -457,7 +469,9 @@ class FlashAttentionBackward:
             lane = tid % fx.Int32(64)
             wave = tid // fx.Int32(64)
             n_block = fx.Int32(fx.block_idx.x)
-            kv_head = fx.Int32(fx.block_idx.y)
+            kv_head = fx.Int32(fx.block_idx.y) // fx.Int32(split)
+            split_idx = fx.Int32(fx.block_idx.y) % fx.Int32(split)
+            first_head = kv_head * fx.Int32(G) + split_idx * fx.Int32(HPS)
             batch = fx.Int32(fx.block_idx.z)
             ops = _Ops(elem, lane)
             # The rewriter carries any kernel local whose method is called inside a
@@ -493,6 +507,11 @@ class FlashAttentionBackward:
             def kv_side_row(t, pos):
                 coord = (seqlen.offset_k + pos, kv_head, None) if varlen_k else (batch, pos, kv_head, None)
                 return fx.slice(t, coord)
+
+            def out_row(t, pos):
+                """dK / dV row, or this split's fp32 partial row ``[split, ...]``."""
+                coord = (seqlen.offset_k + pos, kv_head, None) if varlen_k else (batch, pos, kv_head, None)
+                return fx.slice(t, (split_idx,) + coord if partial else coord)
 
             def row_stat(t, pos, h):
                 row = fx.slice(t, (h, None)) if varlen_q else fx.slice(t, (batch, h, None))
@@ -561,8 +580,8 @@ class FlashAttentionBackward:
                     sparse_n = n_block // fx.Int32(KV_SUB)
                     mask_cnt_t = fx.rocdl.make_buffer_tensor(MaskCnt)
                     mask_idx_t = fx.rocdl.make_buffer_tensor(MaskIdx)
-                    for g_head in range_constexpr(G):
-                        head = kv_head * fx.Int32(G) + fx.Int32(g_head)
+                    for g_head in range_constexpr(HPS):
+                        head = first_head + fx.Int32(g_head)
                         mask_cnt = fx.Int32(fx.slice(mask_cnt_t, (batch, head, None))[sparse_n])
                         mask_idx = fx.slice(mask_idx_t, (batch, head, sparse_n, None))
                         for m_iter, state in range(fx.Int32(0), mask_cnt * fx.Int32(Q_SUB), fx.Int32(1), init=results):
@@ -577,8 +596,8 @@ class FlashAttentionBackward:
                                                      kv_pos, list(state[:NDK]), list(state[NDK:]), apply_mask_mod=False)
                                 results = yield dk + dv
                 else:
-                    for g_head in range_constexpr(G):
-                        head = kv_head * fx.Int32(G) + fx.Int32(g_head)
+                    for g_head in range_constexpr(HPS):
+                        head = first_head + fx.Int32(g_head)
                         for m_iter, state in range(m_block_min, m_block_max, fx.Int32(1), init=results):
                             dk, dv = one_m_block(fx.Int32(m_iter), head, k_frags, v_frags, kv_pos,
                                                  list(state[:NDK]), list(state[NDK:]))
@@ -586,8 +605,8 @@ class FlashAttentionBackward:
 
                 if kv_pos < seqlen.seqlen_k:
                     acc_tiles = list(results)
-                    store_acc(acc_tiles[:NDK], kv_side_row(dk_t, kv_row), softmax_scale)
-                    store_acc(acc_tiles[NDK:], kv_side_row(dv_t, kv_row))
+                    store_acc(acc_tiles[:NDK], out_row(dk_t, kv_row), softmax_scale, partial)
+                    store_acc(acc_tiles[NDK:], out_row(dv_t, kv_row), None, partial)
 
         @flyc.jit
         def launch(
@@ -713,9 +732,33 @@ class FlashAttentionBackward:
             static_q, static_k, max(-(-seqlen_q // self.dq_tile_m), 1), num_heads, batch, *scalars, sg_pad,
             stream=stream,
         )
-        self.dkdv_launcher(
-            q, k, v, dout, lse, dsum, dk, dv, *common, *sparse_slots(block_sparse_tensors_kv),
-            static_q, static_k, max(-(-seqlen_k // self.dkdv_tile_n), 1), num_kv_heads, batch, *scalars,
+        num_n_blocks = max(-(-seqlen_k // self.dkdv_tile_n), 1)
+        split = self._dkdv_split(num_n_blocks * num_kv_heads * batch, q.device)
+        dk_out, dv_out = dk, dv
+        if split > 1:
+            dk_out = torch.empty((split, *dk.shape), dtype=torch.float32, device=dk.device)
+            dv_out = torch.empty((split, *dv.shape), dtype=torch.float32, device=dv.device)
+            if self.varlen_k or self.has_seqused_k:  # rows past a sequence are never written
+                dk_out.zero_()
+                dv_out.zero_()
+        self._dkdv_launcher(split)(
+            q, k, v, dout, lse, dsum, dk_out, dv_out, *common, *sparse_slots(block_sparse_tensors_kv),
+            static_q, static_k, num_n_blocks, num_kv_heads * split, batch, *scalars,
             stream=stream,
         )
+        if split > 1:
+            dk.copy_(dk_out.sum(0))
+            dv.copy_(dv_out.sum(0))
         return dq, dk, dv, dsink
+
+    def _dkdv_split(self, ctas, device):
+        """Smallest power-of-two split of the GQA group across CTAs that gives every CU a
+        dK/dV CTA (it fits one per CU); a grid that already fills the GPU is not split, as the
+        fp32 partials then cost more than they add."""
+        import torch
+
+        num_cus = torch.cuda.get_device_properties(device).multi_processor_count
+        split = 1
+        while ctas * split < num_cus and self.qhead_per_kvhead % (split * 2) == 0:
+            split *= 2
+        return split
