@@ -403,7 +403,8 @@ class FlashAttentionForward:
                 """Kernel tile of the ``j``-th entry of a block list, sparse blocks split in KV_SUB."""
                 return fx.Int32(idx_row[j // fx.Int32(KV_SUB)]) * fx.Int32(KV_SUB) + j % fx.Int32(KV_SUB)
 
-            def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod=True):
+            def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod=True,
+                                    masked=True):
                 kv_base = n_block * fx.Int32(TN)
                 fx.gpu.barrier()  # every wave is done reading the previous tile
                 stage_kv(kv_base)
@@ -423,9 +424,10 @@ class FlashAttentionForward:
                         kv_pos = kv_base + fx.Int32(half * MFMA_M) + fx.Int32(fx.get_scalar(c_rows[j]))
                         score = _apply_score_mod(score_mod, acc[j] * score_scale, batch, head, q_pos, kv_pos, mask)
                         scores.append(score * fx.Float32(LOG2E))
-                        keep.append(mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod))
+                        keep.append(mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod) if masked else None)
 
-                probs, new_max, new_sum, rescale = Softmax.online_softmax(row_max, row_sum, scores, keep)
+                probs, new_max, new_sum, rescale = Softmax.online_softmax(row_max, row_sum, scores,
+                                                                          keep if masked else None)
                 rescale_vec = Vec.from_elements([rescale], fx.Float32).broadcast_to(16)
                 o_acc = [Vec(o) * rescale_vec for o in o_acc]
                 for half in range_constexpr(TN // MFMA_M):
@@ -488,7 +490,25 @@ class FlashAttentionForward:
                             )
                             results = yield [row_max, row_sum] + o_acc
                 else:
-                    for n_iter, state in range(n_block_min, n_block_max, fx.Int32(1), init=init):
+                    # Interior KV blocks (every key kept for every query of the block) skip the
+                    # per-element mask; the masked blocks before and after them keep it. With a
+                    # mask_mod every block is masked.
+                    n_lo, n_hi = block_info.get_n_block_interior(
+                        seqlen, m_block, window_left, window_right, n_block_min, n_block_max
+                    ) if mask_mod is None else (n_block_max, n_block_max)
+                    for n_iter, state in range(n_block_min, n_lo, fx.Int32(1), init=init):
+                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                        row_max, row_sum, o_acc = compute_one_n_block(
+                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
+                        )
+                        results = yield [row_max, row_sum] + o_acc
+                    for n_iter, state in range(n_lo, n_hi, fx.Int32(1), init=results):
+                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
+                        row_max, row_sum, o_acc = compute_one_n_block(
+                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state, masked=False
+                        )
+                        results = yield [row_max, row_sum] + o_acc
+                    for n_iter, state in range(n_hi, n_block_max, fx.Int32(1), init=results):
                         o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
                         row_max, row_sum, o_acc = compute_one_n_block(
                             fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state

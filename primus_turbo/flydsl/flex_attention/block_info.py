@@ -56,6 +56,27 @@ class BlockInfo:
                 n_block_min = (window_left >= zero).select(_max(first_key, zero) // fx.Int32(self.tile_n), zero)
         return n_block_min, n_block_max
 
+    def get_n_block_interior(self, seqlen: SeqlenInfo, m_block, window_left, window_right, n_block_min, n_block_max):
+        """``[n_lo, n_hi)`` within ``[n_block_min, n_block_max)``: the KV blocks whose every key
+        is kept for every query of the block by causal / local and the sequence end, so they
+        need no per-element mask (without a mask_mod). The rest of the range is masked."""
+        zero = fx.Int32(0)
+        tn = fx.Int32(self.tile_n)
+        m_start = m_block * fx.Int32(self.tile_m)
+        m_last = _min(m_start + fx.Int32(self.tile_m), seqlen.seqlen_q) - fx.Int32(1)
+        n_lo = zero
+        n_hi = seqlen.seqlen_k // tn  # blocks wholly before the sequence end
+        if self.is_causal:
+            n_hi = _min(n_hi, _max(m_start + seqlen.offset + fx.Int32(1), zero) // tn)
+        if self.is_local:
+            lo = _ceil_div(_max(m_last + seqlen.offset - window_left, zero), self.tile_n)
+            n_lo = (window_left >= zero).select(lo, zero)
+            hi = _max(m_start + seqlen.offset + window_right + fx.Int32(1), zero) // tn
+            n_hi = (window_right >= zero).select(_min(n_hi, hi), n_hi)
+        n_lo = _min(_max(n_lo, n_block_min), n_block_max)
+        n_hi = _max(_min(n_hi, n_block_max), n_lo)
+        return n_lo, n_hi
+
     @staticmethod
     def split(n_block_min, n_block_max, split_idx, num_splits):
         """FA4's split-KV share: ``ceil(n / num_splits)`` consecutive blocks per split."""

@@ -47,13 +47,19 @@ class Softmax:
     @staticmethod
     def online_softmax(row_max, row_sum, scores, keep):
         """Fold one tile in. ``scores`` / ``keep``: this lane's log2-domain scores and keep
-        flags. Returns ``(probs, new_max, new_sum, rescale)``; the caller scales O by
-        ``rescale`` before accumulating ``probs @ V``."""
-        masked = [k.select(s, _f32(NEG_BIG)) for s, k in zip(scores, keep)]
+        flags (``keep=None``: every score is kept). Returns ``(probs, new_max, new_sum,
+        rescale)``; the caller scales O by ``rescale`` before accumulating ``probs @ V``."""
+        if keep is None:
+            masked = list(scores)
+        else:
+            masked = [k.select(s, _f32(NEG_BIG)) for s, k in zip(scores, keep)]
         tile_max = _row_reduce(masked, _max)
         new_max = _max(row_max, tile_max)
         rescale = fx.math.exp2(row_max - new_max)
-        probs = [k.select(fx.math.exp2(s - new_max), _f32(0.0)) for s, k in zip(masked, keep)]
+        if keep is None:
+            probs = [fx.math.exp2(s - new_max) for s in masked]
+        else:
+            probs = [k.select(fx.math.exp2(s - new_max), _f32(0.0)) for s, k in zip(masked, keep)]
         tile_sum = _row_reduce(probs, lambda a, b: a + b)
         return probs, new_max, row_sum * rescale + tile_sum, rescale
 
