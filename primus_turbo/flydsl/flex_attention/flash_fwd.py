@@ -210,7 +210,7 @@ class FlashAttentionForward:
         self.launcher = self._build()
         # Paged single-token decode goes to FlashAttentionDecode (built on first use).
         self._decode_ok = (
-            paged_kv and not varlen_q and not block_sparse and not self.fp8 and not self.dequant_e5m2
+            paged_kv and not varlen_q and not self.fp8 and not self.dequant_e5m2
             and qhead_per_kvhead <= 16 and head_dim == head_dim_v and head_dim % 32 == 0
         )
         self._decode = None
@@ -547,7 +547,7 @@ class FlashAttentionForward:
         return launch
 
     def _run_decode(self, q, k, v, softmax_scale, out, lse, window_left, seqused_k, aux_tensors, learnable_sink,
-                    page_table, stream):
+                    page_table, block_sparse_tensors, stream):
         """One query token per sequence on a paged cache: FlashAttentionDecode (GQA packed,
         256-token partitions). Causal needs no mask here (the keys end at the query)."""
         import torch
@@ -559,6 +559,8 @@ class FlashAttentionForward:
                 dtype=self.dtype, head_dim=self.head_dim, qhead_per_kvhead=self.qhead_per_kvhead,
                 is_local=self.is_local, score_mod=self.score_mod, mask_mod=self.mask_mod,
                 num_aux_tensors=self.num_aux_tensors, has_learnable_sink=self.has_learnable_sink,
+                block_sparse=self.block_sparse, has_full_blocks=self.has_full_blocks,
+                sparse_block_size=self.tile_n * self.kv_subtile,
             )
         B, _, Hq, D = q.shape
         if seqused_k is None:
@@ -567,8 +569,19 @@ class FlashAttentionForward:
         l2 = None if lse is None else lse.view(B, Hq)
         o3, l2 = self._decode(q.view(B, Hq, D), k, v, page_table, seqused_k, softmax_scale, out=o3, lse=l2,
                               window_left=window_left if self.is_local else -1, aux_tensors=aux_tensors,
-                              learnable_sink=learnable_sink, stream=stream)
+                              learnable_sink=learnable_sink, block_sparse_tensors=self._decode_sparse(block_sparse_tensors),
+                              stream=stream)
         return o3.view(B, 1, Hq, D), l2.view(B, Hq, 1)
+
+    def _decode_sparse(self, bst):
+        """The forward's block-sparse lists for the decode kernel (KV block in keys)."""
+        if bst is None:
+            return None
+        if (bst.full_block_cnt is not None) != self.has_full_blocks:
+            raise ValueError("full_block_cnt / full_block_idx do not match how this kernel was built")
+        if subtile_factors(bst.block_size, self.tile_m, self.tile_n) != (self.q_subtile, self.kv_subtile):
+            raise ValueError("block_sparse_tensors.block_size does not match how this kernel was built")
+        return bst._replace(block_size=None)
 
     def __call__(
         self,
@@ -607,8 +620,10 @@ class FlashAttentionForward:
         if (page_table is not None) != self.paged_kv:
             raise ValueError("page_table does not match how this kernel was built")
         if self._decode_ok and q.dim() == 4 and q.shape[1] == 1:
+            if (block_sparse_tensors is not None) != self.block_sparse:
+                raise ValueError("block_sparse_tensors does not match how this kernel was built")
             return self._run_decode(q, k, v, softmax_scale, out, lse, window_left, seqused_k, aux_tensors,
-                                    learnable_sink, page_table, stream)
+                                    learnable_sink, page_table, block_sparse_tensors, stream)
         if num_splits != 1 and not self.split_kv:
             raise ValueError("num_splits != 1 needs a kernel built with split_kv=True")
         descales = ()

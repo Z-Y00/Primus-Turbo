@@ -222,6 +222,42 @@ def test_decode_mask_mod_score_mod_aux():
         torch.testing.assert_close(lse[b, :, 0], torch.logsumexp(s, -1), atol=1e-3, rtol=1e-3)
 
 
+def _head_or_sparse_tail(b, h, q_idx, kv_idx, seqlen_info, aux):
+    """The first 256 keys, then every third key of the last 1000."""
+    import flydsl.expr as fx
+
+    tail = kv_idx >= seqlen_info.seqlen_k - fx.Int32(1000)
+    return (kv_idx < fx.Int32(256)) | (((kv_idx % fx.Int32(3)) == fx.Int32(0)) & tail)
+
+
+@pytest.mark.parametrize("shared_heads", [False, True])
+def test_decode_block_sparse(shared_heads):
+    # FA4 block lists from the dense mask: full head blocks, partial tail blocks, and
+    # absent middle blocks whose partitions the decode kernel skips.
+    from primus_turbo.flydsl.flex_attention.block_sparsity import dense_to_block_sparse
+
+    seqlens = (1, 700, 5000, 2100)
+    Hq, Hk, D = 8, 2, 128
+    k_cache, v_cache, table, used = _paged_cache(seqlens, 16, Hk, D, seed=13)
+    q = torch.randn(len(seqlens), 1, Hq, D, device="cuda").to(DTYPE)
+    fwd = FlashAttentionForward(head_dim=D, qhead_per_kvhead=Hq // Hk, has_seqused_k=True, paged_kv=True,
+                                mask_mod=_head_or_sparse_tail, block_sparse=True, has_full_blocks=True)
+    sk = table.shape[1] * 16
+    kv = torch.arange(sk, device="cuda")
+    dense = torch.zeros(len(seqlens), 1 if shared_heads else Hq, 1, sk, dtype=torch.bool, device="cuda")
+    for b, n in enumerate(seqlens):
+        dense[b, ..., :n] = ((kv < 256) | ((kv % 3 == 0) & (kv >= n - 1000)))[:n]
+    bst = dense_to_block_sparse(dense, (fwd.tile_m, fwd.tile_n))
+    out, lse = fwd(q, k_cache, v_cache, D**-0.5, seqused_k=used, page_table=table, block_sparse_tensors=bst)
+    for b, n in enumerate(seqlens):
+        k, v = _gather(k_cache, table, b, n), _gather(v_cache, table, b, n)
+        s = torch.einsum("hd,nhd->hn", q[b, 0].float(), k.float().repeat_interleave(Hq // Hk, 1)) * D**-0.5
+        s = s.masked_fill(~dense[b, :, 0, :n].expand(Hq, n), float("-inf"))
+        ref_o = torch.einsum("hn,nhd->hd", torch.softmax(s, -1), v.float().repeat_interleave(Hq // Hk, 1))
+        torch.testing.assert_close(out[b, 0].float(), ref_o, atol=2e-2, rtol=2e-2, msg=f"out, sequence {b}")
+        torch.testing.assert_close(lse[b, :, 0], torch.logsumexp(s, -1), atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.parametrize("group", [1, 16])
 def test_decode_group_sizes_and_empty_sequence(group):
     seqlens = (300, 0, 4097)

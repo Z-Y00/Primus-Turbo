@@ -42,6 +42,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from primus_turbo.flydsl.flex_attention.flash_fwd import MAX_AUX_TENSORS, _apply_score_mod, _arch_has_ocp_fp8
+from primus_turbo.flydsl.flex_attention.block_sparsity import broadcast_heads
 from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LN2, LOG2E, NEG_BIG
@@ -142,6 +143,9 @@ class FlashAttentionDecode:
         partition_size: int | None = None,
         kv_dtype: str = "bf16",
         kv_scale: str = "tensor",
+        block_sparse: bool = False,
+        has_full_blocks: bool = False,
+        sparse_block_size: int = 128,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -166,6 +170,12 @@ class FlashAttentionDecode:
         self.fp8_ocp = _arch_has_ocp_fp8() if self.kv_fp8 else False
         if self.kv_fp8 and head_dim % 64:
             raise ValueError(f"an fp8 KV cache needs head_dim % 64 == 0, got {head_dim}")
+        # Block-sparse lists (FA4's, query block 0): KV blocks of sparse_block_size keys.
+        self.block_sparse = block_sparse
+        self.has_full_blocks = block_sparse and has_full_blocks
+        self.sparse_kv = int(sparse_block_size)
+        if block_sparse and (self.sparse_kv < CHUNK or self.sparse_kv & (self.sparse_kv - 1)):
+            raise ValueError(f"sparse KV block must be a power of two >= {CHUNK}, got {sparse_block_size}")
         self._get_launchers(partition_size or PARTITION)
 
     # ------------------------------------------------------------- decode ----
@@ -198,6 +208,14 @@ class FlashAttentionDecode:
         off_v = off_sum + NWAVES * 16 * 4
         off_o = off_v
         total = off_v + max(NWAVES * V_CHUNK_BYTES, NWAVES * 16 * D_ROUND * 4)
+        # Block sparsity: status of the partition's NB sparse blocks per group head
+        # (0 absent, 1 mask_mod, 2 fully kept), then a flag "some block is present".
+        block_sparse, has_full = self.block_sparse, self.has_full_blocks
+        BK = self.sparse_kv
+        NB = max(P // BK, 1)
+        off_bs = total
+        if block_sparse:
+            total += (G * NB + 1) * 4
 
         @fx.struct
         class SharedStorage:
@@ -217,8 +235,10 @@ class FlashAttentionDecode:
         def paged_decode_kernel(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, PageTable: fx.Tensor, SeqUsedK: fx.Tensor,
             POut: fx.Tensor, PLse: fx.Tensor, KScale: fx.Tensor, VScale: fx.Tensor,
+            MaskCnt: fx.Tensor, MaskIdx: fx.Tensor, FullCnt: fx.Tensor, FullIdx: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             page_size: fx.Int32, softmax_scale: fx.Float32, window_left: fx.Int32,
+            num_mask_idx: fx.Int32, num_full_idx: fx.Int32, sparse_heads: fx.Int32,
         ):
             tid = fx.Int32(fx.thread_idx.x)
             lane = tid % fx.Int32(64)
@@ -295,7 +315,63 @@ class FlashAttentionDecode:
             mask_keep = mask.keep
             # Partitions past the sequence or before the window do nothing; the reducer
             # never reads them.
-            live = part_start < seqlen
+            in_seq = part_start < seqlen
+            blk0 = part_start // fx.Int32(BK)  # the partition's first sparse block
+            if block_sparse:
+                # Mark the partition's sparse blocks from every group head's lists (the lists
+                # need not be sorted, so all entries are scanned).
+                if tid < fx.Int32(G * NB + 1):
+                    lds_store(fx.Int32(off_bs) + tid * fx.Int32(4), fx.Int32, Vec.from_elements([fx.Int32(0)], fx.Int32))
+                fx.gpu.barrier()
+                mask_cnt_t, mask_idx_t = fx.rocdl.make_buffer_tensor(MaskCnt), fx.rocdl.make_buffer_tensor(MaskIdx)
+                full_cnt_t, full_idx_t = fx.rocdl.make_buffer_tensor(FullCnt), fx.rocdl.make_buffer_tensor(FullIdx)
+                n_idx = _max(num_mask_idx, num_full_idx) if has_full else num_mask_idx
+                # Lists shared by all heads (sparse_heads == 1) are scanned once, into slot 0.
+                n_all = n_idx * sparse_heads
+                flag_off = fx.Int32(off_bs + G * NB * 4)
+                # One pass over (group head, entry): a mask-list entry and a full-list entry each.
+                for it, carry in range(fx.Int32(0), (n_all + fx.Int32(NT - 1)) // fx.Int32(NT), fx.Int32(1),
+                                       init=[fx.Int32(0), fx.Int32(0)]):
+                    i = fx.Int32(it) * fx.Int32(NT) + tid
+                    hg = _min(i // n_idx, sparse_heads - fx.Int32(1))
+                    e = i % n_idx
+                    head_g = kvh * fx.Int32(G) + hg
+                    m_cnt = fx.Int32(fx.slice(mask_cnt_t, (b, head_g, None))[fx.Int32(0)])
+                    m_blk = fx.Int32(fx.slice(mask_idx_t, (b, head_g, fx.Int32(0), None))[
+                        _min(e, num_mask_idx - fx.Int32(1))]) - blk0
+                    m_hit = (i < n_all) & (e < m_cnt) & (m_blk >= fx.Int32(0)) & (m_blk < fx.Int32(NB))
+                    if m_hit:
+                        lds_store(fx.Int32(off_bs) + (hg * fx.Int32(NB) + m_blk) * fx.Int32(4), fx.Int32,
+                                  Vec.from_elements([fx.Int32(1)], fx.Int32))
+                        lds_store(flag_off, fx.Int32, Vec.from_elements([fx.Int32(1)], fx.Int32))
+                    if has_full:
+                        f_cnt = fx.Int32(fx.slice(full_cnt_t, (b, head_g, None))[fx.Int32(0)])
+                        f_blk = fx.Int32(fx.slice(full_idx_t, (b, head_g, fx.Int32(0), None))[
+                            _min(e, num_full_idx - fx.Int32(1))]) - blk0
+                        f_hit = (i < n_all) & (e < f_cnt) & (f_blk >= fx.Int32(0)) & (f_blk < fx.Int32(NB))
+                        if f_hit:
+                            lds_store(fx.Int32(off_bs) + (hg * fx.Int32(NB) + f_blk) * fx.Int32(4), fx.Int32,
+                                      Vec.from_elements([fx.Int32(2)], fx.Int32))
+                            lds_store(flag_off, fx.Int32, Vec.from_elements([fx.Int32(1)], fx.Int32))
+                    results = yield [carry[0], carry[1]]
+                fx.gpu.barrier()
+            present = lds_load(fx.Int32(off_bs + G * NB * 4), fx.Int32, 1)[0] if block_sparse else fx.Int32(1)
+            live = in_seq & (present != fx.Int32(0))
+            if block_sparse:
+                # A partition no group head lists still has partials the reducer reads:
+                # write the empty result (O = 0, LSE = -inf) without touching K / V.
+                if in_seq & (present == fx.Int32(0)):
+                    for it in range_constexpr(-(-(G * D) // (NT * 4))):
+                        e4 = (fx.Int32(it * NT) + tid) * fx.Int32(4)
+                        h, d = e4 // fx.Int32(D), e4 % fx.Int32(D)
+                        if h < fx.Int32(G):
+                            reg = fx.make_rmem_tensor(4, fx.Float32)
+                            reg.store(Vec.filled(4, 0.0, fx.Float32))
+                            row = fx.logical_divide(fx.slice(pout_t, (b, kvh, part_rel, h, None)), fx.make_layout(4, 1))
+                            fx.copy(copy_f128, reg, fx.slice(row, (None, d // fx.Int32(4))))
+                    if tid < fx.Int32(G):
+                        lse_row = fx.slice(plse_t, (b, kvh, part_rel, None))
+                        lse_row[tid] = fx.Float32(float("-inf"))
             if live:
                 last = seqlen - fx.Int32(1)
                 wave_start = part_start + wave * fx.Int32(TOK_PER_WAVE)
@@ -329,6 +405,14 @@ class FlashAttentionDecode:
 
                 # S = K . Q^T: lane holds head l16, tokens 4r + i of each chunk.
                 scores, keep, v_scales = [], [], []
+                # Sparse status of each chunk's block for this lane's head (a 16-token chunk
+                # lies in one block).
+                block_status = [
+                    lds_load(fx.Int32(off_bs) + (_min(l16, sparse_heads - fx.Int32(1)) * fx.Int32(NB)
+                                                 + (wave_start + fx.Int32(c * CHUNK)) // fx.Int32(BK) - blk0)
+                             * fx.Int32(4), fx.Int32, 1)[0]
+                    for c in range_constexpr(NCHUNK_)
+                ] if block_sparse else None
                 for c in range_constexpr(NCHUNK_):
                     acc = Vec.filled(4, 0.0, fx.Float32)
                     for p in range_constexpr(D // 32):
@@ -343,7 +427,10 @@ class FlashAttentionDecode:
                         score = _apply_score_mod(score_mod, acc[i] * (softmax_scale * k_scale), b, head, q_idx, tok,
                                                  mask)
                         scores.append(score * fx.Float32(LOG2E))
-                        keep.append(mask_keep(q_idx, tok))
+                        # Sparse: mask-list blocks apply mask_mod, full-list blocks only the bounds.
+                        keep.append(((block_status[c] == fx.Int32(1)) & mask_keep(q_idx, tok))
+                                    | ((block_status[c] == fx.Int32(2)) & mask_keep(q_idx, tok, True, False))
+                                    if block_sparse else mask_keep(q_idx, tok))
 
                 # Partition max per head: in-lane, across the four 16-lane groups, across waves.
                 m = fx.Float32(NEG_BIG)
@@ -438,12 +525,15 @@ class FlashAttentionDecode:
         def launch(
             Q: fx.Tensor, K: fx.Tensor, V: fx.Tensor, PageTable: fx.Tensor, SeqUsedK: fx.Tensor,
             POut: fx.Tensor, PLse: fx.Tensor, KScale: fx.Tensor, VScale: fx.Tensor,
+            MaskCnt: fx.Tensor, MaskIdx: fx.Tensor, FullCnt: fx.Tensor, FullIdx: fx.Tensor,
             Aux0: fx.Tensor, Aux1: fx.Tensor, Aux2: fx.Tensor, Aux3: fx.Tensor,
             page_size: fx.Int32, softmax_scale: fx.Float32, window_left: fx.Int32,
+            num_mask_idx: fx.Int32, num_full_idx: fx.Int32, sparse_heads: fx.Int32,
             batch: fx.Int32, num_parts: fx.Int32, num_kv_heads: fx.Int32, stream: fx.Stream = fx.Stream(None),
         ):
-            paged_decode_kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, KScale, VScale, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale,
-                   window_left).launch(grid=(batch, num_parts, num_kv_heads), block=(NT, 1, 1), stream=stream)
+            paged_decode_kernel(Q, K, V, PageTable, SeqUsedK, POut, PLse, KScale, VScale, MaskCnt, MaskIdx, FullCnt,
+                                FullIdx, Aux0, Aux1, Aux2, Aux3, page_size, softmax_scale, window_left, num_mask_idx,
+                                num_full_idx, sparse_heads).launch(grid=(batch, num_parts, num_kv_heads), block=(NT, 1, 1), stream=stream)
 
         return launch
 
@@ -561,7 +651,7 @@ class FlashAttentionDecode:
     # --------------------------------------------------------------- host ----
     def __call__(self, q, k_cache, v_cache, page_table, seqused_k, softmax_scale, out=None, lse=None,
                  window_left=-1, aux_tensors=(), learnable_sink=None, partials=None, k_scale=None, v_scale=None,
-                 stream=None):
+                 block_sparse_tensors=None, stream=None):
         """Returns ``(out [B, Hq, D], lse [B, Hq])``. ``partials`` = ``(pout, plse)`` may be
         preallocated (e.g. for CUDA-graph capture): ``[B, Hk, P, G, D]`` / ``[B, Hk, P, G]``
         fp32 with ``P >= ceil(max_pages * page_size / 256)`` (with a window, P >=
@@ -570,7 +660,10 @@ class FlashAttentionDecode:
 
         An fp8 cache (``kv_dtype="fp8"``, native format) dequantizes as ``k_cache * k_scale``
         / ``v_cache * v_scale``: fp32 ``[1]`` per tensor, or ``[num_pages, page_size, Hk]`` per
-        token (``kv_scale="token"``)."""
+        token (``kv_scale="token"``).
+
+        ``block_sparse_tensors`` (FA4's lists, ``BlockSparseTensors``) are read at query
+        block 0; their KV block is ``sparse_block_size``. Heads may be 1 (shared)."""
         import torch
 
         B, Hq, D = q.shape
@@ -590,6 +683,28 @@ class FlashAttentionDecode:
             v_scale = torch.as_tensor(v_scale, dtype=torch.float32, device=q.device).reshape(want).contiguous()
         elif k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
             raise ValueError("a bf16 / fp16 KV cache must match q's dtype (build with kv_dtype='fp8' for fp8)")
+        if (block_sparse_tensors is not None) != self.block_sparse:
+            raise ValueError("block_sparse_tensors does not match how this kernel was built")
+        sparse = ()
+        if self.block_sparse:
+            bst = block_sparse_tensors
+            if (bst.full_block_cnt is not None) != self.has_full_blocks:
+                raise ValueError("full_block_cnt / full_block_idx do not match how this kernel was built")
+            if bst.block_size is not None and bst.block_size[1] != self.sparse_kv:
+                raise ValueError(f"sparse KV block {bst.block_size[1]} != the kernel's {self.sparse_kv}")
+            shared = bst.mask_block_cnt.shape[1] == 1 and (bst.full_block_cnt is None or bst.full_block_cnt.shape[1] == 1)
+            sparse_heads = 1 if shared else self.group
+            bst = broadcast_heads(bst, Hq)
+            for t in (bst.mask_block_cnt, bst.mask_block_idx, bst.full_block_cnt, bst.full_block_idx):
+                if t is not None and t.dtype != torch.int32:
+                    raise ValueError("block-sparse counts / indices must be int32")
+            def nonempty(idx):  # the kernel clamps entry indices to the list length
+                return idx if idx.shape[-1] else torch.zeros(*idx.shape[:-1], 1, dtype=idx.dtype, device=idx.device)
+
+            mask_idx = nonempty(bst.mask_block_idx)
+            full_cnt = bst.full_block_cnt if self.has_full_blocks else bst.mask_block_cnt
+            full_idx = nonempty(bst.full_block_idx) if self.has_full_blocks else mask_idx
+            sparse = (bst.mask_block_cnt, mask_idx, full_cnt, full_idx)
         aux_tensors = tuple(aux_tensors or ())
         if len(aux_tensors) != self.num_aux_tensors:
             raise ValueError(f"kernel built for {self.num_aux_tensors} aux tensors, got {len(aux_tensors)}")
@@ -628,9 +743,12 @@ class FlashAttentionDecode:
         aux_slots = aux_tensors + (plse,) * (MAX_AUX_TENSORS - len(aux_tensors))
         k_scale = plse if k_scale is None else k_scale
         v_scale = plse if v_scale is None else v_scale
-        decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, k_scale, v_scale, *aux_slots,
+        if not sparse:
+            sparse, sparse_heads = (seqused_k, page_table, seqused_k, page_table), 1
+        decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, k_scale, v_scale, *sparse, *aux_slots,
                         page_size,
-                             float(softmax_scale), int(window_left), B, num_parts, Hk, stream=stream)
+                        float(softmax_scale), int(window_left), sparse[1].shape[-1], sparse[3].shape[-1], sparse_heads, B, num_parts,
+                        Hk, stream=stream)
         reduce_launcher(pout, plse, seqused_k, learnable_sink if learnable_sink is not None else plse,
                              out, lse, int(window_left), B, Hq, stream=stream)
         return out, lse
