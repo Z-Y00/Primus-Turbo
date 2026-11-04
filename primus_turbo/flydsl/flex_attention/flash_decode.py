@@ -7,10 +7,11 @@
 """Paged-KV decode attention in FlyDSL, after aiter's ``paged_attention_ragged``
 (vLLM's ``paged_attention_ll4mi_QKV_mfma16`` kernel), on FA4's paged layout.
 
-One query token per sequence. A CTA owns one (sequence, 256-token partition, KV head):
-all ``G`` query heads of the KV head share it, so each KV page is read once (GQA
-packing), and partitions keep the GPU full at any batch size. Four waves take 64 of
-the partition's tokens each, as four 16-token chunks.
+One query token per sequence. A CTA owns one (sequence, partition, KV head): all ``G``
+query heads of the KV head share it, so each KV page is read once (GQA packing), and
+partitions keep the GPU full at any batch size. A partition is 256 tokens, or 128 when
+that grid would fill at most half the CUs; four waves take a quarter of it each, in
+16-token chunks.
 
 Per chunk, ``S = K . Q^T`` with MFMA 16x16x16: tokens are the rows, the group's query
 heads the columns. Lane ``l`` holds head ``l % 16`` and tokens ``4 * (l // 16) + i``;
@@ -45,11 +46,9 @@ from primus_turbo.flydsl.flex_attention.mask import AttentionMask
 from primus_turbo.flydsl.flex_attention.seqlen_info import SeqlenInfo
 from primus_turbo.flydsl.flex_attention.softmax import LN2, LOG2E, NEG_BIG
 
-PARTITION = 256  # tokens per CTA
+PARTITION = 256  # default tokens per CTA
 NWAVES = 4
-TOK_PER_WAVE = PARTITION // NWAVES  # 64
 CHUNK = 16  # tokens per MFMA
-NCHUNK = TOK_PER_WAVE // CHUNK  # 4
 MAX_GROUP = 16  # query heads per KV head that fit the MFMA's 16 columns
 
 
@@ -61,12 +60,12 @@ def _max(a, b):
     return (a > b).select(a, b)
 
 
-def _first_live_partition(is_local, seqlen, window_left):
+def _first_live_partition(is_local, seqlen, window_left, partition):
     """First partition holding a key the window keeps (0 without a window)."""
     if not is_local:
         return fx.Int32(0)
     first_key = _max(seqlen - fx.Int32(1) - window_left, fx.Int32(0))
-    return (window_left >= fx.Int32(0)).select(first_key // fx.Int32(PARTITION), fx.Int32(0))
+    return (window_left >= fx.Int32(0)).select(first_key // fx.Int32(partition), fx.Int32(0))
 
 
 def _finish(m, wsum, sink_log2):
@@ -103,9 +102,14 @@ class FlashAttentionDecode:
         mask_mod=None,
         num_aux_tensors: int = 0,
         has_learnable_sink: bool = False,
+        partition_size: int | None = None,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
+        if partition_size not in (None, 64, 128, 256):
+            raise ValueError(f"partition_size must be None (auto), 64, 128 or 256, got {partition_size}")
+        self.partition = partition_size
+        self._launchers = {}
         if head_dim % 32:
             raise ValueError("head_dim must be a multiple of 32")
         if not 1 <= qhead_per_kvhead <= MAX_GROUP:
@@ -115,16 +119,22 @@ class FlashAttentionDecode:
         self.dtype, self.head_dim, self.group = dtype, head_dim, qhead_per_kvhead
         self.is_local, self.score_mod, self.mask_mod = is_local, score_mod, mask_mod
         self.num_aux_tensors, self.has_learnable_sink = num_aux_tensors, has_learnable_sink
-        self.decode_launcher = self._build_decode()
-        self.reduce_launcher = self._build_reduce()
+        self._get_launchers(partition_size or PARTITION)
 
     # ------------------------------------------------------------- decode ----
-    def _build_decode(self):
+    def _get_launchers(self, P):
+        if P not in self._launchers:
+            self._launchers[P] = (self._build_decode(P), self._build_reduce(P))
+        return self._launchers[P]
+
+    def _build_decode(self, P):
         D, G = self.head_dim, self.group
         fp16 = self.dtype == "fp16"
         elem = fx.Float16 if fp16 else fx.BFloat16
         is_local, score_mod, mask_mod = self.is_local, self.score_mod, self.mask_mod
         num_aux = self.num_aux_tensors
+        TOK_PER_WAVE = P // NWAVES
+        NCHUNK_ = TOK_PER_WAVE // CHUNK  # 16-token MFMA chunks per wave
         NT = NWAVES * 64
         V_ROW = D + 8  # padded LDS row (elements) for the staged V chunk
         V_CHUNK_BYTES = CHUNK * V_ROW * 2
@@ -205,8 +215,8 @@ class FlashAttentionDecode:
                 page = fx.Int32(pages[tok // page_size])
                 return fx.slice(t, (page, tok % page_size, kvh, None))
 
-            part = _first_live_partition(is_local, seqlen, window_left) + part_rel
-            part_start = part * fx.Int32(PARTITION)
+            part = _first_live_partition(is_local, seqlen, window_left, P) + part_rel
+            part_start = part * fx.Int32(P)
             # Q: B operand, column = head l16 (clamped into the group; extra columns compute
             # garbage that is never stored).
             head = kvh * fx.Int32(G) + _min(l16, fx.Int32(G - 1))
@@ -231,7 +241,7 @@ class FlashAttentionDecode:
 
                 # K for all four chunks, straight to registers (A operand, row = token l16).
                 k8 = []
-                for c in range_constexpr(NCHUNK):
+                for c in range_constexpr(NCHUNK_):
                     tok = _min(wave_start + fx.Int32(c * CHUNK) + l16, last)
                     row = kv_row(k_t, tok)
                     k8.append([load8(row, r * fx.Int32(8) + fx.Int32(32 * p)) for p in range_constexpr(D // 32)])
@@ -240,7 +250,7 @@ class FlashAttentionDecode:
                 # chunk's 16 x D tile, row = j // (D / 8), 8 elements at column 8 * (j % (D / 8)).
                 PACKS = CHUNK * D // 8
                 v8 = []
-                for c in range_constexpr(NCHUNK):
+                for c in range_constexpr(NCHUNK_):
                     chunk = []
                     for it in range_constexpr(PACKS // 64):
                         j = fx.Int32(it * 64) + lane
@@ -250,7 +260,7 @@ class FlashAttentionDecode:
 
                 # S = K . Q^T: lane holds head l16, tokens 4r + i of each chunk.
                 scores, keep = [], []
-                for c in range_constexpr(NCHUNK):
+                for c in range_constexpr(NCHUNK_):
                     acc = Vec.filled(4, 0.0, fx.Float32)
                     for p in range_constexpr(D // 32):
                         acc = mfma(as4([k8[c][p][i] for i in range(4)]), as4([q8[p][i] for i in range(4)]), acc)
@@ -290,7 +300,7 @@ class FlashAttentionDecode:
                 v_base = fx.Int32(off_v) + wave * fx.Int32(V_CHUNK_BYTES)
                 # The V chunk area is private to the wave and a wave's LDS operations run in
                 # order, so staging and reading it need no CTA barrier.
-                for c in range_constexpr(NCHUNK):
+                for c in range_constexpr(NCHUNK_):
                     for it in range_constexpr(PACKS // 64):
                         j = fx.Int32(it * 64) + lane
                         row, col = j // fx.Int32(D // 8), fx.Int32(8) * (j % fx.Int32(D // 8))
@@ -360,7 +370,7 @@ class FlashAttentionDecode:
         return launch
 
     # ------------------------------------------------------------- reduce ----
-    def _build_reduce(self):
+    def _build_reduce(self, P):
         D, G = self.head_dim, self.group
         elem = fx.Float16 if self.dtype == "fp16" else fx.BFloat16
         is_local, has_sink = self.is_local, self.has_learnable_sink
@@ -391,8 +401,8 @@ class FlashAttentionDecode:
             lse_t = fx.rocdl.make_buffer_tensor(LSE)
             seqlen = fx.Int32(fx.rocdl.make_buffer_tensor(SeqUsedK)[b])
             # Partials are indexed from the first in-window partition (see the decode kernel).
-            nparts = (seqlen + fx.Int32(PARTITION - 1)) // fx.Int32(PARTITION) - _first_live_partition(
-                is_local, seqlen, window_left)
+            nparts = (seqlen + fx.Int32(P - 1)) // fx.Int32(P) - _first_live_partition(
+                is_local, seqlen, window_left, P)
             last_part = nparts - fx.Int32(1)
             copy_f128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
             copy_o64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
@@ -493,10 +503,24 @@ class FlashAttentionDecode:
             raise ValueError("learnable_sink does not match how this kernel was built")
         if learnable_sink is not None:
             learnable_sink = learnable_sink.to(torch.float32).contiguous()
-        num_parts = max(-(-(page_table.shape[1] * page_size) // PARTITION), 1)
-        if self.is_local and window_left >= 0:
-            # A window of W + 1 keys spans at most ceil((W + 1) / 256) + 1 partitions.
-            num_parts = min(num_parts, -(-(int(window_left) + 1) // PARTITION) + 1)
+        def parts_for(P):
+            n = max(-(-(page_table.shape[1] * page_size) // P), 1)
+            if self.is_local and window_left >= 0:
+                # A window of W + 1 keys spans at most ceil((W + 1) / P) + 1 partitions.
+                n = min(n, -(-(int(window_left) + 1) // P) + 1)
+            return n
+
+        P = self.partition
+        if P is None:
+            # Halve the partition when the default grid fills at most half the CUs (MI300X:
+            # batch 1-4 x 8K, 1 x 32K gain 15-25%); bigger grids keep 256. Sized from the
+            # page table's capacity, so no device sync.
+            num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+            P = 128 if B * Hk * parts_for(PARTITION) <= num_cus // 2 else PARTITION
+            if partials is not None and partials[0].shape[2] < parts_for(P):
+                P = PARTITION  # caller's buffers were sized for the default partition
+        num_parts = parts_for(P)
+        decode_launcher, reduce_launcher = self._get_launchers(P)
         if partials is None:
             pout = torch.empty(B, Hk, num_parts, self.group, D, dtype=torch.float32, device=q.device)
             plse = torch.empty(B, Hk, num_parts, self.group, dtype=torch.float32, device=q.device)
@@ -508,8 +532,8 @@ class FlashAttentionDecode:
             lse = torch.empty(B, Hq, dtype=torch.float32, device=q.device)
         stream = torch.cuda.current_stream() if stream is None else stream
         aux_slots = aux_tensors + (plse,) * (MAX_AUX_TENSORS - len(aux_tensors))
-        self.decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, *aux_slots, page_size,
+        decode_launcher(q, k_cache, v_cache, page_table, seqused_k, pout, plse, *aux_slots, page_size,
                              float(softmax_scale), int(window_left), B, num_parts, Hk, stream=stream)
-        self.reduce_launcher(pout, plse, seqused_k, learnable_sink if learnable_sink is not None else plse,
+        reduce_launcher(pout, plse, seqused_k, learnable_sink if learnable_sink is not None else plse,
                              out, lse, int(window_left), B, Hq, stream=stream)
         return out, lse
