@@ -145,14 +145,35 @@ class _Ops:
                 fx.copy(self.copy_g64, reg, fx.slice(packs, (None, d_start // fx.Int32(4))))
 
 
+def _swizzle_bits(dim):
+    """Row bits XOR-ed into the 16-byte chunk index of a row-major ``[rows, dim]`` 16-bit
+    LDS tile: unswizzled, the 32 rows of an A fragment are a multiple of 128 bytes apart
+    and read one bank."""
+    chunks = dim // 8
+    return min(3, chunks.bit_length() - 1) if chunks & (chunks - 1) == 0 else 0
+
+
+def _lds_view(ptr, shape, stride, dim):
+    """View of a row-major ``[rows, dim]`` LDS tile (any shape / stride over its linear
+    offsets, e.g. the transposed view), through the tile's chunk swizzle."""
+    layout = fx.make_layout(shape, stride)
+    bits = _swizzle_bits(dim)
+    if bits:
+        layout = fx.make_composed_layout(fx.static(fx.SwizzleType.get(bits, 3, dim.bit_length() - 4)), layout)
+    return fx.make_view(ptr, layout)
+
+
 def _stage_rows(ops, tid, NT, rows, dim, row_of, lds_packs):
-    """Copy ``rows`` x ``dim`` (row ``r`` read from ``row_of(r)``) global -> LDS."""
+    """Copy ``rows`` x ``dim`` (row ``r`` read from ``row_of(r)``) global -> LDS, storing
+    each 16-byte chunk at its swizzled place (see ``_lds_view``)."""
+    chunks, mask = dim // 8, (1 << _swizzle_bits(dim)) - 1
     for it in range_constexpr(rows * dim // 8 // NT):
         linear = fx.Int32(it * NT) + tid
-        src = fx.logical_divide(row_of(linear // fx.Int32(dim // 8)), fx.make_layout(8, 1))
+        row, chunk = linear // fx.Int32(chunks), linear % fx.Int32(chunks)
+        src = fx.logical_divide(row_of(row), fx.make_layout(8, 1))
         reg = fx.make_rmem_tensor(8, ops.elem)
-        fx.copy(ops.copy_g128, fx.slice(src, (None, linear % fx.Int32(dim // 8))), reg)
-        fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, linear)))
+        fx.copy(ops.copy_g128, fx.slice(src, (None, chunk)), reg)
+        fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, row * fx.Int32(chunks) + (chunk ^ (row & fx.Int32(mask))))))
 
 
 class FlashAttentionBackward:
@@ -278,10 +299,10 @@ class FlashAttentionBackward:
             ) if score_grad_hook is not None else None
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            k_rows = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((TN, D), (D, 1))), (MFMA_M, K_STEP))
-            kt_cols = fx.flat_divide(fx.make_view(lds.k.ptr, fx.make_layout((D, TN), (1, D))), (MFMA_M, K_STEP))
+            k_rows = fx.flat_divide(_lds_view(lds.k.ptr, (TN, D), (D, 1), D), (MFMA_M, K_STEP))
+            kt_cols = fx.flat_divide(_lds_view(lds.k.ptr, (D, TN), (1, D), D), (MFMA_M, K_STEP))
             k_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(8, 1))
-            v_rows = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((TN, DV), (DV, 1))), (MFMA_M, K_STEP))
+            v_rows = fx.flat_divide(_lds_view(lds.v.ptr, (TN, DV), (DV, 1), DV), (MFMA_M, K_STEP))
             v_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(8, 1))
 
             seqlen = SeqlenInfo.create(
@@ -448,11 +469,11 @@ class FlashAttentionBackward:
             lse_t, dsum_t = fx.rocdl.make_buffer_tensor(LSE), fx.rocdl.make_buffer_tensor(Dsum)
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            q_rows = fx.flat_divide(fx.make_view(lds.q.ptr, fx.make_layout((TM, D), (D, 1))), (MFMA_M, K_STEP))
-            qt_cols = fx.flat_divide(fx.make_view(lds.q.ptr, fx.make_layout((D, TM), (1, D))), (MFMA_M, K_STEP))
+            q_rows = fx.flat_divide(_lds_view(lds.q.ptr, (TM, D), (D, 1), D), (MFMA_M, K_STEP))
+            qt_cols = fx.flat_divide(_lds_view(lds.q.ptr, (D, TM), (1, D), D), (MFMA_M, K_STEP))
             q_packs = fx.logical_divide(fx.make_view(lds.q.ptr, fx.make_layout(TM * D, 1)), fx.make_layout(8, 1))
-            do_rows = fx.flat_divide(fx.make_view(lds.do.ptr, fx.make_layout((TM, DV), (DV, 1))), (MFMA_M, K_STEP))
-            dot_cols = fx.flat_divide(fx.make_view(lds.do.ptr, fx.make_layout((DV, TM), (1, DV))), (MFMA_M, K_STEP))
+            do_rows = fx.flat_divide(_lds_view(lds.do.ptr, (TM, DV), (DV, 1), DV), (MFMA_M, K_STEP))
+            dot_cols = fx.flat_divide(_lds_view(lds.do.ptr, (DV, TM), (1, DV), DV), (MFMA_M, K_STEP))
             do_packs = fx.logical_divide(fx.make_view(lds.do.ptr, fx.make_layout(TM * DV, 1)), fx.make_layout(8, 1))
             lse2_lds, dsum_lds = lds.lse2.ptr, lds.dsum.ptr
 
