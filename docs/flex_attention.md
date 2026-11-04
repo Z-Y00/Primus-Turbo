@@ -260,9 +260,27 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   directly (the grid stays worst-case sized for CUDA graphs, with extra CTAs exiting at
   once) and the reduce would fold only live partials. Expected: ~1/8 density at
   32 x 32K from 49 us toward ~21 us, and the 1-8 us scan cost gone when all blocks are listed.
-- FlyDSL prefill / training: tile and wave tuning, double-buffered LDS, vectorized V^T
-  reads, a 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while
-  staying deterministic), then the kernel-optimize loop against the Triton backend.
+- FlyDSL prefill / training, from the gfx942 kernel-optimize campaign
+  (`agent/workspace/flex_attention_flydsl_gfx942_20261103/`; rounds 4-12 accepted: K / Q / dO
+  LDS swizzles, dK/dV GQA split, rel-bias index from SeqlenInfo, unmasked interior tiles).
+  Measured on MI300X as of round 12 (FlyDSL time vs Triton): dense forward 1.36-1.70x,
+  Inkling forward 0.72-0.90x, dense backward 1.06-1.81x, Inkling backward 1.28-1.86x. Open:
+  - Forward K/V prefetch: each tile's global loads are issued and waited on right before
+    the LDS stores, behind a barrier, so load latency is exposed per tile. Load tile n+1
+    while computing tile n; watch registers (232 of the 256 that keep 2 waves/SIMD;
+    `rocdl.waves_per_eu = 2` is the cap if needed).
+  - Forward VALU per tile (~660 in unmasked tiles vs 64 MFMA): P's f32 -> bf16 cast is
+    round-to-nearest with a NaN check (~5 VALU per value; P is never NaN), and exp2 lowers
+    with denormal fix-ups (v_ldexp + compares). Tried and not worth it: v_max_f32 row max
+    (IEEE canonicalizes), tree reductions (+0.8%), transposed V in LDS (registers, rounds 2/6/8).
+  - Interior (unmasked) tiles for block-list full blocks too (band / prefix-LM still mask
+    every element of full blocks for the sequence end).
+  - dK/dV kernel: 512 registers and 33,280 B LDS (512 B over 32 KB), one CTA per CU; the
+    GQA split (round 9-10) works around the grid, not the footprint. The split choice could
+    also weigh causal work imbalance more precisely.
+  - Inkling local backward is dQ-bound: per-score bias gather and the hook's scattered store.
+  - A 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while staying
+    deterministic) instead of separate dQ and dK/dV kernels recomputing S and P.
 - FlyDSL features: varlen block-sparse lists, split-KV combined with
   block sparsity or sinks, native e5m2 (needs MFMA support in FlyDSL), fp8 backward.
 - Validation: the turbo-API FlyDSL tests and benchmarks on gfx950 (only the kernel
