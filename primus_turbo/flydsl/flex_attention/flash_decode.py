@@ -104,7 +104,14 @@ def _load_kv(kv_fp8, load_elem, copy_fp8, kv_elem, elem, row, first):
     reg = fx.make_rmem_tensor(16, kv_elem)
     fx.copy(copy_fp8, fx.slice(packs, (None, first // fx.Int32(16))), reg)
     f = _fp8_to_f32(reg.load())
-    return [Vec.from_elements(f[:8], fx.Float32).to(elem), Vec.from_elements(f[8:], fx.Float32).to(elem)]
+    if elem is not fx.BFloat16:
+        return [Vec.from_elements(f[:8], fx.Float32).to(elem), Vec.from_elements(f[8:], fx.Float32).to(elem)]
+    # e4m3 values are exact in bf16, so truncating f32 (one perm per pair) equals rounding,
+    # which gfx942 has no instruction for.
+    words = [fx.Int32(fx.rocdl.perm_b32(fx.Float32(f[2 * i + 1]).bitcast(fx.Int32),
+                                        fx.Float32(f[2 * i]).bitcast(fx.Int32), fx.Int32(0x07060302)))
+             for i in range(8)]
+    return [Vec.from_elements(words[:4], fx.Int32).bitcast(elem), Vec.from_elements(words[4:], fx.Int32).bitcast(elem)]
 
 
 def _d_offset(kw, r, p):
