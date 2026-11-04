@@ -85,26 +85,24 @@ def make_softcap_mods(softcap: float):
 def make_rel_bias_mods(num_heads: int, rel_extent: int):
     """``(score_mod, score_grad_hook)`` for ``score += rel_logits[t, h, q_idx - kv_idx]``,
     ``0 <= q_idx - kv_idx < rel_extent``, with aux tensors ``(rel_logits [T, H, RE] fp32,
-    cu_seqlens)``: ``t = cu_seqlens[b] + q_idx`` is the query's packed row (varlen)."""
+    cu_seqlens)``: ``t = cu_seqlens[b] + q_idx`` is the query's packed row (varlen). The row
+    comes from ``seqlen_info`` (the kernel's per-sequence offset and length, from the same
+    cu_seqlens), not a per-score reload of ``cu_seqlens``."""
     H, RE = int(num_heads), int(rel_extent)
 
-    def rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
-        cu = aux_tensors[1]
-        start = fx.Int32(cu[batch_idx])
-        end = fx.Int32(cu[batch_idx + fx.Int32(1)])
+    def rel_index(q_idx, kv_idx, seqlen_info):
         rd = q_idx - kv_idx
-        row = start + q_idx
-        keep = (rd >= fx.Int32(0)) & (rd < fx.Int32(RE)) & (row < end)
-        return row, rd, keep
+        keep = (rd >= fx.Int32(0)) & (rd < fx.Int32(RE)) & (q_idx < seqlen_info.seqlen_q)
+        return seqlen_info.offset_q + q_idx, rd, keep
 
     def rel_bias_score_mod(score, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-        row, rd, keep = rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+        row, rd, keep = rel_index(q_idx, kv_idx, seqlen_info)
         zero = fx.Int32(0)
         bias = fx.Float32(fx.slice(aux_tensors[0], (keep.select(row, zero), head_idx, None))[keep.select(rd, zero)])
         return score + keep.select(bias, fx.Float32(0.0))
 
     def rel_bias_grad_hook(dscore, valid, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-        row, rd, keep = rel_index(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+        row, rd, keep = rel_index(q_idx, kv_idx, seqlen_info)
         return row * fx.Int32(H * RE) + head_idx * fx.Int32(RE) + rd, dscore, keep & valid
 
     return rel_bias_score_mod, rel_bias_grad_hook
