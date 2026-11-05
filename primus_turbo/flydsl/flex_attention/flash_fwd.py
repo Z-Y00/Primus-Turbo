@@ -487,10 +487,13 @@ class FlashAttentionForward:
                         first = half * 16 + KPL * g
                         p_frag = fx.make_fragment_like(b_coords, elem)
                         p_frag.store(_to_elem(probs[first : first + KPL], elem, dtype))
+                        # All d blocks' V^T fragments of this key step are read before their
+                        # MFMAs, so the reads overlap instead of each MFMA waiting on its own.
+                        t = half * (MFMA_M // KS) + g
+                        a_frags = [vt_frag_tr(c, t) if VTR else vt_frag_elems(fx.slice(vt_lds_tiles, (None, None, c, t)))
+                                   for c in range_constexpr(DV // MFMA_M)]
                         for c in range_constexpr(DV // MFMA_M):
-                            t = half * (MFMA_M // KS) + g
-                            a_frag = vt_frag_tr(c, t) if VTR else vt_frag_elems(fx.slice(vt_lds_tiles, (None, None, c, t)))
-                            o_acc[c] = mfma(a_frag, p_frag, o_acc[c])
+                            o_acc[c] = mfma(a_frags[c], p_frag, o_acc[c])
                 return new_max, new_sum, o_acc
 
             # A varlen grid is sized for the longest sequence; shorter ones skip the
