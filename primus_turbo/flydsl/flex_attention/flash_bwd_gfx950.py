@@ -154,6 +154,61 @@ class _Ops:
             frags.append(frag)
         return frags
 
+    def frag_offsets(self, row, dim):
+        """Element offsets of this lane's 16-byte operand reads (A or B: row ``row``, K
+        elements ``8 * (lane // 32) ..``) of a row-major ``[rows, dim]`` LDS tile swizzled as
+        ``_lds_view``, one per K step. The swizzled chunk is ``(2 ks + lane // 32) ^ (row & m)``,
+        so the offsets are a per-lane value XOR-ed with or plus constants: a few registers
+        serve every read (and every tile laid out alike), the rest is the read's immediate."""
+        if self.kpl != 8:
+            raise ValueError("frag_offsets needs 16-element K steps")
+        m = (1 << _swizzle_bits(dim)) - 1
+        h = fx.Int32(fx.get_scalar(self.b_coords[0])) // fx.Int32(8 * MFMA_M)
+        offs = []
+        if m:
+            base = row * fx.Int32(dim) + fx.Int32(8) * (h ^ (row & fx.Int32(m)))
+            for ks in range_constexpr(dim // self.k_step):
+                lo, hi = (2 * ks) & m, (2 * ks) & ~m
+                offs.append(((base ^ fx.Int32(8 * lo)) if lo else base) + fx.Int32(8 * hi))
+        else:
+            base = row * fx.Int32(dim) + fx.Int32(8) * h
+            offs = [base + fx.Int32(16 * ks) for ks in range_constexpr(dim // self.k_step)]
+        return offs
+
+    def frag_at(self, ptr, off, coords):
+        """The operand fragment (``self.a_coords`` / ``self.b_coords``) at LDS element ``off``."""
+        src = fx.make_view(fx.add_offset(ptr, fx.make_int_tuple(off)), fx.make_layout(self.kpl, 1))
+        reg = fx.make_rmem_tensor(self.kpl, self.elem)
+        fx.copy(self.copy_s64, src, reg)
+        frag = fx.make_fragment_like(coords, self.elem)
+        frag.store(Vec(reg.load()))
+        return frag
+
+    def tr_offsets(self, dim):
+        """Per 32-column group ``c``, this lane's element offset of ``a_from_cols_tr``'s
+        reads minus the step's whole rows (``16 step + 8 h``, a multiple of 8, so the row
+        swizzle only sees ``tr_row``)."""
+        m = fx.Int32((1 << _swizzle_bits(dim)) - 1)
+        offs = []
+        for c in range_constexpr(dim // MFMA_M):
+            col = fx.Int32(c * MFMA_M) + self.tr_col
+            offs.append(self.tr_row * fx.Int32(dim) + ((col // fx.Int32(8)) ^ (self.tr_row & m)) * fx.Int32(8)
+                        + col % fx.Int32(8))
+        return offs
+
+    def a_from_cols_tr_at(self, ptr, off, dim, step):
+        """``a_from_cols_tr`` with the column group's ``tr_offsets`` entry."""
+        halves = []
+        for h in range_constexpr(2):
+            idx = off + fx.Int32((16 * step + 8 * h) * dim)
+            src = fx.make_view(fx.add_offset(ptr, fx.make_int_tuple(idx)), fx.make_layout(4, 1))
+            dst = fx.make_rmem_tensor(fx.make_layout(4, 1), self.elem)
+            fx.copy(self.copy_tr, src, dst)
+            halves.append(Vec(dst.load()))
+        frag = fx.make_fragment_like(self.a_coords, self.elem)
+        frag.store(halves[0].shuffle(halves[1], list(range(8))))
+        return frag
+
     def b_frag(self, values):
         frag = fx.make_fragment_like(self.b_coords, self.elem)
         frag.store(Vec.from_elements(values, fx.Float32).to(self.elem))
@@ -214,7 +269,12 @@ def _store_rows(ops, pending):
         fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, idx)))
 
 
-MIN_SPLIT_WORK = 128
+MIN_SPLIT_WORK = 128 * 64  # query rows (x heads) a split dK/dV CTA keeps at least
+
+
+def _occupancy_2(nt):
+    """Hold a kernel to 2 waves per SIMD (<= 256 registers per lane)."""
+    return {"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": f"{nt},{nt}"}
 
 
 class FlashAttentionBackward:
@@ -246,8 +306,10 @@ class FlashAttentionBackward:
         sparse_block_size: tuple | None = None,
         score_grad_hook=None,
         num_waves: int = 4,
+        # Both kernels run 2 waves per SIMD (<= 256 registers per lane): 32-row tiles keep the
+        # per-iteration working set small, and dK/dV keeps K / V in LDS (see _build_dkdv).
         dq_tile_n: int = 64,
-        dkdv_tile_m: int = 64,
+        dkdv_tile_m: int = 32,
     ):
         if dtype not in ("bf16", "fp16"):
             raise ValueError(f"dtype must be bf16 or fp16, got {dtype}")
@@ -474,6 +536,7 @@ class FlashAttentionBackward:
                 Q, K, V, dO, LSE, Dsum, dQ, ScoreGrad, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
                 Aux0, Aux1, Aux2, Aux3, MaskCnt, MaskIdx, FullCnt, FullIdx,
                 seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right, score_grad_pad,
+                value_attrs=_occupancy_2(NT),
             ).launch(grid=(num_m_blocks, num_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -498,12 +561,19 @@ class FlashAttentionBackward:
         block_sparse, has_full_blocks = self.block_sparse, self.has_full_blocks
         Q_SUB, KV_SUB = self.dkdv_sub
 
+        # The CTA's K / V rows live in LDS for its whole life (staged once) and the B fragments
+        # are read at each use: held in registers they took 64 per lane, which spilled at 2 waves
+        # per SIMD. Q / dO (32 rows) + K / V (128 rows) = 80 KB, two CTAs in gfx950's 160 KB.
+        # A row's LSE / D' come by lane shuffle (each lane loads its own row), not via LDS.
+        if TM != MFMA_M:
+            raise ValueError(f"the gfx950 dK/dV kernel needs dkdv_tile_m == {MFMA_M}")
+
         @fx.struct
         class SharedStorage:
             q: fx.Array[elem, TM * D, 16]
             do: fx.Array[elem, TM * DV, 16]
-            lse2: fx.Array[fx.Float32, TM, 16]
-            dsum: fx.Array[fx.Float32, TM, 16]
+            k: fx.Array[elem, TN * D, 16]
+            v: fx.Array[elem, TN * DV, 16]
 
         @flyc.kernel(known_block_size=[NT, 1, 1])
         def kernel(
@@ -526,18 +596,18 @@ class FlashAttentionBackward:
             ops = _Ops(elem, lane, KS)
             # The rewriter carries any kernel local whose method is called inside a
             # runtime ``if`` as branch state, so those calls go through plain names.
-            lane_col, b_frags_of_row, store_acc = ops.col(), ops.b_frags_from_row, ops.store_transposed_acc
+            lane_col, store_acc = ops.col(), ops.store_transposed_acc
+            frag_offsets, tr_offsets = ops.frag_offsets, ops.tr_offsets
 
             q_t, k_t, v_t = (fx.rocdl.make_buffer_tensor(t) for t in (Q, K, V))
             do_t, dk_t, dv_t = (fx.rocdl.make_buffer_tensor(t) for t in (dO, dK, dV))
             lse_t, dsum_t = fx.rocdl.make_buffer_tensor(LSE), fx.rocdl.make_buffer_tensor(Dsum)
 
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-            q_rows = fx.flat_divide(_lds_view(lds.q.ptr, (TM, D), (D, 1), D), (MFMA_M, KS))
             q_packs = fx.logical_divide(fx.make_view(lds.q.ptr, fx.make_layout(TM * D, 1)), fx.make_layout(8, 1))
-            do_rows = fx.flat_divide(_lds_view(lds.do.ptr, (TM, DV), (DV, 1), DV), (MFMA_M, KS))
             do_packs = fx.logical_divide(fx.make_view(lds.do.ptr, fx.make_layout(TM * DV, 1)), fx.make_layout(8, 1))
-            lse2_lds, dsum_lds = lds.lse2.ptr, lds.dsum.ptr
+            k_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(8, 1))
+            v_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(8, 1))
 
             seqlen = SeqlenInfo.create(
                 batch, seqlen_q_static, seqlen_k_static,
@@ -568,7 +638,8 @@ class FlashAttentionBackward:
             def sparse_m_block(idx_row, j):
                 return fx.Int32(idx_row[j // fx.Int32(Q_SUB)]) * fx.Int32(Q_SUB) + j % fx.Int32(Q_SUB)
 
-            def one_m_block(m_block, head, k_frags, v_frags, kv_pos, dk_acc, dv_acc, apply_mask_mod=True):
+            def one_m_block(m_block, head, offs, kv_pos, dk_acc, dv_acc, apply_mask_mod=True):
+                q_offs, do_offs, k_offs, v_offs, q_tr, do_tr = offs
                 mask = AttentionMask(
                     seqlen, is_causal, is_local, window_left, window_right, mask_mod, batch, head, aux_tensors
                 )
@@ -579,19 +650,21 @@ class FlashAttentionBackward:
                 pending += _load_rows(ops, tid, NT, TM, DV, lambda r: q_side_row(do_t, _min(q_base + r, last_q), head),
                                       do_packs)
                 _store_rows(ops, pending)
-                # Every thread writes row tid % TM: duplicates store the same value.
-                r = tid % fx.Int32(TM)
-                q_r = _min(q_base + r, last_q)
-                lse2_lds[r] = _lse_log2(row_stat(lse_t, q_r, head))
-                dsum_lds[r] = row_stat(dsum_t, q_r, head)
+                # Lane l holds query row l % 32's LSE (log2) and D'; rows are shuffled in below.
+                q_r = _min(q_base + lane % fx.Int32(MFMA_M), last_q)
+                my_lse2 = _lse_log2(row_stat(lse_t, q_r, head))
+                my_dsum = row_stat(dsum_t, q_r, head)
                 fx.gpu.barrier()
                 zero16 = Vec.filled(16, 0.0, fx.Float32)
+                a_c, b_c = ops.a_coords, ops.b_coords
                 for sub in range_constexpr(TM // MFMA_M):
                     s_acc, dp_acc = zero16, zero16
                     for ks in range_constexpr(D // KS):
-                        s_acc = ops.mfma(ops.a_from_rows(fx.slice(q_rows, (None, None, sub, ks))), k_frags[ks], s_acc)
+                        s_acc = ops.mfma(ops.frag_at(lds.q.ptr, q_offs[ks], a_c), ops.frag_at(lds.k.ptr, k_offs[ks], b_c),
+                                         s_acc)
                     for ks in range_constexpr(DV // KS):
-                        dp_acc = ops.mfma(ops.a_from_rows(fx.slice(do_rows, (None, None, sub, ks))), v_frags[ks], dp_acc)
+                        dp_acc = ops.mfma(ops.frag_at(lds.do.ptr, do_offs[ks], a_c),
+                                          ops.frag_at(lds.v.ptr, v_offs[ks], b_c), dp_acc)
                     s_acc, dp_acc = Vec(s_acc), Vec(dp_acc)
                     probs, grads = [], []
                     for j in range_constexpr(16):
@@ -600,9 +673,9 @@ class FlashAttentionBackward:
                         scaled = s_acc[j] * softmax_scale
                         score = _mod_score(score_mod, scaled, batch, head, q_pos, kv_pos, mask)
                         keep = mask.keep(q_pos, kv_pos, apply_mask_mod=apply_mask_mod) & (q_pos < seqlen.seqlen_q)
-                        lse2 = fx.Float32(lse2_lds[q_local])
+                        lse2 = fx.Float32(fx.gpu.shuffle_idx(my_lse2, q_local, 64))
                         p = keep.select(fx.math.exp2(score * fx.Float32(LOG2E) - lse2), fx.Float32(0.0))
-                        grad = p * (dp_acc[j] - fx.Float32(dsum_lds[q_local]))
+                        grad = p * (dp_acc[j] - fx.Float32(fx.gpu.shuffle_idx(my_dsum, q_local, 64)))
                         probs.append(p)
                         grads.append(_mod_grad(score_mod_bwd, grad, scaled, batch, head, q_pos, kv_pos, mask))
                     for g in range_constexpr(MFMA_M // KS):
@@ -610,10 +683,10 @@ class FlashAttentionBackward:
                         ds_frag = ops.b_frag(grads[(KS // 2) * g : (KS // 2) * (g + 1)])
                         step = sub * (MFMA_M // KS) + g
                         for c in range_constexpr(DV // MFMA_M):
-                            a = ops.a_from_cols_tr(lds.do.ptr, DV, step, c)
+                            a = ops.a_from_cols_tr_at(lds.do.ptr, do_tr[c], DV, step)
                             dv_acc[c] = ops.mfma(a, p_frag, dv_acc[c])
                         for c in range_constexpr(D // MFMA_M):
-                            a = ops.a_from_cols_tr(lds.q.ptr, D, step, c)
+                            a = ops.a_from_cols_tr_at(lds.q.ptr, q_tr[c], D, step)
                             dk_acc[c] = ops.mfma(a, ds_frag, dk_acc[c])
                 return dk_acc, dv_acc
 
@@ -621,8 +694,18 @@ class FlashAttentionBackward:
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block, window_left, window_right)
                 kv_pos = n_block * fx.Int32(TN) + wave * fx.Int32(MFMA_M) + lane_col
                 kv_row = _min(kv_pos, seqlen.seqlen_k - fx.Int32(1))
-                k_frags = b_frags_of_row(kv_side_row(k_t, kv_row), D)
-                v_frags = b_frags_of_row(kv_side_row(v_t, kv_row), DV)
+                # Q / dO rows are lane % 32 and K / V rows 32 wave more: alike below 32 rows,
+                # so K / V reuse the Q / dO offsets plus the wave's rows.
+                q_offs, do_offs = frag_offsets(lane_col, D), frag_offsets(lane_col, DV)
+                k_offs = [o + wave * fx.Int32(MFMA_M * D) for o in q_offs]
+                v_offs = [o + wave * fx.Int32(MFMA_M * DV) for o in do_offs]
+                offs = (q_offs, do_offs, k_offs, v_offs, tr_offsets(D), tr_offsets(DV))
+                # Stage the CTA's K / V rows once (the first query block's barrier publishes them).
+                kv_base, last_key = n_block * fx.Int32(TN), seqlen.seqlen_k - fx.Int32(1)
+                pending = _load_rows(ops, tid, NT, TN, D, lambda r: kv_side_row(k_t, _min(kv_base + r, last_key)), k_packs)
+                pending += _load_rows(ops, tid, NT, TN, DV, lambda r: kv_side_row(v_t, _min(kv_base + r, last_key)),
+                                      v_packs)
+                _store_rows(ops, pending)
 
                 NDK, NDV = D // MFMA_M, DV // MFMA_M
                 init = [Vec.filled(16, 0.0, fx.Float32) for _ in range_constexpr(NDK + NDV)]
@@ -637,21 +720,21 @@ class FlashAttentionBackward:
                         mask_cnt = fx.Int32(fx.slice(mask_cnt_t, (batch, head, None))[sparse_n])
                         mask_idx = fx.slice(mask_idx_t, (batch, head, sparse_n, None))
                         for m_iter, state in range(fx.Int32(0), mask_cnt * fx.Int32(Q_SUB), fx.Int32(1), init=results):
-                            dk, dv = one_m_block(sparse_m_block(mask_idx, fx.Int32(m_iter)), head, k_frags, v_frags,
+                            dk, dv = one_m_block(sparse_m_block(mask_idx, fx.Int32(m_iter)), head, offs,
                                                  kv_pos, list(state[:NDK]), list(state[NDK:]))
                             results = yield dk + dv
                         if has_full_blocks:
                             full_cnt = fx.Int32(fx.slice(fx.rocdl.make_buffer_tensor(FullCnt), (batch, head, None))[sparse_n])
                             full_idx = fx.slice(fx.rocdl.make_buffer_tensor(FullIdx), (batch, head, sparse_n, None))
                             for m_iter, state in range(fx.Int32(0), full_cnt * fx.Int32(Q_SUB), fx.Int32(1), init=results):
-                                dk, dv = one_m_block(sparse_m_block(full_idx, fx.Int32(m_iter)), head, k_frags, v_frags,
+                                dk, dv = one_m_block(sparse_m_block(full_idx, fx.Int32(m_iter)), head, offs,
                                                      kv_pos, list(state[:NDK]), list(state[NDK:]), apply_mask_mod=False)
                                 results = yield dk + dv
                 else:
                     for g_head in range_constexpr(HPS):
                         head = first_head + fx.Int32(g_head)
                         for m_iter, state in range(m_block_min, m_block_max, fx.Int32(1), init=results):
-                            dk, dv = one_m_block(fx.Int32(m_iter), head, k_frags, v_frags, kv_pos,
+                            dk, dv = one_m_block(fx.Int32(m_iter), head, offs, kv_pos,
                                                  list(state[:NDK]), list(state[NDK:]))
                             results = yield dk + dv
 
@@ -676,6 +759,7 @@ class FlashAttentionBackward:
                 Q, K, V, dO, LSE, Dsum, dK, dV, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
                 Aux0, Aux1, Aux2, Aux3, MaskCnt, MaskIdx, FullCnt, FullIdx,
                 seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                value_attrs=_occupancy_2(NT),
             ).launch(grid=(num_n_blocks, num_kv_heads, batch), block=(NT, 1, 1), stream=stream)
 
         return launch
@@ -805,10 +889,10 @@ class FlashAttentionBackward:
         return dq, dk, dv, dsink
 
     def _dkdv_split(self, ctas, seqlen_q, window_left, window_right, device):
-        """Power-of-two split of the GQA group across dK/dV CTAs (it fits one CTA per CU).
-        Split until every CU has a CTA; keep splitting up to two per CU only while each CTA
-        keeps at least ``MIN_SPLIT_WORK`` (query tile x head) iterations, since below that the
-        fp32 partials cost more than the extra overlap gains."""
+        """Power-of-two split of the GQA group across dK/dV CTAs (two fit per CU).
+        Split until every CU has two CTAs; keep splitting up to four per CU only while each
+        CTA keeps at least ``MIN_SPLIT_WORK`` query rows (x heads) of work, since below that
+        the fp32 partials cost more than the extra overlap gains."""
         import torch
 
         num_cus = torch.cuda.get_device_properties(device).multi_processor_count
@@ -820,10 +904,10 @@ class FlashAttentionBackward:
             m_iters = max(m_blocks // 2, 1)
         else:
             m_iters = m_blocks
-        work = m_iters * self.qhead_per_kvhead
+        work = m_iters * self.dkdv_tile_m * self.qhead_per_kvhead
         split = 1
         while self.qhead_per_kvhead % (split * 2) == 0:
-            if ctas * split < num_cus or (ctas * split < 2 * num_cus and work // (split * 2) >= MIN_SPLIT_WORK):
+            if ctas * split < 2 * num_cus or (ctas * split < 4 * num_cus and work // (split * 2) >= MIN_SPLIT_WORK):
                 split *= 2
             else:
                 break

@@ -292,9 +292,12 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
     stores (both GPUs: MI355X backward +16%, MI300X +9%), and on gfx950 transpose reads for
     the dQ / dK / dV column views (MI355X backward +19%; causal 8K 12.0 -> 7.3 ms, band and
     prefix-LM now faster than Triton).
-  - Backward register footprint: dQ 336 and dK/dV 464 registers per lane, one wave per SIMD
-    (gfx950's 160 KB LDS no longer limits occupancy; registers do). dK/dV is ~2/3 of the
-    backward.
+  - Done (gfx950 round 15): dK/dV at 2 waves per SIMD without spills (256 registers):
+    K / V staged in LDS once per CTA (80 KB with a 32-row Q / dO tile, 2 CTAs per CU), LDS
+    operand offsets shared across Q / dO / K / V, GQA split filling 2 CTAs per CU (MI355X
+    backward +22%, every shape +12% to +31%).
+  - Backward: the next Q / dO tile's loads are not overlapped with the current block (at
+    256 registers, via LDS DMA); dQ at 2 waves per SIMD the same way.
   - Forward VALU (510 per unmasked 64-key tile vs 32 MFMA; ~180 needed): exp2 range fix-ups,
     scale and max subtraction as separate ops, compare + select row max.
 - FlyDSL features: varlen block-sparse lists, split-KV combined with
