@@ -386,8 +386,11 @@ class FlashAttentionForward:
                 return fx.slice(t, coord)
 
             def stage_kv(kv_base):
-                """Copy the K and V tiles at ``kv_base`` to LDS (rows clamped to the sequence)."""
+                """Copy the K and V tiles at ``kv_base`` to LDS (rows clamped to the sequence).
+                Every global load is issued before the first LDS store, so the tile pays one
+                load latency rather than one per load."""
                 last_key = seqlen.seqlen_k - fx.Int32(1)
+                pending = []  # (register pack, LDS packs view, pack index)
                 for it in range_constexpr(k_iters):
                     linear = fx.Int32(it * NT) + tid
                     key = _min(kv_base + linear // fx.Int32(D // PACK), last_key)
@@ -396,7 +399,7 @@ class FlashAttentionForward:
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // PACK))), reg)
                     k_row, k_chunk = linear // fx.Int32(k_chunks), linear % fx.Int32(k_chunks)
                     k_pack = k_row * fx.Int32(k_chunks) + (k_chunk ^ (k_row & fx.Int32((1 << K_SWZ) - 1)))
-                    fx.copy(copy_s128, reg, fx.slice(k_lds_packs, (None, k_pack)))
+                    pending.append((reg, k_lds_packs, k_pack))
                 for it in range_constexpr(v_iters):
                     linear = fx.Int32(it * NT) + tid
                     row, col = linear // fx.Int32(DV // PACK), linear % fx.Int32(DV // PACK)
@@ -405,7 +408,9 @@ class FlashAttentionForward:
                     reg = fx.make_rmem_tensor(PACK, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, col)), reg)
                     lds_row = _fp8_v_row(row) if KS == 16 else row
-                    fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, lds_row * fx.Int32(DV // PACK) + col)))
+                    pending.append((reg, v_lds_packs, lds_row * fx.Int32(DV // PACK) + col))
+                for reg, packs, idx in pending:
+                    fx.copy(copy_s128, reg, fx.slice(packs, (None, idx)))
 
             def sparse_n_block(idx_row, j):
                 """Kernel tile of the ``j``-th entry of a block list, sparse blocks split in KV_SUB."""
