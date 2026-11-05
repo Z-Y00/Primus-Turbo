@@ -288,6 +288,10 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   - Done (gfx950 rounds 7-8): forward K/V staging loads batched before the LDS stores, and
     P . V reads V^T with `ds_read_b64_tr_b16` from a V tile swizzled by (row & 3) << 1
     (forward +10% geomean; causal 8K 1.79 -> 1.55 ms, 1.50x Triton).
+  - Done (gfx950 rounds 12-13, gfx942 round 16): backward staging loads batched before the LDS
+    stores (both GPUs: MI355X backward +16%, MI300X +9%), and on gfx950 transpose reads for
+    the dQ / dK / dV column views (MI355X backward +19%; causal 8K 12.0 -> 7.3 ms, band and
+    prefix-LM now faster than Triton).
   - Backward register footprint: dQ 336 and dK/dV 464 registers per lane, one wave per SIMD
     (gfx950's 160 KB LDS no longer limits occupancy; registers do). dK/dV is ~2/3 of the
     backward.
