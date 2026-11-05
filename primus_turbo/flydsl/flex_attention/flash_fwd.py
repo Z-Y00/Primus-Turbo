@@ -257,10 +257,15 @@ class FlashAttentionForward:
         k_chunks = D // PACK
         K_SWZ = min(3, k_chunks.bit_length() - 1) if k_chunks & (k_chunks - 1) == 0 else 0
 
+        # gfx950 16-bit without block lists: K / V double-buffered in LDS (2 x 32 KB per CTA; the
+        # 160 KB LDS holds two CTAs). Tile n+1's global loads are in flight while tile n computes.
+        DB = VTR and not block_sparse
+        NBUF = 2 if DB else 1
+
         @fx.struct
         class SharedStorage:
-            k: fx.Array[elem, TN * D, 16]
-            v: fx.Array[elem, TN * DV, 16]
+            k: fx.Array[elem, NBUF * TN * D, 16]
+            v: fx.Array[elem, NBUF * TN * DV, 16]
 
         @flyc.kernel(known_block_size=[NT, 1, 1])
         def kernel(
@@ -352,10 +357,15 @@ class FlashAttentionForward:
                 fx.make_layout((TN, D), (D, 1)),
             ) if K_SWZ else fx.make_layout((TN, D), (D, 1))
             k_lds_tiles = fx.flat_divide(fx.make_view(lds.k.ptr, k_layout), (MFMA_M, KS))
-            k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(TN * D, 1)), fx.make_layout(PACK, 1))
+            k_lds_packs = fx.logical_divide(fx.make_view(lds.k.ptr, fx.make_layout(NBUF * TN * D, 1)), fx.make_layout(PACK, 1))
+
+            def k_tiles_at(buf):
+                """K tile views of LDS buffer ``buf`` (runtime index)."""
+                base = fx.add_offset(lds.k.ptr, fx.make_int_tuple(buf * fx.Int32(TN * D)))
+                return fx.flat_divide(fx.make_view(base, k_layout), (MFMA_M, KS))
             # V^T view of the row-major [TN, DV] V tile: (d, key) with strides (1, DV).
             vt_lds_tiles = fx.flat_divide(fx.make_view(lds.v.ptr, fx.make_layout((DV, TN), (1, DV))), (MFMA_M, KS))
-            v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(TN * DV, 1)), fx.make_layout(PACK, 1))
+            v_lds_packs = fx.logical_divide(fx.make_view(lds.v.ptr, fx.make_layout(NBUF * TN * DV, 1)), fx.make_layout(PACK, 1))
 
             seqlen = SeqlenInfo.create(
                 batch,
@@ -399,9 +409,19 @@ class FlashAttentionForward:
                 return fx.slice(t, coord)
 
             def stage_kv(kv_base):
-                """Copy the K and V tiles at ``kv_base`` to LDS (rows clamped to the sequence).
-                Every global load is issued before the first LDS store, so the tile pays one
-                load latency rather than one per load."""
+                """Copy the K and V tiles at ``kv_base`` to LDS buffer 0."""
+                store_kv(load_kv(kv_base), fx.Int32(0))
+
+            def store_kv(pending, buf):
+                k_off, v_off = buf * fx.Int32(TN * D // PACK), buf * fx.Int32(TN * DV // PACK)
+                for reg, is_k, idx in pending:
+                    packs, off = (k_lds_packs, k_off) if is_k else (v_lds_packs, v_off)
+                    fx.copy(copy_s128, reg, fx.slice(packs, (None, idx + off)))
+
+            def load_kv(kv_base):
+                """Global loads of the K and V tiles at ``kv_base`` (rows clamped to the
+                sequence) into registers, with their LDS pack indices. All loads are issued
+                before any store, so a tile pays one load latency rather than one per load."""
                 last_key = seqlen.seqlen_k - fx.Int32(1)
                 pending = []  # (register pack, LDS packs view, pack index)
                 for it in range_constexpr(k_iters):
@@ -412,7 +432,7 @@ class FlashAttentionForward:
                     fx.copy(copy_g128, fx.slice(src, (None, linear % fx.Int32(D // PACK))), reg)
                     k_row, k_chunk = linear // fx.Int32(k_chunks), linear % fx.Int32(k_chunks)
                     k_pack = k_row * fx.Int32(k_chunks) + (k_chunk ^ (k_row & fx.Int32((1 << K_SWZ) - 1)))
-                    pending.append((reg, k_lds_packs, k_pack))
+                    pending.append((reg, True, k_pack))
                 for it in range_constexpr(v_iters):
                     linear = fx.Int32(it * NT) + tid
                     row, col = linear // fx.Int32(DV // PACK), linear % fx.Int32(DV // PACK)
@@ -422,16 +442,15 @@ class FlashAttentionForward:
                     fx.copy(copy_g128, fx.slice(src, (None, col)), reg)
                     lds_row = _fp8_v_row(row) if KS == 16 else row
                     v_col = col ^ ((lds_row & fx.Int32(3)) * fx.Int32(2)) if V_SWZ else col
-                    pending.append((reg, v_lds_packs, lds_row * fx.Int32(DV // PACK) + v_col))
-                for reg, packs, idx in pending:
-                    fx.copy(copy_s128, reg, fx.slice(packs, (None, idx)))
+                    pending.append((reg, False, lds_row * fx.Int32(DV // PACK) + v_col))
+                return pending
 
             def vt_frag_elems(tile):
                 a_frag = thr_mma.make_fragment_A(tile)
                 fx.copy(copy_s1, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
                 return a_frag
 
-            def vt_frag_tr(c, t):
+            def vt_frag_tr(c, t, buf):
                 """V^T A fragment (d block c, key step t) from two transpose reads of the
                 row-major V tile: keys 8 * (lane // 32) + {0..3}, then {4..7}."""
                 d = fx.Int32(c * MFMA_M) + vtr_d
@@ -439,7 +458,7 @@ class FlashAttentionForward:
                 for h in range_constexpr(2):
                     row = fx.Int32(t * KS + 4 * h) + vtr_key
                     chunk = (d // fx.Int32(8)) ^ ((row & fx.Int32(3)) * fx.Int32(2)) if V_SWZ else d // fx.Int32(8)
-                    idx = row * fx.Int32(DV) + chunk * fx.Int32(8) + d % fx.Int32(8)
+                    idx = buf * fx.Int32(TN * DV) + row * fx.Int32(DV) + chunk * fx.Int32(8) + d % fx.Int32(8)
                     src = fx.make_view(fx.add_offset(lds.v.ptr, fx.make_int_tuple(idx)), fx.make_layout(4, 1))
                     dst = fx.make_rmem_tensor(fx.make_layout(4, 1), elem)
                     fx.copy(copy_vtr, src, dst)
@@ -454,17 +473,32 @@ class FlashAttentionForward:
 
             def compute_one_n_block(n_block, q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod=True,
                                     masked=True):
-                kv_base = n_block * fx.Int32(TN)
                 fx.gpu.barrier()  # every wave is done reading the previous tile
-                stage_kv(kv_base)
+                stage_kv(n_block * fx.Int32(TN))
                 fx.gpu.barrier()
+                return compute_tile(n_block, fx.Int32(0), q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod,
+                                    masked)
 
+            def compute_one_n_block_db(n_block, n_min, n_max, q_frags, q_pos, row_max, row_sum, o_acc, masked=True):
+                """Double-buffered tile: issue tile n+1's loads, compute tile n from its buffer,
+                store tile n+1 into the other buffer (last read a tile ago, before the previous
+                barrier), one barrier. The last tile re-stages itself into the idle buffer."""
+                buf = (n_block - n_min) & fx.Int32(1)
+                pending = load_kv(_min(n_block + fx.Int32(1), n_max - fx.Int32(1)) * fx.Int32(TN))
+                res = compute_tile(n_block, buf, q_frags, q_pos, row_max, row_sum, o_acc, True, masked)
+                store_kv(pending, fx.Int32(1) - buf)
+                fx.gpu.barrier()
+                return res
+
+            def compute_tile(n_block, buf, q_frags, q_pos, row_max, row_sum, o_acc, apply_mask_mod, masked):
+                kv_base = n_block * fx.Int32(TN)
+                k_tiles = k_tiles_at(buf) if DB else k_lds_tiles
                 zero16 = Vec.filled(16, 0.0, fx.Float32)
                 scores, keep = [], []
                 for half in range_constexpr(TN // MFMA_M):
                     acc = zero16
                     for ks in range_constexpr(D // KS):
-                        tile = fx.slice(k_lds_tiles, (None, None, half, ks))
+                        tile = fx.slice(k_tiles, (None, None, half, ks))
                         a_frag = thr_mma.make_fragment_A(tile)
                         fx.copy(copy_s64, copy_k.partition_S(tile), copy_k.retile(a_frag))
                         acc = mfma(a_frag, q_frags[ks], acc)
@@ -490,7 +524,7 @@ class FlashAttentionForward:
                         # All d blocks' V^T fragments of this key step are read before their
                         # MFMAs, so the reads overlap instead of each MFMA waiting on its own.
                         t = half * (MFMA_M // KS) + g
-                        a_frags = [vt_frag_tr(c, t) if VTR else vt_frag_elems(fx.slice(vt_lds_tiles, (None, None, c, t)))
+                        a_frags = [vt_frag_tr(c, t, buf) if VTR else vt_frag_elems(fx.slice(vt_lds_tiles, (None, None, c, t)))
                                    for c in range_constexpr(DV // MFMA_M)]
                         for c in range_constexpr(DV // MFMA_M):
                             o_acc[c] = mfma(a_frags[c], p_frag, o_acc[c])
@@ -548,23 +582,27 @@ class FlashAttentionForward:
                     n_lo, n_hi = block_info.get_n_block_interior(
                         seqlen, m_block, window_left, window_right, n_block_min, n_block_max
                     ) if mask_mod is None else (n_block_max, n_block_max)
-                    for n_iter, state in range(n_block_min, n_lo, fx.Int32(1), init=init):
+                    if DB:
+                        # Prologue: the first tile into buffer 0 (the condition is uniform per CTA).
+                        if n_block_min < n_block_max:
+                            stage_kv(n_block_min * fx.Int32(TN))
+                            fx.gpu.barrier()
+
+                    def step(n, state, masked):
                         o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
-                        row_max, row_sum, o_acc = compute_one_n_block(
-                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
-                        )
+                        if_db = compute_one_n_block_db(n, n_block_min, n_block_max, q_frags, q_pos, state[0], state[1],
+                                                       o_state, masked) if DB else None
+                        return if_db if DB else compute_one_n_block(n, q_frags, q_pos, state[0], state[1], o_state,
+                                                                    masked=masked)
+
+                    for n_iter, state in range(n_block_min, n_lo, fx.Int32(1), init=init):
+                        row_max, row_sum, o_acc = step(fx.Int32(n_iter), state, True)
                         results = yield [row_max, row_sum] + o_acc
                     for n_iter, state in range(n_lo, n_hi, fx.Int32(1), init=results):
-                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
-                        row_max, row_sum, o_acc = compute_one_n_block(
-                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state, masked=False
-                        )
+                        row_max, row_sum, o_acc = step(fx.Int32(n_iter), state, False)
                         results = yield [row_max, row_sum] + o_acc
                     for n_iter, state in range(n_hi, n_block_max, fx.Int32(1), init=results):
-                        o_state = [state[2 + c] for c in range_constexpr(DV // MFMA_M)]
-                        row_max, row_sum, o_acc = compute_one_n_block(
-                            fx.Int32(n_iter), q_frags, q_pos, state[0], state[1], o_state
-                        )
+                        row_max, row_sum, o_acc = step(fx.Int32(n_iter), state, True)
                         results = yield [row_max, row_sum] + o_acc
 
                 # ---- Epilogue: normalize, store O (4 contiguous elements per group) and LSE ----
@@ -626,6 +664,9 @@ class FlashAttentionForward:
                 Q, K, V, O, LSE, CuSeqlensQ, CuSeqlensK, SeqUsedQ, SeqUsedK,
                 Aux0, Aux1, Aux2, Aux3, Sink, MaskCnt, MaskIdx, FullCnt, FullIdx, PageTable, QDescale, KDescale, VDescale, page_size, num_splits,
                 seqlen_q_static, seqlen_k_static, softmax_scale, window_left, window_right,
+                # Double buffering keeps a tile's loads in flight across the compute; hold the
+                # kernel to 256 registers (2 waves / SIMD).
+                value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": f"{NT},{NT}"} if DB else {},
             ).launch(grid=(num_m_blocks, num_heads, batch * num_splits), block=(NT, 1, 1), stream=stream)
 
         return launch
