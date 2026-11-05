@@ -47,33 +47,15 @@ __all__ = [
 # -------------------------------
 # GPU Architecture
 # -------------------------------
-ArchFamily = Literal["cdna", "rdna"]
-
-CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"})
-RDNA_ARCHS = frozenset(
-    {
-        "gfx1030",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1150",
-        "gfx1151",
-        "gfx1200",
-        "gfx1201",
-    }
-)
+# Configs are tuned for MI300 (gfx942) and MI355 (gfx950) only; other names get the
+# untuned defaults.
 
 
 @dataclass(frozen=True)
 class GpuArch:
     """GPU architecture information."""
 
-    name: str  # e.g., "gfx942", "gfx1100"
-    family: ArchFamily | None = None
-
-    @property
-    def is_rdna(self) -> bool:
-        return self.family == "rdna"
+    name: str  # e.g., "gfx942", "gfx950"
 
     @property
     def cu_count(self) -> int:
@@ -155,12 +137,7 @@ def get_arch() -> GpuArch:
     except RuntimeError:
         # No GPU available (e.g. import-only on Windows/CPU)
         return GpuArch(name="unknown")
-    if name in CDNA_ARCHS:
-        return GpuArch(name=name, family="cdna")
-    elif name in RDNA_ARCHS:
-        return GpuArch(name=name, family="rdna")
-    else:
-        return GpuArch(name=name)
+    return GpuArch(name=name)
 
 
 # -------------------------------

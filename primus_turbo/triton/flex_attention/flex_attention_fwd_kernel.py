@@ -110,21 +110,7 @@ def _fwd_configs_full(arch) -> list:
         ]
     if arch.name == "gfx942":
         return [_fwd_cfg(128, 64, 2, False, stages=1, warps=4)]
-    if arch.is_rdna:
-        # gfx1151 (Strix Halo / RDNA3.5): tuned for the Qwen3-Omni ViT prefill shape
-        # (B=1, S=3200, H=16, head_dim=72, fp16).
-        if arch.name == "gfx1151":
-            return [_fwd_cfg(128, 64, 2, False, stages=1, warps=8)]
-        # NOTE: Tests expect BLOCK_N=32 for RDNA (except gfx1100); see
-        # _get_block_size_n_triton() in test_flash_attn_triton_amd.py
-        BLOCK_N = 64 if arch.name == "gfx1100" else 32
-        return [
-            triton.Config(
-                {"BLOCK_M": 128, "BLOCK_N": BLOCK_N, "PRE_LOAD_V": False, "waves_per_eu": 6},
-                num_stages=1,
-                num_warps=8,
-            ),
-        ]
+    # Untuned default (no MI300 / MI355 GPU, e.g. an import without a GPU).
     return [_fwd_cfg(64, 64, 2, False, stages=1, warps=4)]
 
 
@@ -821,7 +807,6 @@ def attn_fwd(
     BLOCK_N: tl.constexpr,
     PRE_LOAD_V: tl.constexpr,
     USE_EXP2: tl.constexpr,
-    FORCE_MASKING: tl.constexpr,
     NUM_XCD: tl.constexpr = 1,
     HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
@@ -1274,7 +1259,7 @@ def attn_fwd(
                 block_min,  # Start of range: 0
                 block_max,  # End of range: n_full_blocks * BLOCK_N
                 0,  # n_extra_tokens (not used for full blocks)
-                APPLY_MASK=FORCE_MASKING,
+                APPLY_MASK=False,
                 IS_CAUSAL=IS_CAUSAL,
                 BLOCK_M=BLOCK_M,
                 BLOCK_DMODEL_QK=BLOCK_DMODEL_QK,
@@ -1622,11 +1607,7 @@ def attention_forward_prefill_triton_impl(
     padded_d_model_qk = max(padded_d_model_qk, 16)
     padded_d_model_v = max(padded_d_model_v, 16)
 
-    # Detect if we need to force masking for all blocks (required on some architectures)
-    arch = get_arch()
-    force_masking = arch.is_rdna
-
-    num_xcd = 1 if arch.is_rdna else 8
+    num_xcd = 8  # MI300 and MI355 both have 8 XCDs
 
     # Soundness precondition for the `tl.multiple_of` head-stride hint inside
     # `attn_fwd`: only enable it when every Q/K/V head-axis stride is a
@@ -1752,7 +1733,6 @@ def attention_forward_prefill_triton_impl(
             BLOCK_DMODEL_QK=padded_d_model_qk,
             BLOCK_DMODEL_V=padded_d_model_v,
             USE_EXP2=use_exp2,
-            FORCE_MASKING=force_masking,
             NUM_XCD=num_xcd,
             HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
             SCORE_MOD=score_mod,

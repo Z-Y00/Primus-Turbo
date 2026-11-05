@@ -213,11 +213,7 @@ def _bwd_configs_full(arch):
             # small-tile variant (helps short seqlen / wide-window cases)
             _bwd_cfg(16, 64, 64, 64, 2, 2, stages=1, warps=4),
         ]
-    elif arch.is_rdna:
-        preprocess = [_pre_cfg(32, stages=1, warps=4)]
-        noncausal = [_bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4)]
-        causal = [_bwd_cfg(32, 32, 32, 32, 2, stages=1, warps=4)]
-    else:
+    else:  # untuned default (no MI300 / MI355 GPU, e.g. an import without a GPU)
         preprocess = [_pre_cfg(64, 2, stages=2, warps=8)]
         noncausal = [_bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4)]
         causal = [_bwd_cfg(32, 128, 128, 64, 2, 1, stages=1, warps=4)]
@@ -2342,8 +2338,7 @@ def attention_backward_triton_impl(
 
     seqlen = max(max_seqlen_q, max_seqlen_k)
 
-    arch = get_arch()
-    num_xcd = 1 if arch.is_rdna else 8
+    num_xcd = 8  # MI300 and MI355 both have 8 XCDs
 
     if bwd_block_overrides:
         fixed_block_n1 = bwd_block_overrides["BLOCK_N1"]
