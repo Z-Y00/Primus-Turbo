@@ -90,6 +90,16 @@ class _Ops:
         self.copy_s16 = fx.make_copy_atom(fx.UniversalCopy16b(), elem)
         self.copy_rows = fx.make_tiled_copy_A(self.copy_s64, self.tiled_mma).get_slice(lane)
         self.copy_cols = fx.make_tiled_copy_A(self.copy_s16, self.tiled_mma).get_slice(lane)
+        # gfx950 (k_step 16): transposed views are read with the LDS transpose read
+        # (ds_read_b64_tr_b16), two per A fragment, instead of 8 single-element reads.
+        self.tr = k_step == 16
+        if self.tr:
+            self.copy_tr = fx.make_copy_atom(fx.rocdl.cdna4.LDSReadTrans16_64b(), elem)
+            self.a_coords = self.thr_mma.partition_A(fx.make_view(0, fx.make_layout((MFMA_M, k_step), (1, MFMA_M))))
+            # Each 16 lanes supply a 4-row x 16-column block (row + (lane % 16) // 4, column
+            # + 4 * (lane % 4)); lane j gets column j of the block.
+            self.tr_col = fx.Int32(16) * ((lane % fx.Int32(32)) // fx.Int32(16)) + fx.Int32(4) * (lane % fx.Int32(4))
+            self.tr_row = (lane % fx.Int32(16)) // fx.Int32(4) + fx.Int32(4) * (lane // fx.Int32(32))
 
     def row(self, j):
         """Accumulator row of element ``j`` (static per lane)."""
@@ -108,6 +118,25 @@ class _Ops:
         """A fragment of a row-major LDS tile (64-bit reads along K)."""
         frag = self.thr_mma.make_fragment_A(tile)
         fx.copy(self.copy_s64, self.copy_rows.partition_S(tile), self.copy_rows.retile(frag))
+        return frag
+
+    def a_from_cols_tr(self, ptr, dim, step, c):
+        """A fragment of the transposed view of a row-major ``[rows, dim]`` LDS tile (k =
+        rows, through ``_k16_perm``; m = columns ``32 c ..``) from two transpose reads. With the
+        bit-2/3 row order, k = 8 * (lane // 32) + 4 h + e is stored row 16 step + 4 * (lane // 32)
+        + 8 h + e, so each read covers 4 consecutive stored rows."""
+        col = fx.Int32(c * MFMA_M) + self.tr_col
+        mask = fx.Int32((1 << _swizzle_bits(dim)) - 1)
+        halves = []
+        for h in range_constexpr(2):
+            row = fx.Int32(16 * step + 8 * h) + self.tr_row
+            idx = row * fx.Int32(dim) + ((col // fx.Int32(8)) ^ (row & mask)) * fx.Int32(8) + col % fx.Int32(8)
+            src = fx.make_view(fx.add_offset(ptr, fx.make_int_tuple(idx)), fx.make_layout(4, 1))
+            dst = fx.make_rmem_tensor(fx.make_layout(4, 1), self.elem)
+            fx.copy(self.copy_tr, src, dst)
+            halves.append(Vec(dst.load()))
+        frag = fx.make_fragment_like(self.a_coords, self.elem)
+        frag.store(halves[0].shuffle(halves[1], list(range(8))))
         return frag
 
     def a_from_cols(self, tile):
@@ -408,7 +437,9 @@ class FlashAttentionBackward:
                         first = half * 16 + (KS // 2) * g
                         ds_frag = ops.b_frag(ds_all[first : first + KS // 2])
                         for c in range_constexpr(D // MFMA_M):
-                            a = ops.a_from_cols(fx.slice(kt_cols, (None, None, c, half * (MFMA_M // KS) + g)))
+                            step = half * (MFMA_M // KS) + g
+                            a = ops.a_from_cols_tr(lds.k.ptr, D, step, c) if KS == 16 else ops.a_from_cols(
+                                fx.slice(kt_cols, (None, None, c, step)))
                             dq_acc[c] = ops.mfma(a, ds_frag, dq_acc[c])
                 return dq_acc
 
@@ -603,9 +634,13 @@ class FlashAttentionBackward:
                         ds_frag = ops.b_frag(grads[(KS // 2) * g : (KS // 2) * (g + 1)])
                         step = sub * (MFMA_M // KS) + g
                         for c in range_constexpr(DV // MFMA_M):
-                            dv_acc[c] = ops.mfma(ops.a_from_cols(fx.slice(dot_cols, (None, None, c, step))), p_frag, dv_acc[c])
+                            a = ops.a_from_cols_tr(lds.do.ptr, DV, step, c) if KS == 16 else ops.a_from_cols(
+                                fx.slice(dot_cols, (None, None, c, step)))
+                            dv_acc[c] = ops.mfma(a, p_frag, dv_acc[c])
                         for c in range_constexpr(D // MFMA_M):
-                            dk_acc[c] = ops.mfma(ops.a_from_cols(fx.slice(qt_cols, (None, None, c, step))), ds_frag, dk_acc[c])
+                            a = ops.a_from_cols_tr(lds.q.ptr, D, step, c) if KS == 16 else ops.a_from_cols(
+                                fx.slice(qt_cols, (None, None, c, step)))
+                            dk_acc[c] = ops.mfma(a, ds_frag, dk_acc[c])
                 return dk_acc, dv_acc
 
             if n_block * fx.Int32(TN) < seqlen.seqlen_k:
