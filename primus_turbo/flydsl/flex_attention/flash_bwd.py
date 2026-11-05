@@ -178,17 +178,25 @@ def _lds_view(ptr, shape, stride, dim):
     return fx.make_view(ptr, layout)
 
 
-def _stage_rows(ops, tid, NT, rows, dim, row_of, lds_packs):
-    """Copy ``rows`` x ``dim`` (row ``r`` read from ``row_of(r)``) global -> LDS, storing
-    each 16-byte chunk at its swizzled place (see ``_lds_view``)."""
+def _load_rows(ops, tid, NT, rows, dim, row_of, lds_packs):
+    """Global loads of ``rows`` x ``dim`` (row ``r`` read from ``row_of(r)``) into registers,
+    with each 16-byte chunk's swizzled LDS place (see ``_lds_view``); ``_store_rows`` writes
+    them. Loading every staged tile before storing any pays one load latency per stage."""
     chunks, mask = dim // 8, (1 << _swizzle_bits(dim)) - 1
+    pending = []
     for it in range_constexpr(rows * dim // 8 // NT):
         linear = fx.Int32(it * NT) + tid
         row, chunk = linear // fx.Int32(chunks), linear % fx.Int32(chunks)
         src = fx.logical_divide(row_of(row), fx.make_layout(8, 1))
         reg = fx.make_rmem_tensor(8, ops.elem)
         fx.copy(ops.copy_g128, fx.slice(src, (None, chunk)), reg)
-        fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, row * fx.Int32(chunks) + (chunk ^ (row & fx.Int32(mask))))))
+        pending.append((reg, lds_packs, row * fx.Int32(chunks) + (chunk ^ (row & fx.Int32(mask)))))
+    return pending
+
+
+def _store_rows(ops, pending):
+    for reg, lds_packs, idx in pending:
+        fx.copy(ops.copy_s128, reg, fx.slice(lds_packs, (None, idx)))
 
 
 MIN_SPLIT_WORK = 128
@@ -371,8 +379,9 @@ class FlashAttentionBackward:
                 kv_base = n_block * fx.Int32(TN)
                 last_key = seqlen.seqlen_k - fx.Int32(1)
                 fx.gpu.barrier()
-                _stage_rows(ops, tid, NT, TN, D, lambda r: kv_side_row(k_t, _min(kv_base + r, last_key)), k_packs)
-                _stage_rows(ops, tid, NT, TN, DV, lambda r: kv_side_row(v_t, _min(kv_base + r, last_key)), v_packs)
+                pending = _load_rows(ops, tid, NT, TN, D, lambda r: kv_side_row(k_t, _min(kv_base + r, last_key)), k_packs)
+                pending += _load_rows(ops, tid, NT, TN, DV, lambda r: kv_side_row(v_t, _min(kv_base + r, last_key)), v_packs)
+                _store_rows(ops, pending)
                 fx.gpu.barrier()
                 zero16 = Vec.filled(16, 0.0, fx.Float32)
                 ds_all = []
@@ -559,8 +568,10 @@ class FlashAttentionBackward:
                 q_base = m_block * fx.Int32(TM)
                 last_q = seqlen.seqlen_q - fx.Int32(1)
                 fx.gpu.barrier()
-                _stage_rows(ops, tid, NT, TM, D, lambda r: q_side_row(q_t, _min(q_base + r, last_q), head), q_packs)
-                _stage_rows(ops, tid, NT, TM, DV, lambda r: q_side_row(do_t, _min(q_base + r, last_q), head), do_packs)
+                pending = _load_rows(ops, tid, NT, TM, D, lambda r: q_side_row(q_t, _min(q_base + r, last_q), head), q_packs)
+                pending += _load_rows(ops, tid, NT, TM, DV, lambda r: q_side_row(do_t, _min(q_base + r, last_q), head),
+                                      do_packs)
+                _store_rows(ops, pending)
                 # Every thread writes row tid % TM: duplicates store the same value.
                 r = tid % fx.Int32(TM)
                 q_r = _min(q_base + r, last_q)
