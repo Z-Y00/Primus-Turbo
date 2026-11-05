@@ -228,6 +228,13 @@ class FlashAttentionForward:
         fp8, dtype = self.fp8, self.dtype
         elem = _elem_type(dtype, self.fp8_ocp)
         KS = self.mfma_k  # reduction depth of one MFMA
+        # gfx950 16-bit (KS = 16): P . V reads its V^T A fragments with the LDS transpose
+        # read (ds_read_b64_tr_b16), two per fragment, instead of 8 single-element reads.
+        VTR = not self.fp8 and KS == 16
+        # With VTR, V's 16-byte chunks are XOR-swizzled by (stored) row: a 16-lane transpose
+        # read covers 4 consecutive rows x 32 bytes (2 chunks), 256 B apart unswizzled (one
+        # 8-bank set); chunk ^= (row & 3) << 1 puts the 4 rows on 4 different chunk pairs.
+        V_SWZ = VTR and DV // 8 >= 8
         KPL = KS // 2  # k per lane in an A / B fragment
         PACK = 16 if fp8 else 8  # elements per 128-bit global / LDS access
         out_elem = fx.BFloat16 if fp8 else elem
@@ -324,6 +331,12 @@ class FlashAttentionForward:
             copy_s1 = fx.make_copy_atom(fx.UniversalCopy8b() if fp8 else fx.UniversalCopy16b(), elem)
             copy_k = fx.make_tiled_copy_A(copy_s64, tiled_mma).get_slice(lane)
             copy_vt = fx.make_tiled_copy_A(copy_s1, tiled_mma).get_slice(lane)
+            a_coords = thr_mma.partition_A(fx.make_view(0, fx.make_layout((MFMA_M, KS), (1, MFMA_M))))
+            copy_vtr = fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), elem) if VTR else None
+            # A transpose read: each 16 lanes supply the addresses of a 4-key x 16-d block
+            # (lane: key + (lane % 16) // 4, d + 4 * (lane % 4)) and lane j gets d column j.
+            vtr_d = fx.Int32(16) * ((lane % fx.Int32(32)) // fx.Int32(16)) + fx.Int32(4) * (lane % fx.Int32(4))
+            vtr_key = (lane % fx.Int32(16)) // fx.Int32(4) + fx.Int32(8) * (lane // fx.Int32(32))
             qk_descale, v_descale = _descales(fp8, QDescale, KDescale, VDescale, batch, kv_head)
             score_scale = softmax_scale * qk_descale if fp8 else softmax_scale
 
@@ -408,9 +421,32 @@ class FlashAttentionForward:
                     reg = fx.make_rmem_tensor(PACK, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, col)), reg)
                     lds_row = _fp8_v_row(row) if KS == 16 else row
-                    pending.append((reg, v_lds_packs, lds_row * fx.Int32(DV // PACK) + col))
+                    v_col = col ^ ((lds_row & fx.Int32(3)) * fx.Int32(2)) if V_SWZ else col
+                    pending.append((reg, v_lds_packs, lds_row * fx.Int32(DV // PACK) + v_col))
                 for reg, packs, idx in pending:
                     fx.copy(copy_s128, reg, fx.slice(packs, (None, idx)))
+
+            def vt_frag_elems(tile):
+                a_frag = thr_mma.make_fragment_A(tile)
+                fx.copy(copy_s1, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
+                return a_frag
+
+            def vt_frag_tr(c, t):
+                """V^T A fragment (d block c, key step t) from two transpose reads of the
+                row-major V tile: keys 8 * (lane // 32) + {0..3}, then {4..7}."""
+                d = fx.Int32(c * MFMA_M) + vtr_d
+                halves = []
+                for h in range_constexpr(2):
+                    row = fx.Int32(t * KS + 4 * h) + vtr_key
+                    chunk = (d // fx.Int32(8)) ^ ((row & fx.Int32(3)) * fx.Int32(2)) if V_SWZ else d // fx.Int32(8)
+                    idx = row * fx.Int32(DV) + chunk * fx.Int32(8) + d % fx.Int32(8)
+                    src = fx.make_view(fx.add_offset(lds.v.ptr, fx.make_int_tuple(idx)), fx.make_layout(4, 1))
+                    dst = fx.make_rmem_tensor(fx.make_layout(4, 1), elem)
+                    fx.copy(copy_vtr, src, dst)
+                    halves.append(Vec(dst.load()))
+                frag = fx.make_fragment_like(a_coords, elem)
+                frag.store(halves[0].shuffle(halves[1], list(range(8))))
+                return frag
 
             def sparse_n_block(idx_row, j):
                 """Kernel tile of the ``j``-th entry of a block list, sparse blocks split in KV_SUB."""
@@ -452,9 +488,8 @@ class FlashAttentionForward:
                         p_frag = fx.make_fragment_like(b_coords, elem)
                         p_frag.store(_to_elem(probs[first : first + KPL], elem, dtype))
                         for c in range_constexpr(DV // MFMA_M):
-                            tile = fx.slice(vt_lds_tiles, (None, None, c, half * (MFMA_M // KS) + g))
-                            a_frag = thr_mma.make_fragment_A(tile)
-                            fx.copy(copy_s1, copy_vt.partition_S(tile), copy_vt.retile(a_frag))
+                            t = half * (MFMA_M // KS) + g
+                            a_frag = vt_frag_tr(c, t) if VTR else vt_frag_elems(fx.slice(vt_lds_tiles, (None, None, c, t)))
                             o_acc[c] = mfma(a_frag, p_frag, o_acc[c])
                 return new_max, new_sum, o_acc
 
