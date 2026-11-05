@@ -281,6 +281,17 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   - Inkling local backward is dQ-bound: per-score bias gather and the hook's scattered store.
   - A 5-matmul backward (dQ via atomics or a semaphore-ordered reduction while staying
     deterministic) instead of separate dQ and dK/dV kernels recomputing S and P.
+- FlyDSL on gfx950 (MI355X; campaign `agent/workspace/flex_attention_flydsl_gfx950_20261104/`):
+  both kernels use the 32x32x16 MFMA there (gfx950 rounds 2-3). FlyDSL time vs Triton:
+  dense forward 1.63-2.01x, Inkling forward 0.85-1.23x, dense backward 1.06-2.28x, Inkling
+  backward 1.37-2.07x. Open:
+  - Forward P . V: read V^T with gfx950's LDS transpose read (`ds_read_b64_tr_b16`) instead
+    of one 16-bit element per read.
+  - Backward register footprint: dQ 336 and dK/dV 464 registers per lane, one wave per SIMD
+    (gfx950's 160 KB LDS no longer limits occupancy; registers do). dK/dV is ~2/3 of the
+    backward.
+  - Forward VALU (510 per unmasked 64-key tile vs 32 MFMA; ~180 needed): exp2 range fix-ups,
+    scale and max subtraction as separate ops, compare + select row max.
 - FlyDSL features: varlen block-sparse lists, split-KV combined with
   block sparsity or sinks, native e5m2 (needs MFMA support in FlyDSL), fp8 backward.
 - Validation: the turbo-API FlyDSL tests and benchmarks on gfx950 (only the kernel
