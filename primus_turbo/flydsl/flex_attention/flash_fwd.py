@@ -148,6 +148,7 @@ class FlashAttentionForward:
         paged_kv: bool = False,
         split_kv: bool = False,
         fp8_ocp: bool | None = None,
+        mfma_k: int | None = None,
     ):
         if dtype not in ("bf16", "fp16") + FP8_DTYPES:
             raise ValueError(f"dtype must be bf16, fp16, fp8_e4m3 or fp8_e5m2, got {dtype}")
@@ -167,6 +168,11 @@ class FlashAttentionForward:
                 raise NotImplementedError("paged KV with fp8 e5m2 (no e5m2 MFMA in FlyDSL 0.3.4.1)")
             dtype = "bf16"
         self.fp8 = dtype in FP8_DTYPES
+        # MFMA reduction depth: 32x32x16 for fp8, and for 16-bit inputs on gfx950 (twice the
+        # K of gfx942's 32x32x8); ``mfma_k`` overrides for 16-bit inputs.
+        self.mfma_k = 16 if self.fp8 else (mfma_k or (16 if _arch_has_ocp_fp8() else 8))
+        if self.mfma_k not in (8, 16) or head_dim % self.mfma_k:
+            raise ValueError(f"mfma_k must be 8 or 16 and divide head_dim, got {self.mfma_k}")
         if tile_n % MFMA_M:
             raise ValueError(f"tile_n must be a multiple of {MFMA_M}")
         if is_causal and is_local:
@@ -221,7 +227,7 @@ class FlashAttentionForward:
         Q_PER_KV = self.qhead_per_kvhead
         fp8, dtype = self.fp8, self.dtype
         elem = _elem_type(dtype, self.fp8_ocp)
-        KS = _k_step(self.dtype)  # reduction depth of one MFMA
+        KS = self.mfma_k  # reduction depth of one MFMA
         KPL = KS // 2  # k per lane in an A / B fragment
         PACK = 16 if fp8 else 8  # elements per 128-bit global / LDS access
         out_elem = fx.BFloat16 if fp8 else elem
@@ -305,13 +311,15 @@ class FlashAttentionForward:
                 return c_frag.load()
 
             copy_g128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem)
-            copy_g64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), elem)
+            # A / B fragments are KS / 2 elements per lane: 64 bits, or 128 for 16-bit x16.
+            frag128 = KPL * (8 if fp8 else 16) == 128
+            copy_q = fx.make_copy_atom(fx.rocdl.BufferCopy128b() if frag128 else fx.rocdl.BufferCopy64b(), elem)
             # Four output elements per store: 16-bit O, or the fp32 split-KV partial O.
             copy_o = fx.make_copy_atom(
                 fx.rocdl.BufferCopy128b() if split_kv else fx.rocdl.BufferCopy64b(), o_elem
             )
             copy_s128 = fx.make_copy_atom(fx.UniversalCopy128b(), elem)
-            copy_s64 = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
+            copy_s64 = fx.make_copy_atom(fx.UniversalCopy128b() if frag128 else fx.UniversalCopy64b(), elem)
             # V^T reads are one element each (strided by DV in LDS).
             copy_s1 = fx.make_copy_atom(fx.UniversalCopy8b() if fp8 else fx.UniversalCopy16b(), elem)
             copy_k = fx.make_tiled_copy_A(copy_s64, tiled_mma).get_slice(lane)
@@ -396,7 +404,7 @@ class FlashAttentionForward:
                     src = fx.logical_divide(kv_side_row(v_t, key), fx.make_layout(PACK, 1))
                     reg = fx.make_rmem_tensor(PACK, elem)
                     fx.copy(copy_g128, fx.slice(src, (None, col)), reg)
-                    lds_row = _fp8_v_row(row) if fp8 else row
+                    lds_row = _fp8_v_row(row) if KS == 16 else row
                     fx.copy(copy_s128, reg, fx.slice(v_lds_packs, (None, lds_row * fx.Int32(DV // PACK) + col)))
 
             def sparse_n_block(idx_row, j):
@@ -432,8 +440,9 @@ class FlashAttentionForward:
                 o_acc = [Vec(o) * rescale_vec for o in o_acc]
                 for half in range_constexpr(TN // MFMA_M):
                     for g in range_constexpr(MFMA_M // KS):
-                        # Accumulator groups of 4 in order; for fp8 two groups make one
-                        # fragment, matching V's permuted rows (``_fp8_v_row``).
+                        # Accumulator groups of 4 in order; with KS = 16 (fp8, or 16-bit on
+                        # gfx950) two groups make one fragment, matching V's permuted rows
+                        # (``_fp8_v_row``).
                         first = half * 16 + KPL * g
                         p_frag = fx.make_fragment_like(b_coords, elem)
                         p_frag.store(_to_elem(probs[first : first + KPL], elem, dtype))
@@ -460,7 +469,7 @@ class FlashAttentionForward:
                 q_frags = []
                 for ks in range_constexpr(D // KS):
                     reg = fx.make_rmem_tensor(KPL, elem)
-                    fx.copy(copy_g64, fx.slice(q_packs, (None, (fx.Int32(ks * KS) + q_k0) // fx.Int32(KPL))), reg)
+                    fx.copy(copy_q, fx.slice(q_packs, (None, (fx.Int32(ks * KS) + q_k0) // fx.Int32(KPL))), reg)
                     frag = fx.make_fragment_like(b_coords, elem)
                     frag.store(Vec(reg.load()))
                     q_frags.append(frag)
