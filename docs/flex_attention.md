@@ -285,8 +285,9 @@ kernel also carries a `score_mod` with aux tensors and a `score_grad_hook`.
   both kernels use the 32x32x16 MFMA there (gfx950 rounds 2-3). FlyDSL time vs Triton:
   dense forward 1.63-2.01x, Inkling forward 0.85-1.23x, dense backward 1.06-2.28x, Inkling
   backward 1.37-2.07x. Open:
-  - Forward P . V: read V^T with gfx950's LDS transpose read (`ds_read_b64_tr_b16`) instead
-    of one 16-bit element per read.
+  - Done (gfx950 rounds 7-8): forward K/V staging loads batched before the LDS stores, and
+    P . V reads V^T with `ds_read_b64_tr_b16` from a V tile swizzled by (row & 3) << 1
+    (forward +10% geomean; causal 8K 1.79 -> 1.55 ms, 1.50x Triton).
   - Backward register footprint: dQ 336 and dK/dV 464 registers per lane, one wave per SIMD
     (gfx950's 160 KB LDS no longer limits occupancy; registers do). dK/dV is ~2/3 of the
     backward.
