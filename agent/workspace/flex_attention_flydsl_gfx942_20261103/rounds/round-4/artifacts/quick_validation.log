@@ -1,0 +1,28 @@
+a17-40 gpu7 use=0 procs=0
+TEST_RESULT
+==========================
+../../opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491
+  /opt/venv/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+37 passed, 1 warning in 230.97s (0:03:50)
+
+label=causal_s8k | Check=PASS | Forward TFLOPS=185 | Forward TFLOPS_stddev=4.131 | Backward TFLOPS=59.64 | Backward TFLOPS_stddev=0.4695 | Forward Time (ms)=2.972 | Backward Time (ms)=23.05 | out_err=0.0005841 | dq_err=0.001351 | dk_err=0.001244 | dv_err=0.001263
+label=window1k_s8k | Check=PASS | Forward TFLOPS=135.8 | Forward TFLOPS_stddev=5.968 | Backward TFLOPS=76.64 | Backward TFLOPS_stddev=0.9733 | Forward Time (ms)=0.9492 | Backward Time (ms)=4.203 | out_err=0.001168 | dq_err=0.0009124 | dk_err=0.002283 | dv_err=0.0005682
+label=band1k_s8k | Check=PASS | Forward TFLOPS=183.7 | Forward TFLOPS_stddev=4.586 | Backward TFLOPS=87.49 | Backward TFLOPS_stddev=0.6301 | Forward Time (ms)=1.402 | Backward Time (ms)=7.361 | out_err=0.001953 | dq_err=0.001953 | dk_err=0.003906 | dv_err=0.001953
+label=inkling_global_5doc | Check=PASS | Forward TFLOPS=72.66 | Forward TFLOPS_stddev=1.217 | Backward TFLOPS=16.73 | Backward TFLOPS_stddev=0.158 | Forward Time (ms)=0.9758 | Backward Time (ms)=10.59 | out_err=0.0002948 | dq_err=0.0001221 | dk_err=0.0004883 | dv_err=0.001163 | daux_err=5.218e-06
+label=inkling_small_local_5doc | Check=PASS | Forward TFLOPS=31.69 | Forward TFLOPS_stddev=2.756 | Backward TFLOPS=16.39 | Backward TFLOPS_stddev=0.1901 | Forward Time (ms)=0.4575 | Backward Time (ms)=2.212 | out_err=0.0003125 | dq_err=0.0002441 | dk_err=0.0009766 | dv_err=0.0004735 | daux_err=5.024e-06
+GEOMEAN over 5/5 PASS: Forward TFLOPS 101.216 | Backward TFLOPS 40.551
+CSV_BEGIN
+label,Check,Forward TFLOPS,Forward TFLOPS_stddev,Backward TFLOPS,Backward TFLOPS_stddev,Forward Time (ms),Backward Time (ms),Triton Forward Time (ms),Triton Backward Time (ms),out_err,dq_err,dk_err,dv_err,daux_err
+causal_s8k,PASS,185.00340979865115,4.131144423496367,59.64128043005954,0.46952150365688944,2.97196102142334,23.04707908630371,,,0.0005841121495327102,0.0013513513513513514,0.0012437810945273632,0.0012626262626262627,
+window1k_s8k,PASS,135.7511244654282,5.967792182026321,76.63877700962188,0.9733014108783906,0.9492179751396179,4.2034010887146,,,0.0011682242990654205,0.0009124087591240876,0.00228310502283105,0.0005681818181818182,
+band1k_s8k,PASS,183.6744118653819,4.58623671623151,87.48722958324552,0.630097189395845,1.4023760557174683,7.360519886016846,,,0.001953125,0.001953125,0.00390625,0.001953125,
+inkling_global_5doc,PASS,72.66049859996369,1.2171776111934134,16.731746667810707,0.15798286398765699,0.9757779836654663,10.593710899353027,,,0.00029481132075471697,0.0001220703125,0.00048828125,0.0011627906976744186,5.218462806979774e-06
+inkling_small_local_5doc,PASS,31.693982071632668,2.756234600234871,16.38885070963882,0.1901010601984405,0.45752400159835815,2.2119851112365723,,,0.0003125,0.000244140625,0.0009765625,0.0004734848484848485,5.02448682560594e-06
+CSV_END
+12,12,"Agent 9",2,2087,2087,524288,711,"kernel_0",256,32768,0,100,132,112,"SQ_INSTS_LDS",89456640.000000,30458542403234,30458545126022
+12,12,"Agent 9",2,2087,2087,524288,711,"kernel_0",256,32768,0,100,132,112,"SQ_INSTS_VALU",492240896.000000,30458542403234,30458545126022
+12,12,"Agent 9",2,2087,2087,524288,711,"kernel_0",256,32768,0,100,132,112,"SQ_INSTS_VMEM_RD",4390912.000000,30458542403234,30458545126022
+12,12,"Agent 9",2,2087,2087,524288,711,"kernel_0",256,32768,0,100,132,112,"SQ_LDS_BANK_CONFLICT",68157440.000000,30458542403234,30458545126022

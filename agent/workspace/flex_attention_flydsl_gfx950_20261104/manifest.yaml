@@ -1,0 +1,21 @@
+target_op: flex_attention
+target_backend: FLYDSL
+target_lang: FLYDSL
+target_gpu: gfx950
+execution_mode: repo
+project_skill: primus-turbo-develop
+performance_target: "match the TRITON backend: FlyDSL forward and backward time <= Triton's on every target shape"
+primary_metric: "Forward TFLOPS, Backward TFLOPS (tracked separately; accept needs one to improve and neither to regress >= 5% on any shape)"
+target_shapes: [causal_s4k, causal_s8k, window1k_s8k, band1k_s8k, prefix_lm_s8k, inkling_global_1doc, inkling_global_5doc, inkling_local_1doc, inkling_local_5doc, inkling_small_global_1doc, inkling_small_global_5doc, inkling_small_local_1doc, inkling_small_local_5doc]
+kernel_source:
+  - primus_turbo/flydsl/flex_attention/flash_fwd.py
+  - primus_turbo/flydsl/flex_attention/flash_bwd.py
+test_command: "pytest -q tests/pytorch/ops/test_flex_attention_flydsl.py tests/pytorch/ops/test_flex_attention_flydsl_paged.py"
+benchmark_command: "python benchmark/ops/training/bench_flex_attention_turbo.py --backend FLYDSL"
+quick_command: "python <campaign_dir>/quick_test_bench.py"
+representative_shapes: []  # chosen after BASELINE
+run_environment: "cv350-tnndh2-b05-2 (MI355X, gfx950), 8 GPUs, rocm/primus:v26.8, flydsl 0.3.4.1 (wheel in ~/flexfly/wh), idle check + cgroup guard; per-shape same-GPU comparisons"
+git_commit: true
+git_branch: none  # commit on feat/attention/flydsl-flex
+max_iterations: null
+created: 2026-11-04 16:20

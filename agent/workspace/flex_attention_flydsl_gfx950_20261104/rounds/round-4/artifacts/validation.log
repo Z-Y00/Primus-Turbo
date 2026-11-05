@@ -1,0 +1,153 @@
+
+ $$$$$$\  $$$$$$\  $$$$$$\       $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
+$$  __$$\ \_$$  _|$$  __$$\     $$  __$$\ $$ |  $$ |\__$$  __|$$ |  $$ |
+$$ /  $$ |  $$ |  $$ /  \__|$$\ $$ /  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$$$$$$$ |  $$ |  $$ |$$$$\ \__|$$$$$$$$ |$$ |  $$ |   $$ |   $$$$$$$$ |
+$$  __$$ |  $$ |  $$ |\_$$ |    $$  __$$ |$$ |  $$ |   $$ |   $$  __$$ |
+$$ |  $$ |  $$ |  $$ |  $$ |$$\ $$ |  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$ |  $$ |$$$$$$\ \$$$$$$  |\__|$$ |  $$ |\$$$$$$  |   $$ |   $$ |  $$ |
+\__|  \__|\______| \______/     \__|  \__| \______/    \__|   \__|  \__|
+
+ is protected by Conductor SUT Authentication - 20260513.01-gf7373bc.
+
+Reminder: An SSH key is required to access this system. 
+To manage your Conductor SSH keys please visit https://conductor.amd.com/user/dashboard/key-management
+
+You will be denied access to this system if:
+  • You did not provide a valid SSH key
+  • You do not have an active reservation in Conductor
+  • You are not in the required security groups (ex: mi300_doc.4erminus)
+
+____________   _______________________________________^__
+ ___   ___ |||  ___   ___   ___    ___ ___  |   __  ,----\
+|   | |   |||| |   | |   | |   |  |   |   | |  |  | |_____\
+|___| |___|||| |___| |___| |___|  | O | O | |  |  |        \
+           |||                    |___|___| |  |__|         )
+___________|||______________________________|______________/
+           |||                                        /--------
+-----------'''---------------------------------------'
+
+For other help resources please visit https://conductor.amd.com/docs
+
+Checking authorization now...
+cv350-tnndh2-b05-2.tnn.dcgpu GPUs 0,1,2,3,4,5,6,7 idle
+flydsl 0.3.4.1
+[     0s] start tests0 on GPU 0
+[     0s] start tests1 on GPU 1
+[     0s] start tests2 on GPU 2
+[     0s] start tests3 on GPU 3
+[     0s] start tests4 on GPU 4
+[     0s] start tests5 on GPU 5
+[     0s] start tests6 on GPU 6
+[     0s] start tests7 on GPU 7
+[    18s] done  tests1 (exit 0)
+[    20s] done  tests3 (exit 0)
+[    21s] done  tests4 (exit 0)
+[    21s] done  tests5 (exit 0)
+[    22s] done  tests2 (exit 0)
+[    28s] done  tests0 (exit 0)
+[    57s] done  tests6 (exit 0)
+[    65s] done  tests7 (exit 0)
+[    66s] start shape_causal_s4k on GPU 1
+[    66s] start shape_causal_s8k on GPU 3
+[    66s] start shape_window1k_s8k on GPU 4
+[    66s] start shape_band1k_s8k on GPU 5
+[    66s] start shape_prefix_lm_s8k on GPU 2
+[    66s] start shape_inkling_global_1doc on GPU 0
+[    66s] start shape_inkling_global_5doc on GPU 6
+[    66s] start shape_inkling_local_1doc on GPU 7
+[   102s] done  shape_band1k_s8k (exit 0)
+[   103s] start shape_inkling_local_5doc on GPU 5
+[   106s] done  shape_prefix_lm_s8k (exit 0)
+[   107s] start shape_inkling_small_global_1doc on GPU 2
+[   113s] done  shape_causal_s4k (exit 0)
+[   114s] start shape_inkling_small_global_5doc on GPU 1
+[   116s] done  shape_causal_s8k (exit 0)
+[   117s] start shape_inkling_small_local_1doc on GPU 3
+[   121s] done  shape_window1k_s8k (exit 0)
+[   122s] start shape_inkling_small_local_5doc on GPU 4
+[   139s] done  shape_inkling_global_5doc (exit 0)
+[   140s] done  shape_inkling_global_1doc (exit 0)
+[   144s] done  shape_inkling_local_1doc (exit 0)
+[   177s] done  shape_inkling_small_global_1doc (exit 0)
+[   180s] done  shape_inkling_local_5doc (exit 0)
+[   182s] done  shape_inkling_small_global_5doc (exit 0)
+[   190s] done  shape_inkling_small_local_1doc (exit 0)
+[   194s] done  shape_inkling_small_local_5doc (exit 0)
+all jobs finished in 195s
+== tests1 exit=0: 5 passed in 16.05s
+== tests3 exit=0: 5 passed in 17.10s
+== tests4 exit=0: 5 passed in 17.49s
+== tests5 exit=0: 4 passed in 17.80s
+== tests2 exit=0: 5 passed in 18.63s
+== tests0 exit=0: 5 passed in 24.44s
+== tests6 exit=0: 4 passed in 53.91s
+== tests7 exit=0: 4 passed in 62.55s (0:01:02)
+== shape_band1k_s8k exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 284.237 | Backward TFLOPS 170.213 | GEOMEAN over 1/1 PASS: Forward TFLOPS 309.601 | Backward TFLOPS 169.707
+== shape_prefix_lm_s8k exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 255.025 | Backward TFLOPS 117.645 | GEOMEAN over 1/1 PASS: Forward TFLOPS 277.168 | Backward TFLOPS 116.880
+== shape_causal_s4k exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 237.738 | Backward TFLOPS 99.374 | GEOMEAN over 1/1 PASS: Forward TFLOPS 221.546 | Backward TFLOPS 99.294
+== shape_causal_s8k exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 289.521 | Backward TFLOPS 114.170 | GEOMEAN over 1/1 PASS: Forward TFLOPS 287.630 | Backward TFLOPS 114.523
+== shape_window1k_s8k exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 226.921 | Backward TFLOPS 141.036 | GEOMEAN over 1/1 PASS: Forward TFLOPS 238.337 | Backward TFLOPS 141.288
+== shape_inkling_global_5doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 99.165 | Backward TFLOPS 38.645 | GEOMEAN over 1/1 PASS: Forward TFLOPS 116.964 | Backward TFLOPS 38.866
+== shape_inkling_global_1doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 133.834 | Backward TFLOPS 64.782 | GEOMEAN over 1/1 PASS: Forward TFLOPS 174.269 | Backward TFLOPS 64.281
+== shape_inkling_local_1doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 71.060 | Backward TFLOPS 44.362 | GEOMEAN over 1/1 PASS: Forward TFLOPS 72.623 | Backward TFLOPS 43.991
+== shape_inkling_small_global_1doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 118.617 | Backward TFLOPS 58.139 | GEOMEAN over 1/1 PASS: Forward TFLOPS 150.255 | Backward TFLOPS 57.998
+== shape_inkling_local_5doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 56.882 | Backward TFLOPS 28.385 | GEOMEAN over 1/1 PASS: Forward TFLOPS 57.798 | Backward TFLOPS 28.606
+== shape_inkling_small_global_5doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 62.512 | Backward TFLOPS 35.421 | GEOMEAN over 1/1 PASS: Forward TFLOPS 78.400 | Backward TFLOPS 35.666
+== shape_inkling_small_local_1doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 51.573 | Backward TFLOPS 36.513 | GEOMEAN over 1/1 PASS: Forward TFLOPS 53.592 | Backward TFLOPS 37.425
+== shape_inkling_small_local_5doc exit=0: GEOMEAN over 1/1 PASS: Forward TFLOPS 39.933 | Backward TFLOPS 25.407 | GEOMEAN over 1/1 PASS: Forward TFLOPS 41.463 | Backward TFLOPS 25.444
+TESTS: 37 passed, 0 failed
+REF_CSV_BEGIN
+label,Check,Forward TFLOPS,Forward TFLOPS_stddev,Backward TFLOPS,Backward TFLOPS_stddev,Forward Time (ms),Backward Time (ms),Triton Forward Time (ms),Triton Backward Time (ms),out_err,dq_err,dk_err,dv_err,daux_err
+causal_s4k,PASS,237.73805147938214,6.86967010653501,99.37429339334291,1.2891167404367723,1.1565040349960327,6.916904926300049,,,0.0005841121495327102,0.0007309941520467836,0.002232142857142857,0.000992063492063492,
+causal_s8k,PASS,289.52066881318933,14.304955847217972,114.16955214833143,1.8322483236017382,1.8990800380706787,12.039613723754883,,,0.0005841121495327102,0.0013812154696132596,0.0026041666666666665,0.0009541984732824427,
+window1k_s8k,PASS,226.92075204411069,9.092210802898387,141.03567123975736,0.5467062269776279,0.5678520202636719,2.284127950668335,,,0.0011682242990654205,0.001256281407035176,0.002403846153846154,0.0014970059880239522,
+band1k_s8k,PASS,284.2365870287636,9.14190365282367,170.2134835847513,2.8242624555393347,0.9062190055847168,3.7831990718841553,,,0.001953125,0.001953125,0.00390625,0.001953125,
+prefix_lm_s8k,PASS,255.0250963659101,3.381233665372273,117.64472710357654,0.9648941129352306,2.189605951309204,11.86633014678955,,,0.001953125,0.001953125,0.003401360544217687,0.0030303030303030303,
+inkling_global_1doc,PASS,133.83398727324922,1.8241975374343298,64.78221911020185,0.9820509894858718,2.0541229248046875,10.609063148498535,,,0.00033068783068783067,0.0001220703125,0.0009765625,0.00043706293706293706,1.8051481745990047e-06
+inkling_global_5doc,PASS,99.16502657119855,4.313075795501029,38.64465430535028,0.8885290281707863,0.7149749994277954,4.586696147918701,,,0.00029481132075471697,0.0001220703125,0.0009765625,0.0006443298969072165,3.013934427481849e-06
+inkling_local_1doc,PASS,71.06007684488814,3.3502844737656763,44.36235926190147,0.3820983194269249,0.46845000982284546,1.8759199380874634,,,0.00033068783068783067,0.0001220703125,0.00048828125,0.0005813953488372093,9.664260731377568e-07
+inkling_local_5doc,PASS,56.8823366257719,3.306705119435486,28.38461596714828,2.047509149068136,0.5098509788513184,2.5543339252471924,,,0.00022644927536231884,0.0001220703125,0.0009765625,0.0007530120481927711,6.227925288283036e-06
+inkling_small_global_1doc,PASS,118.61657560140422,2.6223623577631034,58.13946031821404,1.0163659653431831,1.1588239669799805,5.910604000091553,,,0.00017959770114942528,0.0001220703125,0.00048828125,0.0020408163265306124,6.600802714827014e-07
+inkling_small_global_5doc,PASS,62.512468277928775,2.3163524660874817,35.42060219305585,0.2903731399676753,0.5670909881591797,2.5020930767059326,,,0.000625,0.0001220703125,0.0009765625,0.0009124087591240876,6.372162372060417e-06
+inkling_small_local_1doc,PASS,51.57314733074794,4.3732014217457476,36.5134286882064,0.42750135083531293,0.3227269947528839,1.139583945274353,,,0.00017959770114942528,0.0001220703125,0.000244140625,0.0002840909090909091,7.961592699176172e-07
+inkling_small_local_5doc,PASS,39.93302006287139,2.2075153644127017,25.40729617757015,0.29011832494072176,0.3631269931793213,1.4268300533294678,,,0.0003125,0.000244140625,0.00048828125,0.00045955882352941176,3.907685903179686e-06
+REF_CSV_END
+BENCH_CSV_BEGIN
+label,Check,Forward TFLOPS,Forward TFLOPS_stddev,Backward TFLOPS,Backward TFLOPS_stddev,Forward Time (ms),Backward Time (ms),Triton Forward Time (ms),Triton Backward Time (ms),out_err,dq_err,dk_err,dv_err,daux_err
+causal_s4k,PASS,221.54636147899635,3.1367582080978726,99.29446518854203,0.3408714893438386,1.2410269975662231,6.922465801239014,0.6146529912948608,2.997143030166626,0.0011682242990654205,0.0012755102040816326,0.004219409282700422,0.0011574074074074073,
+causal_s8k,PASS,287.6303289423314,2.853815536437863,114.52304235117577,1.154140745013712,1.9115610122680664,12.00245189666748,0.9982209801673889,5.693359851837158,0.0005841121495327102,0.0011210762331838565,0.002380952380952381,0.0013227513227513227,
+window1k_s8k,PASS,238.33748927456807,5.257172681143959,141.2880490953534,0.6262801630065952,0.5406510233879089,2.28004789352417,0.3543280065059662,1.4492310285568237,0.0011682242990654205,0.0011574074074074073,0.003816793893129771,0.002617801047120419,
+band1k_s8k,PASS,309.6006190341733,7.845810785721105,169.70743781271207,3.2041046988061783,0.8319770097732544,3.794480085372925,0.5450109839439392,3.6491971015930176,0.001953125,0.001953125,0.00390625,0.00390625,
+prefix_lm_s8k,PASS,277.16753990204006,3.7633902048881347,116.87998984708835,1.0088614695353408,2.0146820545196533,11.943970680236816,1.0767029523849487,7.182830810546875,0.001953125,0.001953125,0.0029585798816568047,0.0033333333333333335,
+inkling_global_1doc,PASS,174.26890614987954,5.549010992265737,64.28053273628038,1.8029198087715905,1.5775129795074463,10.691863059997559,1.8555580377578735,5.544156074523926,0.00033068783068783067,0.000244140625,0.00048828125,0.0014285714285714286,9.740194198976702e-07
+inkling_global_5doc,PASS,116.9641625188099,7.28343156385205,38.86598721615802,0.310284438174949,0.6061729788780212,4.56057596206665,0.6869339942932129,2.397289991378784,0.00029481132075471697,0.000244140625,0.001953125,0.001091703056768559,3.751737052238485e-06
+inkling_local_1doc,PASS,72.62291876491058,7.183695088256681,43.990905087066146,0.2236481818144353,0.4583689868450165,1.891759991645813,0.4455289840698242,1.2191059589385986,0.00033068783068783067,0.000244140625,0.00048828125,0.0010504201680672268,1.3269345242184526e-06
+inkling_local_5doc,PASS,57.798311494034174,5.43793630585484,28.60591716407053,0.390568666724451,0.5017709732055664,2.5345730781555176,0.443928986787796,1.3881889581680298,0.00022644927536231884,0.0001220703125,0.00048828125,0.0003676470588235294,1.2661380762852378e-05
+inkling_small_global_1doc,PASS,150.25456441627134,7.76087090533102,57.998150059240544,0.149972517879994,0.9148190021514893,5.925004959106445,1.2453069686889648,2.84909987449646,0.00017959770114942528,0.0001220703125,0.000244140625,0.0010504201680672268,6.158299827337985e-07
+inkling_small_global_5doc,PASS,78.40045938922749,6.363296685432907,35.66579448542235,0.1531815695055722,0.4521690011024475,2.484891891479492,0.5009300112724304,1.647354006767273,0.000625,0.000244140625,0.0009765625,0.0017006802721088435,3.2161270917916816e-05
+inkling_small_local_1doc,PASS,53.592452835981845,5.759538572521069,37.425092268200835,2.005616045150746,0.3105669915676117,1.1118240356445312,0.2804049849510193,0.8278579711914062,0.00017959770114942528,6.103515625e-05,0.00048828125,0.0005434782608695652,9.554262249134594e-07
+inkling_small_local_5doc,PASS,41.46307636061193,4.102799287196886,25.443674597716956,1.0071000676345818,0.34972700476646423,1.4247900247573853,0.2890070080757141,0.9465399980545044,0.0003125,0.0001220703125,0.00048828125,0.0005274261603375527,3.512920283978386e-06
+BENCH_CSV_END
+GPU_MAP
+tests0 GPU 0
+tests1 GPU 1
+tests2 GPU 2
+tests3 GPU 3
+tests4 GPU 4
+tests5 GPU 5
+tests6 GPU 6
+tests7 GPU 7
+shape_causal_s4k GPU 1
+shape_causal_s8k GPU 3
+shape_window1k_s8k GPU 4
+shape_band1k_s8k GPU 5
+shape_prefix_lm_s8k GPU 2
+shape_inkling_global_1doc GPU 0
+shape_inkling_global_5doc GPU 6
+shape_inkling_local_1doc GPU 7
+shape_inkling_local_5doc GPU 5
+shape_inkling_small_global_1doc GPU 2
+shape_inkling_small_global_5doc GPU 1
+shape_inkling_small_local_1doc GPU 3
+shape_inkling_small_local_5doc GPU 4

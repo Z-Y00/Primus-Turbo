@@ -1,0 +1,21 @@
+# Performance trend (append-only)
+
+Forward and backward are separate accept metrics (user choice), so `Combined Step TFLOPS` uses the rule's formula `6 / (2/Fwd + 4/Bwd)` per shape, geomean, for information only.
+
+| Round | Status | Description | Fwd Avg TFLOPS | Fwd Peak TFLOPS | Bwd Avg TFLOPS | Bwd Peak TFLOPS | Combined Step TFLOPS | vs Baseline | Key Finding |
+|-------|--------|-------------|----------------|-----------------|----------------|-----------------|----------------------|-------------|-------------|
+| 1 | BASELINE | FlyDSL fwd/bwd at commit 234b86c1 (13 shapes, full) | 66.725 | 130.326 | 32.622 | 87.042 | 39.088 | — | dense fwd 1.9-2.8x Triton time, Inkling fwd ~1x; bwd 1.5-3.2x |
+| 2 | ROLLBACK | V staged transposed in LDS (fwd), quick set | 65.842 | 113.011 | 40.601 | 87.101 | 46.142 | quick-set vs round 1: step -4.916%, fwd -17.494%, bwd -1.178% | VGPR+AGPR 200->264 halved occupancy; K-read bank conflicts dominate |
+| 3 | ROLLBACK | K LDS rows padded 16 B (fwd), quick set | 80.647 | 146.825 | 41.168 | 86.582 | 48.840 | quick-set vs round 1: step +0.643%, fwd +1.058%, bwd +0.203% | conflicts 1022M->68M but LDS 33 KB -> 1 CTA/CU; Inkling fwd -11..-13% |
+| 4 | ACCEPTED | XOR-swizzled K LDS tile (fwd), quick set | 101.216 | 185.003 | 40.551 | 87.487 | 50.295 | quick-set vs round 1: step +3.641%, fwd +26.832%, bwd -1.299% | conflicts 1022M->68M at 32 KB LDS, 232 regs |
+| 5 | ACCEPTED | XOR-swizzled backward LDS tiles (dQ, dK/dV), quick set | 101.481 | 185.061 | 54.029 | 124.763 | 63.439 | quick-set vs round 1: step +30.727%, fwd +27.165%, bwd +31.505% | dQ 6.5->4.5 ms, dK/dV 15.7->10.0 ms (causal 8K) |
+| 6 | ROLLBACK | transposed V in LDS, swizzled (fwd), quick set | 82.351 | 154.238 | 54.240 | 124.864 | 60.684 | quick-set vs round 1: step +25.050%, fwd +3.193%, bwd +32.019% | 288 regs (>256) even at 32 KB LDS: occupancy halved |
+| 7 | ROLLBACK | waves_per_eu=2 hint on fwd (neutral), quick set | 100.630 | 183.348 | 53.659 | 124.486 | 62.981 | quick-set vs round 1: step +29.784%, fwd +26.098%, bwd +30.604% | 232 regs unchanged; hint alone does nothing |
+| 8 | ROLLBACK | transposed V under waves_per_eu=2 (fwd), quick set, a17-31 | 97.603 | 182.317 | 54.158 | 125.591 | - | vs round 5 re-measured on a17-31: fwd -2.991%, bwd -0.154% | 256 regs, LDS insts -42%, still -3% fwd: LDS issue not the limit |
+| 9 | ACCEPTED | dK/dV GQA-group split when the grid is short (full set, same-GPU ref) | 84.210 | 187.802 | 47.156 | 122.788 | - | vs round 5 same GPU: fwd +0.919%, bwd +15.211% | Inkling global bwd +39..57%; grids 128 CTAs -> split 4/8 |
+| 10 | ACCEPTED | work-aware dK/dV split heuristic | 83.912 | 183.730 | 48.593 | 120.849 | - | vs previous accepted (same GPU): fwd +0.633%, bwd +2.957% | Causal and prefix 8K carry ~512 head-iterations per unsplit CTA, so 4-way splitting still leaves 128 per CTA and doubles the CTAs per CU (1024 for 304 CUs), hiding the causal tail imbalance; window / band / Inkling keep their splits and are unchanged (within noise; inkling_small_local_1doc +5 |
+| 11 | ACCEPTED | rel-bias mods index from SeqlenInfo (no per-score cu_seqlens loads) | 84.434 | 185.751 | 51.062 | 121.036 | - | vs previous accepted (same GPU): fwd +2.768%, bwd +5.378% | Inkling backward +4 |
+| 12 | ACCEPTED | unmasked interior KV tiles in the forward | 86.612 | 193.801 | 50.905 | 122.051 | - | vs previous accepted (same GPU): fwd +3.068%, bwd -0.376% | Causal / window forward +6-9%: the interior tiles drop the mask VALU; each causal query block still has 2-3 masked diagonal tiles |
+| 13 | ROLLED BACK | row max via v_max_f32 (fx.maxnumf) | 86.511 | 194.100 | 50.745 | 120.623 | - | vs previous accepted (same GPU): fwd +0.429%, bwd +0.560% | Interior loop VALU 661 -> 612, but the masked loop gained 65 canonicalizing v_mul_f32 (IEEE-mode maxnum quieting) and the forward did not speed up: geomean +0 |
+| 14 | ROLLED BACK | pairwise row reductions in the online softmax | 86.778 | 195.842 | 51.121 | 121.956 | - | vs previous accepted (same GPU): fwd +0.844%, bwd -0.036% | Forward geomean +0 |
+| 16 | ACCEPTED | issue all of a backward stage's global loads before its LDS stores (dQ, dK/dV) | 91.434 | 219.731 | 55.286 | 129.639 | - | vs previous accepted (same GPU): fwd +0.508%, bwd +9.338% | Backward faster on every shape on both GPUs: MI355 +7% to +29% (geomean +16 |

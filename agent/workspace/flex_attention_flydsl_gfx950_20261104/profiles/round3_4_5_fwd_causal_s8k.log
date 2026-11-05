@@ -1,0 +1,52 @@
+
+ $$$$$$\  $$$$$$\  $$$$$$\       $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
+$$  __$$\ \_$$  _|$$  __$$\     $$  __$$\ $$ |  $$ |\__$$  __|$$ |  $$ |
+$$ /  $$ |  $$ |  $$ /  \__|$$\ $$ /  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$$$$$$$ |  $$ |  $$ |$$$$\ \__|$$$$$$$$ |$$ |  $$ |   $$ |   $$$$$$$$ |
+$$  __$$ |  $$ |  $$ |\_$$ |    $$  __$$ |$$ |  $$ |   $$ |   $$  __$$ |
+$$ |  $$ |  $$ |  $$ |  $$ |$$\ $$ |  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$ |  $$ |$$$$$$\ \$$$$$$  |\__|$$ |  $$ |\$$$$$$  |   $$ |   $$ |  $$ |
+\__|  \__|\______| \______/     \__|  \__| \______/    \__|   \__|  \__|
+
+ is protected by Conductor SUT Authentication - 20260513.01-gf7373bc.
+
+Reminder: An SSH key is required to access this system. 
+To manage your Conductor SSH keys please visit https://conductor.amd.com/user/dashboard/key-management
+
+You will be denied access to this system if:
+  • You did not provide a valid SSH key
+  • You do not have an active reservation in Conductor
+  • You are not in the required security groups (ex: mi300_doc.4erminus)
+
+____________   _______________________________________^__
+ ___   ___ |||  ___   ___   ___    ___ ___  |   __  ,----\
+|   | |   |||| |   | |   | |   |  |   |   | |  |  | |_____\
+|___| |___|||| |___| |___| |___|  | O | O | |  |  |        \
+           |||                    |___|___| |  |__|         )
+___________|||______________________________|______________/
+           |||                                        /--------
+-----------'''---------------------------------------'
+
+For other help resources please visit https://conductor.amd.com/docs
+
+Checking authorization now...
+cv350-tnndh2-b05-2.tnn.dcgpu GPUs 0,1,2 idle
+flydsl 0.3.4.1
+== round 3
+8432610296364460,8432610298038856,32768,0,84,132
+"SQ_INSTS_LDS",80936960.000000
+"SQ_INSTS_VALU",294703104.000000
+"SQ_LDS_BANK_CONFLICT",34078720.000000
+"SQ_WAIT_INST_LDS",86047966.000000
+== round 4
+8432610503768860,8432610505560218,32768,0,72,128
+"SQ_INSTS_LDS",29818880.000000
+"SQ_INSTS_VALU",261181440.000000
+"SQ_LDS_BANK_CONFLICT",136314880.000000
+"SQ_WAIT_INST_LDS",24126547.000000
+== round 5
+8432610692964506,8432610694737303,32768,0,76,132
+"SQ_INSTS_LDS",29818880.000000
+"SQ_INSTS_VALU",261774720.000000
+"SQ_LDS_BANK_CONFLICT",136314880.000000
+"SQ_WAIT_INST_LDS",24130367.000000

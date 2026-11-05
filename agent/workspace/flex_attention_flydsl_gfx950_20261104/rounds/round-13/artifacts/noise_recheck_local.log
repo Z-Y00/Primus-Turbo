@@ -1,0 +1,46 @@
+
+ $$$$$$\  $$$$$$\  $$$$$$\       $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
+$$  __$$\ \_$$  _|$$  __$$\     $$  __$$\ $$ |  $$ |\__$$  __|$$ |  $$ |
+$$ /  $$ |  $$ |  $$ /  \__|$$\ $$ /  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$$$$$$$ |  $$ |  $$ |$$$$\ \__|$$$$$$$$ |$$ |  $$ |   $$ |   $$$$$$$$ |
+$$  __$$ |  $$ |  $$ |\_$$ |    $$  __$$ |$$ |  $$ |   $$ |   $$  __$$ |
+$$ |  $$ |  $$ |  $$ |  $$ |$$\ $$ |  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$ |  $$ |$$$$$$\ \$$$$$$  |\__|$$ |  $$ |\$$$$$$  |   $$ |   $$ |  $$ |
+\__|  \__|\______| \______/     \__|  \__| \______/    \__|   \__|  \__|
+
+ is protected by Conductor SUT Authentication - 20260513.01-gf7373bc.
+
+Reminder: An SSH key is required to access this system. 
+To manage your Conductor SSH keys please visit https://conductor.amd.com/user/dashboard/key-management
+
+You will be denied access to this system if:
+  • You did not provide a valid SSH key
+  • You do not have an active reservation in Conductor
+  • You are not in the required security groups (ex: mi300_doc.4erminus)
+
+____________   _______________________________________^__
+ ___   ___ |||  ___   ___   ___    ___ ___  |   __  ,----\
+|   | |   |||| |   | |   | |   |  |   |   | |  |  | |_____\
+|___| |___|||| |___| |___| |___|  | O | O | |  |  |        \
+           |||                    |___|___| |  |__|         )
+___________|||______________________________|______________/
+           |||                                        /--------
+-----------'''---------------------------------------'
+
+For other help resources please visit https://conductor.amd.com/docs
+
+Checking authorization now...
+cv350-tnndh2-b05-2.tnn.dcgpu GPUs 0,1 idle
+flydsl 0.3.4.1
+label=inkling_local_1doc  Backward Time (ms)=1.733  [tref]
+label=inkling_local_1doc  Backward Time (ms)=1.658  [t]
+label=inkling_local_1doc  Backward Time (ms)=1.709  [tref]
+label=inkling_local_1doc  Backward Time (ms)=1.634  [t]
+label=inkling_local_1doc  Backward Time (ms)=1.729  [tref]
+label=inkling_local_1doc  Backward Time (ms)=1.669  [t]
+label=inkling_local_5doc  Backward Time (ms)=2.25  [tref]
+label=inkling_local_5doc  Backward Time (ms)=2.231  [t]
+label=inkling_local_5doc  Backward Time (ms)=2.234  [tref]
+label=inkling_local_5doc  Backward Time (ms)=2.135  [t]
+label=inkling_local_5doc  Backward Time (ms)=2.252  [tref]
+label=inkling_local_5doc  Backward Time (ms)=2.127  [t]

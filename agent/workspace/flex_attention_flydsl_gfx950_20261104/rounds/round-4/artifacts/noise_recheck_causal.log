@@ -1,0 +1,46 @@
+
+ $$$$$$\  $$$$$$\  $$$$$$\       $$$$$$\  $$\   $$\ $$$$$$$$\ $$\   $$\
+$$  __$$\ \_$$  _|$$  __$$\     $$  __$$\ $$ |  $$ |\__$$  __|$$ |  $$ |
+$$ /  $$ |  $$ |  $$ /  \__|$$\ $$ /  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$$$$$$$ |  $$ |  $$ |$$$$\ \__|$$$$$$$$ |$$ |  $$ |   $$ |   $$$$$$$$ |
+$$  __$$ |  $$ |  $$ |\_$$ |    $$  __$$ |$$ |  $$ |   $$ |   $$  __$$ |
+$$ |  $$ |  $$ |  $$ |  $$ |$$\ $$ |  $$ |$$ |  $$ |   $$ |   $$ |  $$ |
+$$ |  $$ |$$$$$$\ \$$$$$$  |\__|$$ |  $$ |\$$$$$$  |   $$ |   $$ |  $$ |
+\__|  \__|\______| \______/     \__|  \__| \______/    \__|   \__|  \__|
+
+ is protected by Conductor SUT Authentication - 20260513.01-gf7373bc.
+
+Reminder: An SSH key is required to access this system. 
+To manage your Conductor SSH keys please visit https://conductor.amd.com/user/dashboard/key-management
+
+You will be denied access to this system if:
+  • You did not provide a valid SSH key
+  • You do not have an active reservation in Conductor
+  • You are not in the required security groups (ex: mi300_doc.4erminus)
+
+____________   _______________________________________^__
+ ___   ___ |||  ___   ___   ___    ___ ___  |   __  ,----\
+|   | |   |||| |   | |   | |   |  |   |   | |  |  | |_____\
+|___| |___|||| |___| |___| |___|  | O | O | |  |  |        \
+           |||                    |___|___| |  |__|         )
+___________|||______________________________|______________/
+           |||                                        /--------
+-----------'''---------------------------------------'
+
+For other help resources please visit https://conductor.amd.com/docs
+
+Checking authorization now...
+cv350-tnndh2-b05-2.tnn.dcgpu GPUs 0,1 idle
+flydsl 0.3.4.1
+label=causal_s4k  Forward Time (ms)=1.16  [tref]
+label=causal_s4k  Forward Time (ms)=1.24  [t]
+label=causal_s4k  Forward Time (ms)=1.156  [tref]
+label=causal_s4k  Forward Time (ms)=1.247  [t]
+label=causal_s4k  Forward Time (ms)=1.157  [tref]
+label=causal_s4k  Forward Time (ms)=1.238  [t]
+label=causal_s8k  Forward Time (ms)=1.786  [tref]
+label=causal_s8k  Forward Time (ms)=1.9  [t]
+label=causal_s8k  Forward Time (ms)=1.766  [tref]
+label=causal_s8k  Forward Time (ms)=1.907  [t]
+label=causal_s8k  Forward Time (ms)=1.815  [tref]
+label=causal_s8k  Forward Time (ms)=1.897  [t]
