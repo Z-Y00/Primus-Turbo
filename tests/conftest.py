@@ -103,6 +103,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_mega_mxfp8_gfx1250.py",
     # The same across every visible GPU (EP2+).
     "tests/pytorch/ops/test_mega_mxfp8_gfx1250_ep.py",
+    # bf16 MegaMoE with the post-norm stage2 (fused_mega_moe_gfx1250_post_norm_impl), EP2+.
+    "tests/pytorch/ops/test_mega_bf16_gfx1250_post_norm_ep.py",
 )
 
 
