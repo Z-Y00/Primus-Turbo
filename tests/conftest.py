@@ -65,6 +65,8 @@ _GFX1250_ENABLED_TESTS = (
     "tests/pytorch/ops/test_attention_hipkittens_gfx1250_mla.py",
     # Dense FlyDSL attention (primus_turbo/flydsl/attention/gfx1250), bf16 head_dim 128.
     "tests/pytorch/ops/test_attention_flydsl_gfx1250.py",
+    # Gated packed QKV weightless Q / K RMSNorm + RoPE (primus_turbo/triton/rope/gated_qkv_rmsnorm_rope_kernel.py).
+    "tests/pytorch/ops/test_gated_qkv_rmsnorm_rope.py",
     # MXFP8 quantization (primus_turbo/flydsl/quantization/mxfp8_quant_gfx1250.py), bitwise vs the reference.
     "tests/pytorch/ops/test_quant_mxfp8_gfx1250.py",
     # The MXFP8 GEMM kernel (primus_turbo/flydsl/gemm/gemm_mxfp8_kernel_gfx1250.py).

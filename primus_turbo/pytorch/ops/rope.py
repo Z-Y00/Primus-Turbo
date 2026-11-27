@@ -9,6 +9,7 @@
 Public API:
     - ``fused_qkv_rope(qkv, q_freqs, k_freqs, qkv_split_arg_list) -> (q, k, v)``
     - ``fused_qkv_rmsnorm_rope(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, eps) -> (q, k, v)``
+    - ``fused_gated_qkv_rmsnorm_rope(qkv, cos, sin, heads_per_group, eps, rope) -> (q, gate, k, v)``
     - ``dit_qk_norm_rope(qkv, w_q, w_k, cos, sin, eps, ...) -> (q, k, v)`` and its tables,
       ``dit_qk_norm_rope_cos_sin(freqs, dtype) -> (cos, sin)``
 """
@@ -26,6 +27,11 @@ from primus_turbo.pytorch.kernels.rope.dit_qk_norm_rope_impl import (
     source_layout,
     split_streams,
 )
+from primus_turbo.pytorch.kernels.rope.gated_qkv_rmsnorm_rope_impl import (
+    gated_qkv_rmsnorm_rope_bwd_impl,
+    gated_qkv_rmsnorm_rope_fwd_impl,
+    gated_qkv_rmsnorm_rope_shape_error,
+)
 from primus_turbo.pytorch.kernels.rope.qk_rmsnorm_rope_impl import (
     qk_rmsnorm_rope_bwd_impl,
     qk_rmsnorm_rope_fwd_impl,
@@ -37,7 +43,13 @@ from primus_turbo.pytorch.kernels.rope.rope_impl import (
     rope_shape_error,
 )
 
-__all__ = ["fused_qkv_rope", "fused_qkv_rmsnorm_rope", "dit_qk_norm_rope", "dit_qk_norm_rope_cos_sin"]
+__all__ = [
+    "fused_qkv_rope",
+    "fused_qkv_rmsnorm_rope",
+    "fused_gated_qkv_rmsnorm_rope",
+    "dit_qk_norm_rope",
+    "dit_qk_norm_rope_cos_sin",
+]
 
 
 class _FusedQKVRoPEFunction(torch.autograd.Function):
@@ -135,6 +147,65 @@ def fused_qkv_rmsnorm_rope(
     if why is not None:
         raise ValueError(f"fused_qkv_rmsnorm_rope: unsupported input ({why})")
     return _FusedQKVRMSNormRoPEFunction.apply(qkv, q_gamma, k_gamma, freqs, qkv_split_arg_list, float(eps))
+
+
+class _FusedGatedQKVRMSNormRoPEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv, cos, sin, heads_per_group, eps, rope):
+        q, k, q_rstd, k_rstd = gated_qkv_rmsnorm_rope_fwd_impl(qkv, cos, sin, heads_per_group, eps, rope)
+        H = int(heads_per_group)
+        D = qkv.shape[-1] // (2 * H + 2)
+        gate = qkv[..., H * D : 2 * H * D]
+        v = qkv[..., (2 * H + 1) * D :]
+        ctx.save_for_backward(qkv, cos if rope else None, sin if rope else None, q_rstd, k_rstd)
+        ctx.args = (H, bool(rope))
+        return q, gate, k, v
+
+    @staticmethod
+    def backward(ctx, dq, dgate, dk, dv):
+        qkv, cos, sin, q_rstd, k_rstd = ctx.saved_tensors
+        H, rope = ctx.args
+        dqkv = gated_qkv_rmsnorm_rope_bwd_impl(dq, dgate, dk, dv, qkv, cos, sin, q_rstd, k_rstd, H, rope)
+        return dqkv, None, None, None, None, None
+
+
+def fused_gated_qkv_rmsnorm_rope(
+    qkv: torch.Tensor,
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
+    heads_per_group: int,
+    eps: float,
+    rope: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a gated packed QKV with a weightless per-head Q / K RMSNorm and rotate-half RoPE fused.
+
+    Megatron's ``attention_output_gate`` packs, per query group, ``[q: H x D | gate: H x D | k: D | v: D]``.
+    This op computes ``q = rope(rms(q))`` and ``k = rope(rms(k))`` with ``rms(x) = round(x32 * rsqrt(mean(x32^2)
+    + eps))`` (no weight, as Muse Spark's QK-norm) and Megatron's unfused rotate-half RoPE ``round(round(n * cos)
+    + round(rotate_half(n) * sin))``, rounding to bf16 where those unfused ops do. The backward writes the packed
+    gradient (gate and v gradients included) in one pass. Triton, any arch.
+
+    Relation to ``fused_qkv_rmsnorm_rope``: that op is the ungated GPT-OSS / Qwen3 layout with weighted norms
+    (FlyDSL, gfx950); this one is the gated layout with weightless norms and NoPE layers (``rope=False``).
+
+    Args:
+        qkv: ``[S, B, G, (2H + 2) * D]`` contiguous bfloat16; H and D powers of 2.
+        cos, sin: ``[S, D]`` contiguous bfloat16, each RoPE pair's angle twice (``dit_qk_norm_rope_cos_sin``
+            builds them from Megatron's ``[S, 1, 1, D]`` freqs). Ignored (may be None) with ``rope=False``.
+        heads_per_group: H, query heads per query group.
+        eps: RMSNorm epsilon.
+        rope: False for a NoPE layer (norm only).
+
+    Returns:
+        ``(q [S, B, G * H, D], gate [S, B, G, H * D], k [S, B, G, D], v [S, B, G, D])``; gate and v are views of
+        ``qkv``.
+    """
+    why = gated_qkv_rmsnorm_rope_shape_error(qkv, cos, sin, heads_per_group, rope)
+    if why is not None:
+        raise ValueError(f"fused_gated_qkv_rmsnorm_rope: unsupported input ({why})")
+    return _FusedGatedQKVRMSNormRoPEFunction.apply(
+        qkv, cos, sin, int(heads_per_group), float(eps), bool(rope)
+    )
 
 
 _V_OUT = ("copy", "none")
